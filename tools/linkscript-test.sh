@@ -211,6 +211,54 @@ done
 [ "$nre" -gt 0 ] || bad "no global text symbols found in the boot assembly at all"
 
 echo
+echo "=== the 32 IDT stub addresses really are isr0..isr31, in order (3.2) ==="
+# Only vectors 0 and 14 are ever fired by a boot test, so a duplicated or
+# transposed .quad in boot/interrupts.S boots perfectly green and mis-routes an
+# exception nobody has raised yet.  The table is read back out of the linked
+# image and compared against the symbols it names.  python3, not awk: these
+# addresses exceed the 53 bits awk keeps exactly.
+if out=$(python3 - "$K" 2>&1 <<'PY'
+import subprocess, sys
+
+elf = sys.argv[1]
+hexd = "0123456789abcdef"
+
+syms = {}
+for line in subprocess.run(["nm", elf], capture_output=True, text=True).stdout.splitlines():
+    f = line.split()
+    if len(f) == 3:
+        syms.setdefault(f[2], int(f[0], 16))
+if "isr_stub_table" not in syms:
+    sys.exit("isr_stub_table is not in the linked image")
+
+mem = {}
+dump = subprocess.run(["objdump", "-s", "-j", ".rodata", elf],
+                      capture_output=True, text=True).stdout
+for line in dump.splitlines():
+    f = line.split()
+    if len(f) < 2 or not all(c in hexd for c in f[0]):
+        continue
+    a = int(f[0], 16)
+    for i, w in enumerate(f[1:5]):
+        if len(w) == 8 and all(c in hexd for c in w):
+            for j in range(4):
+                mem[a + 4 * i + j] = int(w[2 * j:2 * j + 2], 16)
+
+base = syms["isr_stub_table"]
+for v in range(32):
+    want = syms.get("isr%d" % v)
+    if want is None:
+        sys.exit("isr%d is not in the linked image" % v)
+    try:
+        got = sum(mem[base + 8 * v + k] << (8 * k) for k in range(8))
+    except KeyError:
+        sys.exit("entry %d lies outside the .rodata dump" % v)
+    if got != want:
+        sys.exit("entry %d is 0x%016x, but isr%d is at 0x%016x" % (v, got, v, want))
+print("32 entries, each pointing at the stub its index names")
+PY
+); then ok "isr_stub_table: $out"; else bad "isr_stub_table: $out"; fi
+
 echo "=== fk_inb defines the whole of EAX before it reads the port (2.1) ==="
 # 'inb %dx, %al' writes AL and leaves EAX bits 31:8 as it found them, so fk_inb
 # must define them itself; no black-box test in this tree can observe the bits.

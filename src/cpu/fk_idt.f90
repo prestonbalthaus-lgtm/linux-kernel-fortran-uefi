@@ -56,6 +56,10 @@ module fk_idt_m
   character(kind=c_char, len=*), parameter :: FK_PANIC_HDR = &
        FK_CRLF // "*** FORTRAN KERNEL PANIC ***" // FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_EXC    = "EXCEPTION 0x" // c_null_char
+  ! The error code rides the headline, not the register dump: a boot gate greps
+  ! one line, and this way that line proves the stub normalised the frame --
+  ! a trampoline that forgets its dummy push reports a return address here.
+  character(kind=c_char, len=*), parameter :: FK_ERR    = " ERR 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_DASH   = " -- " // c_null_char
   character(kind=c_char, len=*), parameter :: FK_EQUALS = " = 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_NL     = FK_CRLF // c_null_char
@@ -242,6 +246,8 @@ contains
 
     call serial_print_string(FK_EXC)
     call print_hex(regs%int_no, 2_c_int32_t)
+    call serial_print_string(FK_ERR)
+    call print_hex(regs%err_code, 16_c_int32_t)
     call serial_print_string(FK_DASH)
     if (regs%int_no >= 0_c_int64_t .and. regs%int_no < int(FK_IDT_VECTORS, c_int64_t)) then
        call serial_print_string(FK_FAULT_NAME(int(regs%int_no, c_int32_t)))
@@ -250,7 +256,6 @@ contains
     end if
     call serial_print_string(FK_NL)
 
-    call print_reg("ERRCODE", regs%err_code)
     call print_reg("RIP    ", regs%rip)
     call print_reg("CS     ", regs%cs)
     call print_reg("RFLAGS ", regs%rflags)

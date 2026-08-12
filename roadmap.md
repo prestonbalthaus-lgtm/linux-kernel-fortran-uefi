@@ -229,13 +229,91 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
 
 The most critical mathematical and structural phase. Setting up the brain of the OS.
 
-  *  [ ] 3.1 Global Descriptor Table (GDT)
+  *  [x] 3.1 Global Descriptor Table (GDT)
 
         Validation: Flat memory model is established in Fortran structures and loaded via lgdt.
 
-  *  [ ] 3.2 Interrupt Descriptor Table (IDT)
+        DONE. `src/cpu/fk_gdt.f90` holds the three descriptors -- null, 0x00AF9A00...
+        (P|S|code|read, G|L set: the L bit is the entire point) and 0x00CF9200...
+        (P|S|data|write) -- and `boot/gdt_flush.S` loads them. This REPLACES the
+        table boot.S carries: that one is .rodata with a 32-bit LGDT operand built
+        for pre-paging addresses, this one is kernel data with a 64-bit one.
+
+        Two things are not what a textbook shows, both deliberate. The pseudo-
+        descriptor is an `integer(c_int16_t) :: gdtr(5)` and NOT a `bind(c)` derived
+        type: LGDT wants a packed 16-bit limit followed by a 64-bit base, and C
+        struct rules would pad that base out to offset 8, so the type system would
+        produce a descriptor the CPU reads as garbage. An array of an intrinsic type
+        is packed by the standard. And the selector values are ARGUMENTS to
+        gdt_flush rather than constants inside it, so `fk_gdt_m` is the only place
+        in the tree that decides what 0x08 and 0x10 mean.
+
+        The far jump is an LRETQ. A far JMP with an immediate pointer does not exist
+        in 64-bit mode, so CS is reloaded by pushing selector and target and faking
+        a far return -- the panic dump below reports `CS = 0x08`, `SS = 0x10`, which
+        is that sequence having worked.
+
+  *  [x] 3.2 Interrupt Descriptor Table (IDT)
 
         Validation: Hardware and CPU exceptions (like Page Faults) trigger specific Fortran subroutines.
+
+        DONE, and validated by faulting on purpose rather than by argument. A
+        deliberate divide by zero in `kernel_main` produced this on COM1:
+
+            *** FORTRAN KERNEL PANIC ***
+            EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error
+            RIP     = 0xFFFFFFFF80101E9F
+            CS      = 0x0000000000000008
+            RFLAGS  = 0x0000000000010086
+            RSP     = 0xFFFFFFFF80109100
+            SS      = 0x0000000000000010
+            RAX     = 0x0000000000000001
+            ... RBX through R15 ...
+            *** HALTED -- CLI/HLT ***
+
+        That RIP is not approximately right, it is the address of the `idivl` in the
+        image (`objdump -d --disassemble=kernel_main`). RAX is the dividend the CPU
+        was holding. R8 = 0xFFFF is the UART spin counter left over from the line
+        printed immediately before -- i.e. the trampoline preserved state the fault
+        did not touch.
+
+        `boot/interrupts.S` -- isr0..isr31. Vectors 8, 10-14, 17, 21, 29 and 30
+        arrive with an error code from the CPU and the rest do not, so the rest push
+        a zero in its place: the Fortran side must not have to know which kind it
+        caught. Then the interrupt number, then all 15 general-purpose registers,
+        then CLD (an interrupt gate does not clear DF and SysV requires DF=0 on
+        entry), then RSP into RDI and `call isr_handler`. The frame is 22 quadwords
+        and the CPU aligns RSP to 16 before pushing its five, so RSP is 16-byte
+        aligned AT the call, which is what the ABI asks for.
+
+        `src/cpu/fk_idt.f90` -- the catcher. `fk_regs_t` is a `bind(c)` type of 22
+        quadwords that mirrors that push order exactly; the gate descriptor is a
+        second `bind(c)` type whose fields C rules place at 0, 2, 4, 5, 6, 8 and 12,
+        which happens to be the hardware format with no padding at all. Vectors
+        32-255 are installed with the present bit CLEAR, so an unexpected vector
+        raises #GP rather than jumping to a zeroed offset.
+
+        THE PROOF THE DIVIDE BY ZERO CANNOT GIVE: #DE carries no error code, so it
+        only exercises the dummy-push branch. A throwaway build that wrote to an
+        unmapped 4 GiB address instead reported `EXCEPTION 0x0E ERR 0x0000000000000002
+        -- #PF Page Fault`, and 0x2 is the CPU's own code for a write to a
+        not-present page. Both branches of the normalisation are therefore observed,
+        not assumed. (A null dereference would NOT have worked: boot.S identity-maps
+        the first 1 GiB, so address 0 is present and writable.)
+
+        WHAT THIS MILESTONE COST, both found by booting and neither by any gate:
+        gcc rewrites `1/x` into a compare against +-1 and emits no DIV, so the first
+        build never faulted; and gfortran 16.1 passes a `character(kind=c_char),
+        VALUE` dummy by ADDRESS at some call sites while the callee reads it as a
+        value, so every byte the panic printer emitted was the low half of a
+        pointer. `fk_serial_m` now exports `serial_print_byte`, taking an integer;
+        `serial_print_char` keeps its C signature because the 2.1 oracle test is
+        written against it and C callers were never affected. See
+        `docs/HARNESS-VALIDATION-PHASE3.md`.
+
+        NOT DONE HERE, and 3.3's problem: no TSS, so no IST -- a #DF arrives on the
+        faulting stack. No 8259 remap, so the IRQ vectors still collide with the
+        exception range and interrupts stay masked.
 
   *  [ ] 3.3 Advanced Programmable Interrupt Controller (APIC)
 
