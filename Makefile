@@ -22,7 +22,7 @@ $(BUILD)/oracle-$(1).o: $(KDIR)/$(ORACLE_$(1)) | $(BUILD)
 $(BUILD)/fk_$(1).o: $(FSRC_$(1)) | $(BUILD)
 	gfortran $(FFLAGS) -c -o $$@ $$<
 $(BUILD)/drv-$(1).o: $(DRV_$(1)) | $(BUILD)
-	gcc $(CFLAGS) -c -o $$@ $$<
+	gcc $(CFLAGS) $(CFLAGS_$(1)) -c -o $$@ $$<
 $(BUILD)/run-$(1): $(BUILD)/oracle-$(1).o $(BUILD)/fk_$(1).o $(BUILD)/drv-$(1).o
 	gcc -o $$@ $$^
 	@./$$@
