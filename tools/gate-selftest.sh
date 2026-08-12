@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
-# Proves the quality gates actually reject what they claim to reject.
-#
-# The Phase 1 audit found three gates that reported PASS on inputs they were
-# supposed to fail (docs/AUDIT-PHASE1.md, A-1 and A-2). The root cause was that
-# nobody had ever watched them fail. This script is the fix for that class of
-# defect: every gate is fed a file that violates it and must reject it, and is
-# fed the real sources and must accept them.
-#
-# Run it in the container:  ./tools/run.sh -f /dev/null  # (or directly)
+# Feeds every gate a file that violates it and must be rejected, plus the real
+# sources that must be accepted.
+# Run in the container:
 #   podman run --rm -v "$PWD:/work:Z" -w /work fortran-kernel-dev:f44 \
 #       bash tools/gate-selftest.sh
 set -uo pipefail
@@ -21,7 +15,6 @@ pass=0; fail=0
 ok()   { printf "  \033[32mPASS\033[0m  %s\n" "$1"; pass=$((pass+1)); }
 bad()  { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
 
-# expect_reject <name> <gate-script> <heredoc-file>
 expect_reject() {
   local name=$1 gate=$2 dir=$3
   if bash "$REPO/$gate" "$dir" >/dev/null 2>&1; then
@@ -179,10 +172,7 @@ expect_reject "missing SPDX identifier" tools/compliance.sh "$d"
 echo
 echo "=== compliance.sh sees past line continuations (Phase 2 regression) ==="
 
-# Fortran statements continue across lines; the gate used to read one line at a
-# time. Both cases below reported PASS before fold_continuations existed. The
-# first is the dangerous one: a public procedure hidden on a continuation line
-# was never checked for bind(c) at all.
+# Both fixtures below are only reachable after continuations are folded.
 d=$(mkcase c_cont_public <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -260,11 +250,7 @@ F90
 )
 expect_reject "public procedure hidden past a COMMENT inside a continuation" tools/compliance.sh "$d"
 
-# Check 6 (free-form layout) was the one mandatory rule with no fixture -- the
-# only gate in the file nobody had ever watched fail. The continuation line
-# below carries exactly five leading spaces, i.e. fixed-form's continuation
-# column; everything else in the module is compliant, so this discriminates on
-# check 6 alone.
+# The continuation line has exactly five leading spaces: fixed-form's column 6.
 d=$(mkcase c_fixedform <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -285,10 +271,7 @@ F90
 )
 expect_reject "fixed-form layout (non-blank in continuation column 6)" tools/compliance.sh "$d"
 
-# The mirror image: a correctly bound export whose bind(c) sits on a
-# continuation line must still be ACCEPTED. Folding that only ever adds
-# rejections would be its own defect -- it would make the gate unusable for the
-# multi-line signatures the GOP renderer needs.
+# Folding must not add rejections: a bind(c) split across lines stays accepted.
 d=$(mkcase c_cont_ok <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -320,11 +303,7 @@ else
   bad "compliance.sh rejects a correctly bound multi-line signature"
 fi
 
-# The bind(c) rule exempts public PARAMETERs (a named constant has no symbol
-# and no ABI -- see the rule's comment in compliance.sh). These two cases fix
-# the boundary of that exemption in place: a public constant is fine, a public
-# module VARIABLE is not. Without the second case, "it's not a procedure" would
-# have quietly become a way to export unbound data.
+# The bind(c) rule exempts public PARAMETERs; these two cases fix that boundary.
 d=$(mkcase c_param_ok <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -369,6 +348,158 @@ F90
 expect_reject "public module VARIABLE exported without bind(c)" tools/compliance.sh "$d"
 
 echo
+echo "=== compliance.sh reads character literals as text, not as code (2.1) ==="
+
+
+# The '!' inside FK_PROMPT must not hide the FK_BANNER declared after it.
+d=$(mkcase c_lit_bang <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_char, c_int32_t
+  implicit none
+  private
+  public :: FK_BANNER, fk_case
+  character(kind=c_char, len=*), parameter :: MSG = "hi! there"
+  character(kind=c_char, len=*), parameter :: FK_PROMPT = "ready! ", FK_BANNER = "fk"
+contains
+  function fk_case(x) result(r) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    r = x + len(MSG) + len(FK_PROMPT) + len(FK_BANNER)
+  end function fk_case
+end module fk_case_m
+F90
+)
+if bash "$REPO/tools/compliance.sh" "$d" >/dev/null 2>&1; then
+  ok "compliance.sh accepts a '!' inside banner text"
+else
+  bad "compliance.sh treats a '!' inside a character literal as a comment"
+fi
+
+d=$(mkcase c_lit_goto_text <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_char, c_int32_t
+  implicit none
+  private
+  public :: fk_case
+  character(kind=c_char, len=*), parameter :: MSG = "go to the console"
+contains
+  function fk_case(x) result(r) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    r = x + len(MSG)
+  end function fk_case
+end module fk_case_m
+F90
+)
+if bash "$REPO/tools/compliance.sh" "$d" >/dev/null 2>&1; then
+  ok "compliance.sh accepts the words 'go to' inside banner text"
+else
+  bad "compliance.sh reads 'go to' in a character literal as a banned construct"
+fi
+
+# "" is Fortran's escaped quote: mis-reading it inverts quote state for the line.
+d=$(mkcase c_lit_dquote <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_char, c_int32_t
+  implicit none
+  private
+  public :: FK_TAIL, fk_case
+  character(kind=c_char, len=*), parameter :: FK_QUOTED = "say ""hi""! now", FK_TAIL = "."
+contains
+  function fk_case(x) result(r) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    r = x + len(FK_QUOTED) + len(FK_TAIL)
+  end function fk_case
+end module fk_case_m
+F90
+)
+if bash "$REPO/tools/compliance.sh" "$d" >/dev/null 2>&1; then
+  ok "compliance.sh accepts a doubled quote inside a literal"
+else
+  bad "compliance.sh mis-tracks Fortran's doubled-delimiter escape"
+fi
+
+d=$(mkcase c_lit_real_goto <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_char, c_int32_t
+  implicit none
+  private
+  public :: fk_case
+contains
+  function fk_case(c) result(r) bind(c, name="fk_case")
+    implicit none
+    character(kind=c_char), intent(in), value :: c
+    integer(c_int32_t) :: r
+    if (iachar(c) == iachar("!")) go to 100
+    r = 0_c_int32_t
+    return
+100 r = 1_c_int32_t
+  end function fk_case
+end module fk_case_m
+F90
+)
+expect_reject "inline GOTO hidden behind a character literal on the same line" tools/compliance.sh "$d"
+
+d=$(mkcase c_lit_unbound <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_char, c_int32_t
+  implicit none
+  private
+  public :: fk_case, fk_unbound
+  character(kind=c_char, len=*), parameter :: MSG = "boot! ok"
+contains
+  function fk_case(x) result(r) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    r = x + len(MSG)
+  end function fk_case
+  function fk_unbound(x) result(r)
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    r = x
+  end function fk_unbound
+end module fk_case_m
+F90
+)
+expect_reject "public procedure with no bind(c) in a file containing literals" tools/compliance.sh "$d"
+
+# Rejected because the stripper refuses (exit 2) a line that ends inside a literal.
+d=$(mkcase c_cont_literal <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_int32_t, c_char
+  implicit none
+  private
+  public :: fk_case
+contains
+  function fk_case(x) result(r) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    character(kind=c_char, len=11) :: msg
+    r = 0
+    msg = "hello &
+         &world" ; if (x > 0) go to 100
+    return
+100 r = x
+  end function fk_case
+end module fk_case_m
+F90
+)
+expect_reject "GOTO hidden past a line-CONTINUED character literal" tools/compliance.sh "$d"
+
+echo
 echo "=== linktest.sh: freestanding gates reject a runtime-dependent module ==="
 
 d=$(mkcase l_libgfortran <<'F90'
@@ -389,13 +520,7 @@ F90
 )
 expect_reject "module that calls into libgfortran (print *)" tools/linktest.sh "$d"
 
-# linktest's undefined-symbol rule was relaxed from "zero undefined symbols" to
-# "every undefined symbol is defined elsewhere in this tree" when roadmap 1.2
-# introduced fk_kmain -> fk_cpu_halt (assembly) and fk_gop_renderer ->
-# vga_font_row (the font module). This case is the proof that the relaxation
-# did not turn into "any undefined symbol is fine": nothing in the tree defines
-# fk_no_such_primitive, so it must still be rejected. Without it, a typo in an
-# interface block would link cleanly in the gate and fail at kernel link time.
+# Undefined symbols are tolerated only when something else in the tree defines them.
 d=$(mkcase l_orphan <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -434,11 +559,39 @@ subroutine fpwork(a, b, n) bind(c, name="fpwork")
   end do
 end subroutine fpwork
 F90
-# built WITHOUT -mno-sse on purpose: proves the detector sees FP when present
+# No -mno-sse here: the object must really contain FP for the detector to find.
 gfortran -O2 -J"$WORK" -c -o "$WORK/fp.o" "$WORK/fp.f90" 2>/dev/null
 hits=$(objdump -d "$WORK/fp.o" | grep -oE '%(x|y|z)mm[0-9]+|%mm[0-7]|[[:space:]]f(ld|st|add|mul|div|sub)[a-z]*[[:space:]]' | sort -u | wc -l)
 if [ "$hits" -gt 0 ]; then ok "FP detector finds $hits distinct FP/vector operand(s)"
 else bad "FP detector saw nothing in an object built with SSE enabled"; fi
+
+
+echo
+echo "=== linktest.sh: a boot/*.S that does not assemble fails the run (2.1) ==="
+# The repo's own boot/*.S all assemble, so FK_BOOTDIR is the only way to test this.
+bad_boot="$WORK/bootdir_broken"
+mkdir -p "$bad_boot"
+cat > "$bad_boot/broken.S" <<'ASM'
+	.text
+	.globl fk_bogus
+fk_bogus:
+	this_is_not_an_x86_instruction %rax, %rbx
+	ret
+ASM
+if FK_BOOTDIR="$bad_boot" bash "$REPO/tools/linktest.sh" "$REPO/src" >/dev/null 2>&1; then
+  bad "linktest.sh passed with a boot/*.S that does not assemble"
+else
+  ok "linktest.sh rejects a boot/*.S that does not assemble"
+fi
+# An unmatched *.S glob must stay a quiet no-op; the cases above depend on it.
+empty_boot="$WORK/bootdir_empty"
+empty_src="$WORK/srcdir_empty"
+mkdir -p "$empty_boot" "$empty_src"
+if FK_BOOTDIR="$empty_boot" bash "$REPO/tools/linktest.sh" "$empty_src" >/dev/null 2>&1; then
+  ok "linktest.sh tolerates a boot directory with no assembly in it"
+else
+  bad "linktest.sh errors on an empty boot directory (unmatched glob leaked)"
+fi
 
 echo
 echo "=== both gates ACCEPT the real sources (no false positives) ==="

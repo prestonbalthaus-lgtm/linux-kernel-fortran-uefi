@@ -1,21 +1,10 @@
 #!/usr/bin/env bash
-# Does linker.ld actually lay the image out the way it claims? (roadmap 0.1)
-#
-# Roadmap 0.1's validation is "properly aligns .text, .data and .bss for a
-# 64-bit ELF kernel". That is checkable, so it is checked here rather than
-# asserted in a commit message -- same standard tools/linktest.sh holds the
-# modules to.
-#
-# This links the REAL kernel modules and the REAL boot stub, not toy objects,
-# so the test fails if the script cannot place what the tree actually produces.
-# (Until roadmap 1.2 existed this used a throwaway `hlt` stub for ENTRY; now
-# boot/boot.S is here, the gate links the thing that will actually boot -- which
-# is what makes the .multiboot_header and .bootpt placement checks below real.)
+# Does linker.ld lay the image out the way it claims?  Links the real kernel
+# modules and the real boot stub, then checks the resulting ELF.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# The kernel flag set, read back from its single source of truth rather than
-# kept as a fourth copy. mk/kflags.mk defines KFLAGS and nothing else.
+# KFLAGS is read back from mk/kflags.mk rather than kept as a fourth copy.
 KFLAGS=$(printf 'include mk/kflags.mk\nprint:\n\t@echo $(KFLAGS)\n' | make -s -f - print) || {
   echo "  FAIL  cannot read KFLAGS out of mk/kflags.mk"; exit 1; }
 
@@ -29,9 +18,7 @@ bad() { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
 want() { [ "$2" = "$3" ] && ok "$1 = $2" || bad "$1: expected $2, got $3"; }
 
 echo "=== building the real kernel objects under KFLAGS ==="
-# Two passes, because one module USEs another and a single alphabetical pass
-# only happens to work today: whatever fails for want of a .mod is retried once
-# the rest have been compiled. Anything still failing is a real failure.
+# Two passes: a module that USEs another may need a .mod not written yet.
 objs=""; pending=$(find src -name 'fk_*.f90' | sort)
 for attempt in 1 2; do
   retry=""
@@ -50,18 +37,23 @@ for attempt in 1 2; do
 done
 echo "  $(echo $objs | wc -w) objects"
 
-# The real entry point (roadmap 1.2). Assembled exactly the way Makefile.boot
-# assembles it -- through gcc, so cpp expands the PHYS() macro.
-if gcc -m64 -fno-pic -Wall -c -o "$WORK/boot.o" boot/boot.S 2>"$WORK/boot.err"; then
-  ok "boot/boot.S assembles"
-else
-  bad "boot/boot.S does not assemble:"; sed 's/^/        /' "$WORK/boot.err" | head -8
-fi
+# Assembled the way Makefile.boot does it -- through gcc, so cpp expands boot.S's
+# PHYS() macro.  [ -e ] guards the unmatched glob.
+aobjs=""
+for s in boot/*.S; do
+  [ -e "$s" ] || continue
+  a=$(basename "$s" .S)
+  if gcc -m64 -fno-pic -Wall -c -o "$WORK/$a.o" "$s" 2>"$WORK/$a.err"; then
+    ok "$s assembles"; aobjs="$aobjs $WORK/$a.o"
+  else
+    bad "$s does not assemble:"; sed 's/^/        /' "$WORK/$a.err" | head -8
+  fi
+done
 
 echo
 echo "=== linking with linker.ld ==="
 if ld -nostdlib -z max-page-size=0x1000 -T linker.ld \
-      -o "$WORK/kernel.elf" "$WORK/boot.o" $objs 2>"$WORK/link.err"; then
+      -o "$WORK/kernel.elf" $aobjs $objs 2>"$WORK/link.err"; then
   ok "links (ASSERTs in linker.ld all held)"
 else
   bad "link failed:"; sed 's/^/        /' "$WORK/link.err" | head -12
@@ -99,14 +91,10 @@ else bad "first PT_LOAD LMA is $lma, expected 0x0000000000100000"; fi
 nseg=$(readelf -lW "$K" | grep -c '^  LOAD')
 want "PT_LOAD segments (text/rodata/data)" "3" "$nseg"
 
-# Distinct permissions are the whole reason for having three segments: this is
-# what lets the VMM map code RX, constants RO and data RW-noexec. If all three
-# came out RWX the split would be decorative.
+# Three segments exist so code maps RX, constants RO and data RW-noexec.
 perms=$(segflags | tr '\n' ' ')
 want "segment permissions (text rodata data)" "RE R RW " "$perms"
 
-# .text must be executable and NOT writable -- a writable .text is the single
-# most valuable thing an exploit can find in a kernel image.
 tflags=$(segflags | sed -n 1p)
 case "$tflags" in
   *W*) bad ".text segment is WRITABLE ($tflags)" ;;
@@ -131,14 +119,9 @@ else bad ".bss is empty or inverted"; fi
 
 echo
 echo "=== roadmap 1.2: the Multiboot2 header and the boot page tables ==="
-# boot.S cannot import a linker script constant, so it redefines KERNEL_VMA.
-# A silent divergence would shift every PHYS() by a fixed offset and produce a
-# kernel that triple-faults the instant paging comes on. boot.S's header comment
-# promises this gate diffs the two; this is that diff.
-# Compared as normalised hex TEXT, not as numbers: 0xFFFFFFFF80000000 exceeds
-# the range of bash's signed 64-bit arithmetic, so `printf %d` fails on both
-# sides and a numeric comparison passes by accident -- a check that cannot fail
-# is worse than no check.
+# boot.S redefines KERNEL_VMA because it cannot import a linker script constant;
+# a divergence shifts every PHYS().  Compared as normalised hex TEXT: the value
+# exceeds bash's signed 64-bit arithmetic, so a numeric compare cannot fail.
 norm_hex() { printf '%s' "$1" | tr 'A-F' 'a-f' | sed 's/^0x0*/0x/'; }
 vma_ld=$(sed -n 's/^ *KERNEL_VMA *= *\(0x[0-9A-Fa-f]*\).*/\1/p' linker.ld | head -1)
 vma_s=$(sed -n 's/^#define KERNEL_VMA *\(0x[0-9A-Fa-f]*\).*/\1/p' boot/boot.S | head -1)
@@ -160,8 +143,7 @@ if [ "$hdrlen" -gt 0 ] && [ "$hdrlen" -le 32768 ]; then
   ok "header is $hdrlen bytes, inside the 32 KiB the spec lets a loader scan"
 else bad "header length is $hdrlen bytes"; fi
 
-# The page tables must NOT be in the region boot.S zeroes -- see the .bootpt
-# comment in linker.ld. This is the check that keeps that argument true.
+# The page tables must not sit in the region boot.S zeroes.
 bp_s=$(sym __bootpt_start); bp_e=$(sym __bootpt_end)
 bs=$(sym __bss_start);      be=$(sym __bss_end)
 if [ -z "$bp_s" ]; then bad "__bootpt_start missing: where did the page tables go?"
@@ -182,7 +164,6 @@ done
 bptype=$(readelf -SW "$K" | sed 's/^ *\[[ 0-9]*\] *//' | awk '$1==".bootpt"{print $2}')
 want ".bootpt occupies no file space" "NOBITS" "$bptype"
 
-# GRUB's own rule about the entry point, plus the whole header contract.
 echo
 echo "=== the linked image is one GRUB would accept (tools/mb2-check.py) ==="
 if python3 tools/mb2-check.py "$K" --quiet; then
@@ -201,7 +182,49 @@ elif [ $(( fa >= ro_s && fa < ro_e )) -eq 1 ]; then ok "font table is inside .ro
 else bad "font at $fa is OUTSIDE .rodata [$ro_s,$ro_e)"; fi
 
 echo
+echo "=== every routine the boot assembly exports is in the executable segment ==="
+# nm -P type T means global, defined, in a text section; boot.S's other globals
+# are R, D and B and are checked above.
+# These addresses wrap negative under bash's signed $(( )), but all of them wrap
+# by the same 2^64, so the ordering survives.
+ts=$(sym __text_start); te=$(sym __text_end)
+nre=0
+for o in $aobjs; do
+  for t in $(nm -g --defined-only -P "$o" | awk '$2=="T"{print $1}'); do
+    a=$(sym "$t"); nre=$((nre+1))
+    if [ -z "$a" ]; then
+      bad "$t is exported by the boot assembly but is not in the linked image"
+    elif [ $(( a >= ts && a < te )) -eq 1 ]; then
+      ok "$t at $a is inside .text [$ts,$te)"
+    else
+      bad "$t at $a is OUTSIDE .text [$ts,$te) -- wrong .section in the .S?"
+    fi
+  done
+done
+[ "$nre" -gt 0 ] || bad "no global text symbols found in the boot assembly at all"
+
+echo
+echo "=== fk_inb defines the whole of EAX before it reads the port (2.1) ==="
+# 'inb %dx, %al' writes AL and leaves EAX bits 31:8 as it found them, so fk_inb
+# must define them itself; no black-box test in this tree can observe the bits.
+if [ -z "$(sym fk_inb)" ]; then
+  ok "fk_inb is not in this tree yet -- nothing to check"
+else
+  eax_def=$(objdump -d --disassemble=fk_inb "$K" 2>/dev/null \
+            | grep -cE '(xor|mov|movz)[a-z]*[[:space:]].*%eax')
+  if [ "${eax_def:-0}" -gt 0 ]; then
+    ok "fk_inb defines EAX itself ($eax_def instruction(s) write %eax besides the IN)"
+  else
+    bad "fk_inb writes only AL: bits 31:8 of the returned int32_t are whatever"
+    bad "     the caller left in EAX. serial_init's 0xAE loopback probe then"
+    bad "     compares unequal on a UART that is working perfectly."
+  fi
+fi
+
+echo
 echo "=== no 2 MiB segment padding (the -z max-page-size flag is doing its job) ==="
+# Catches a missing -z max-page-size, which pads each of the three PT_LOADs to
+# 2 MiB.  Image is 25600 bytes today, 25248 without io.S and the serial driver.
 sz=$(stat -c%s "$K")
 if [ "$sz" -lt 262144 ]; then ok "image is $sz bytes (< 256 KiB)"
 else bad "image is $sz bytes -- looks like 2 MiB segment padding crept back in"; fi
