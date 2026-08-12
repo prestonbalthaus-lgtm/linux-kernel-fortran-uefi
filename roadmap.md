@@ -3,17 +3,37 @@
 
 Before any Fortran is written, the autonomous build environment must be established.
 
-  *  [ ] 0.1 Create Custom Linker Script (linker.ld)
+  *  [x] 0.1 Create Custom Linker Script (linker.ld)
 
         Validation: Script properly aligns .text, .data, and .bss sections for a 64-bit ELF kernel.
+
+        DONE: `linker.ld`. Proven, not asserted -- `tools/linkscript-test.sh` links the
+        REAL nine modules under KFLAGS and checks 25 properties (`make linkscript`, also
+        part of `make audit`). .text/.rodata/.data/.bss each start on a 4 KiB boundary in
+        their own PT_LOAD (RE / R / RW), so the VMM (3.5) can set per-section permissions
+        without two sections sharing a page. VMA 0xFFFFFFFF80100000 is forced by
+        -mcmodel=kernel; LMA 0x100000 via AT(). Exports `__bss_start`/`__bss_end` for
+        1.3's zeroing, a 16 KiB boot stack, and `__kernel_phys_start`/`_end` for 3.4's
+        PMM. 9 injected layout defects were all rejected by the gate.
 
   *  [ ] 0.2 Write the Root Makefile
 
         Validation: Makefile successfully runs gfortran -ffreestanding and links with ld.
 
+        NOT DONE. The existing Makefile builds and runs HOST differential tests; it has no
+        kernel link rule and produces no kernel image. `make linkscript` links one only to
+        validate 0.1, in a temp dir, then throws it away. When this is built it MUST pass
+        `-z max-page-size=0x1000` to ld, or GNU ld pads every PT_LOAD to 2 MiB and a
+        ~19 KiB kernel becomes multi-megabyte.
+
   *  [ ] 0.3 Configure QEMU Test Harness
 
         Validation: A script (run.sh) exists that packages the kernel into an ISO and launches qemu-system-x86_64 -m 24G -smp 6 -bios OVMF.fd.
+
+        NOT DONE, and mind the NAME COLLISION: `tools/run.sh` already exists and is the
+        podman wrapper that runs make inside the container. It is unrelated. Call the QEMU
+        harness something else (`tools/qemu-run.sh`) rather than overwriting a script the
+        whole build depends on.
 
 ## ⚙️ Phase 1: The Boot Layer & Bare-Metal Runtime
 
@@ -22,6 +42,15 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
   *  [x] 1.1 The Core Library Translation (Completed)
 
         Validation: String manipulation and math modules exist without libgfortran.
+
+        CAUTION -- THIS BOX IS OVER-TICKED. Only the MATH half was delivered:
+        `src/lib/math/` has 7 modules plus `src/lib/fk_bcd.f90`. There are ZERO string
+        handlers -- no strlen, strcpy, memcmp, memcpy. `docs/AUDIT-PHASE1.md` flagged this
+        already: "Phase 1 delivered no string handlers ... any Phase 2 planning that
+        assumes lib/string.c is already translated is working from a wrong inventory."
+        Anything downstream needing string ops (the ELF loader at 6.4, VFS paths at 6.1)
+        must translate lib/string.c first. Note 1.3 below needs memcpy/memset anyway, so
+        that is where the debt gets paid.
 
   *  [ ] 1.2 Multiboot2 / EFI Assembly Stub
 
@@ -47,13 +76,37 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
 
         Validation: Multiboot2 header successfully requests the framebuffer; Fortran pointer maps to the physical video memory address.
 
-  *  [ ] 2.3 Bitmap Font System
+        HALF DONE, deliberately not ticked: the Fortran side is finished and tested
+        (`vga_init_framebuffer` maps the pointer via c_f_pointer and validates the
+        geometry). The Multiboot2 header that REQUESTS the framebuffer does not exist and
+        cannot until 1.2. Both halves of the validation must hold.
+
+        HAZARD FOR WHOEVER DOES 1.2: the GOP framebuffer is a PCI BAR that on modern
+        hardware sits ABOVE 4 GiB, while a bootloader identity map usually covers only the
+        low 1-4 GiB. Passing the firmware's reported address straight to
+        `vga_init_framebuffer` will page-fault with no IDT (3.2) installed -> double ->
+        triple fault -> silent reboot, which reads as "the kernel crashed" but is purely
+        an unmapped address. The stub must map the framebuffer range explicitly, and after
+        3.5 the VMM must hand over the VIRTUAL address with write-combining attributes.
+
+  *  [x] 2.3 Bitmap Font System
 
         Validation: An 8x16 hex bitmap font array is hardcoded into a Fortran module.
+
+        DONE: `src/drivers/video/fk_gop_renderer.f90`, `FONT_8X16`, 4096 bytes in .rodata.
+        Generated from the kernel's own `lib/fonts/font_8x16.c` by `tools/gen-font-8x16.py`
+        (re-running it yields a zero diff), and all 4096 bytes are diffed against the
+        compiled `font_vga_8x16` oracle by the test suite. A single flipped bit is caught.
 
   *  [ ] 2.4 The Software Renderer
 
         Validation: vga_print_string() successfully iterates over the font array and plots individual colored pixels to the screen.
+
+        CODE COMPLETE, not ticked: `vga_print_string`/`vga_print_char`/`vga_plot_pixel` are
+        written and verified byte-exact against a reference model on a simulated
+        framebuffer with pitch > width (248,853 checks, 0 mismatches, holds under the real
+        kernel flag set). But "to the screen" has never happened -- no boot path exists.
+        Tick this after QEMU (0.3) shows the pixels.
 
 ## 🧠 Phase 3: Core CPU & Memory Management
 

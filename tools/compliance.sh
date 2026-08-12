@@ -21,13 +21,20 @@ fail=0
 # code), so this substitution is exact here. Revisit if that ever changes.
 strip_comments() { sed 's/!.*//' "$1"; }
 
+# Fold Fortran free-form line continuations into one logical line each, so that
+# every check below sees whole statements. Without it a public procedure listed
+# on a continuation line is never checked for bind(c) at all -- see the header
+# of tools/fold-continuations.awk for the three shapes that hid things, and
+# tools/gate-selftest.sh for the cases that prove each is now caught.
+fold_continuations() { awk -f tools/fold-continuations.awk; }
+
 printf "%-22s %-9s %-7s %-8s %-10s %-5s %s\n" \
        MODULE implicit banned "bind(c)" intrinsic SPDX form
 
 for f in $(find "$SRCDIR" -name 'fk_*.f90' | sort); do
   n=$(basename "$f" .f90)
   code=$(mktemp) || exit 1
-  strip_comments "$f" > "$code"
+  strip_comments "$f" | fold_continuations > "$code"
   notes=""
 
   # --- 1. implicit none in EVERY program unit, not merely once per file -----
