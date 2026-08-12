@@ -23,9 +23,15 @@ GLYPHS, ROWS = 256, 16
 TOTAL = GLYPHS * ROWS
 BEGIN = "  ! BEGIN GENERATED FONT DATA"
 END = "  ! END GENERATED FONT DATA"
-PER_LINE = 8
-BLOCK = 256  # bytes per parameter chunk -> 32 continuation lines, far under the
-             # 255-continuation limit that one 4096-element constructor would blow.
+# 20 values per line is the tuned point between two hard compiler limits:
+#   * 4096/20 = 205 continuation lines, under the 255-continuation maximum;
+#   * 6 indent + 20*4 digits + 19*2 separators + " &" = 126 columns, under the
+#     132-column free-form line limit.
+# Emitting the table as SIXTEEN chunk parameters concatenated into a seventeenth
+# stayed inside both limits too, but gfortran then emits all seventeen arrays
+# into .rodata -- 8192 bytes of kernel image for 4096 bytes of font. One
+# constructor costs one symbol.
+PER_LINE = 20
 
 # Matches only the glyph bytes.  The struct's `{ 0, 0, FONTDATAMAX, 0 }` header
 # uses decimal/macro values on the declaration line, so it cannot be picked up.
@@ -60,27 +66,16 @@ def emit(data, src):
         f"  !     {src} \\",
         "  !     src/drivers/video/fk_gop_renderer.f90",
         "  ! Bytes are pre-biased into signed c_int8_t of identical bit pattern",
-        f"  ! (0xFF -> -1).  Split into {TOTAL // BLOCK} chunks of {BLOCK} so no single array",
-        "  ! constructor approaches the 255-continuation-line limit.",
+        "  ! (0xFF -> -1).  One single constructor, not concatenated chunks:",
+        "  ! chunk parameters would each get their own .rodata symbol and double",
+        f"  ! the table to {TOTAL * 2} bytes of kernel image.",
     ]
-    nblocks = TOTAL // BLOCK
-    for blk in range(nblocks):
-        chunk = data[blk * BLOCK:(blk + 1) * BLOCK]
-        first, last = blk * BLOCK // ROWS, ((blk + 1) * BLOCK // ROWS) - 1
-        L.append(f"  ! glyphs {first}..{last}  (0x{first:02X}..0x{last:02X})")
-        L.append(f"  integer(c_int8_t), parameter :: FONT_BLK{blk:02d}(0:{BLOCK - 1}) = &")
-        L.append("      [integer(c_int8_t) :: &")
-        for i in range(0, BLOCK, PER_LINE):
-            vals = ", ".join(f"{biased(b):4d}" for b in chunk[i:i + PER_LINE])
-            tail = " ]" if i + PER_LINE >= BLOCK else ", &"
-            L.append(f"      {vals}{tail}")
-    L.append("  ! The flat table actually indexed at run time: FONT_8X16(ch*16 + row).")
     L.append(f"  integer(c_int8_t), parameter :: FONT_8X16(0:{TOTAL - 1}) = &")
-    L.append("      [ &")
-    for blk in range(0, nblocks, 4):
-        names = ", ".join(f"FONT_BLK{b:02d}" for b in range(blk, min(blk + 4, nblocks)))
-        tail = " ]" if blk + 4 >= nblocks else ", &"
-        L.append(f"      {names}{tail}")
+    L.append("      [integer(c_int8_t) :: &")
+    for i in range(0, TOTAL, PER_LINE):
+        vals = ", ".join(f"{biased(b):4d}" for b in data[i:i + PER_LINE])
+        tail = " ]" if i + PER_LINE >= TOTAL else ", &"
+        L.append(f"      {vals}{tail}")
     L.append(END)
     return L
 
@@ -104,6 +99,11 @@ def main():
     for i, s in enumerate(new):
         if re.match(r"^     [^ ]", s):
             sys.exit(f"error: generated line {i + 1} has 5 leading spaces (fixed-form trap)")
+        if len(s) > 132:
+            sys.exit(f"error: generated line {i + 1} is {len(s)} columns (free-form limit is 132)")
+    cont = sum(1 for s in body if s.rstrip().endswith("&"))
+    if cont > 250:
+        sys.exit(f"error: {cont} continuation lines, too close to the 255 maximum")
     with open(target, "w") as fh:
         fh.write("\n".join(new) + "\n")
     print(f"wrote {TOTAL} font bytes into {target}")

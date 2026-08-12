@@ -21,24 +21,12 @@ fail=0
 # code), so this substitution is exact here. Revisit if that ever changes.
 strip_comments() { sed 's/!.*//' "$1"; }
 
-# Fold Fortran free-form line continuations into one logical line each.
-#
-# WITHOUT THIS EVERY CHECK BELOW IS BLIND TO ANYTHING PAST THE FIRST LINE OF A
-# STATEMENT. Two ways that bit, both found on the Phase 2 GOP renderer, and both
-# the same A-1 class of defect (a gate reporting PASS on what it must reject):
-#
-#   public :: a, b, &      <- the gate saw only a and b. c was never required to
-#             c               be bind(c) at all, and nothing would have said so.
-#
-#   function f(x) &            <- the gate saw a first line with no bind(c) and
-#        result(r) bind(c,...)    reported MISSING on a correctly bound export.
-#
-# A trailing '&' continues the statement onto the next line, which may itself
-# begin with an optional '&'. Comments are stripped before folding, so a '&'
-# left trailing only because a comment followed it folds correctly too.
-fold_continuations() {
-  sed -e ':a' -e '/&[[:space:]]*$/{N; s/&[[:space:]]*\n[[:space:]]*&\{0,1\}/ /; ba' -e '}'
-}
+# Fold Fortran free-form line continuations into one logical line each, so that
+# every check below sees whole statements. Without it a public procedure listed
+# on a continuation line is never checked for bind(c) at all -- see the header
+# of tools/fold-continuations.awk for the three shapes that hid things, and
+# tools/gate-selftest.sh for the cases that prove each is now caught.
+fold_continuations() { awk -f tools/fold-continuations.awk; }
 
 printf "%-22s %-9s %-7s %-8s %-10s %-5s %s\n" \
        MODULE implicit banned "bind(c)" intrinsic SPDX form

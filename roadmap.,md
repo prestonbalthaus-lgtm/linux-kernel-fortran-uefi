@@ -66,6 +66,14 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
         (vga_init_framebuffer maps the pointer via c_f_pointer and validates the
         geometry). The Multiboot2 header that REQUESTS the framebuffer does not exist
         and cannot until 1.2. Both halves of the validation must hold.
+        HAZARD FOR WHOEVER DOES 1.2: the GOP framebuffer is a PCI BAR that on
+        modern hardware sits ABOVE 4 GiB, while a bootloader identity map
+        usually covers only the low 1-4 GiB. Passing the firmware's reported
+        address straight to vga_init_framebuffer will then page-fault with no
+        IDT (3.2) installed -> double -> triple fault -> silent reboot, which
+        reads as "the kernel crashed" but is purely an unmapped address. The
+        stub must map the framebuffer range explicitly, and after 3.5 the VMM
+        must hand over the VIRTUAL address with write-combining attributes.
 
     [x] 2.3 Bitmap Font System
 

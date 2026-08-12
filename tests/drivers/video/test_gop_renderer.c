@@ -52,9 +52,20 @@ int32_t vga_font_row(int32_t ch, int32_t row);
 #define GLYPH_W  8
 #define GLYPH_H  16
 
+/* Guard regions bracketing every test framebuffer.
+ *
+ * Byte-comparing only the framebuffer itself cannot see a write that lands
+ * PAST it -- and that is precisely what a missing clip does. Removing the
+ * bottom-edge clip made vga_plot_pixel(0, fb_height) store one word beyond the
+ * allocation: a real heap overflow, invisible to a comparison bounded by the
+ * allocation. With guards, any store outside the framebuffer is a hard
+ * failure instead of silent corruption (or a malloc-metadata crash later). */
+#define GUARD 4096
+
 /* ---- reference model: an independent implementation of the same contract -- */
 
 struct fbref {
+	uint8_t *base;	/* allocation start: GUARD, framebuffer, GUARD */
 	uint8_t *px;	/* the real framebuffer handed to Fortran */
 	uint8_t *sh;	/* the shadow the reference model draws into */
 	int32_t  w, h;	/* visible geometry */
@@ -90,23 +101,34 @@ static void ref_string(struct fbref *f, const unsigned char *font,
 	int32_t i;
 
 	for (i = 0; i < max_chars; i++) {
+		int64_t gx = (int64_t)x + (int64_t)i * GLYPH_W;	/* int64: see ref_rect */
+
 		if (s[i] == '\0')
 			return;
-		ref_char(f, font, (unsigned char)s[i],
-			 x + i * GLYPH_W, y, color);
+		if (gx >= f->w)		/* wholly past the right edge */
+			return;
+		ref_char(f, font, (unsigned char)s[i], (int32_t)gx, y, color);
 	}
 }
 
+/* Bounds computed in int64 ON PURPOSE. Written the obvious way, `py < y + h`
+ * overflows in int32 for large h and the model draws nothing -- which is
+ * exactly what the module used to do, so the two agreed and the test passed
+ * while both were wrong. A reference model that shares the bug certifies
+ * nothing, so this one is widened and the module has to meet it. */
 static void ref_rect(struct fbref *f, int32_t x, int32_t y,
 		     int32_t w, int32_t h, int32_t color)
 {
-	int32_t px, py;
+	int64_t px, py;
 
 	if (w <= 0 || h <= 0)
 		return;
-	for (py = y; py < y + h; py++)
-		for (px = x; px < x + w; px++)
-			ref_plot(f, px, py, color);
+	for (py = y; py < (int64_t)y + h; py++) {
+		if (py < 0 || py >= f->h)
+			continue;
+		for (px = x; px < (int64_t)x + w; px++)
+			ref_plot(f, (int32_t)px, (int32_t)py, color);
+	}
 }
 
 /* ---- helpers ------------------------------------------------------------ */
@@ -117,19 +139,20 @@ static void fb_new(struct fbref *f, int32_t w, int32_t h, int32_t pitch)
 	f->h = h;
 	f->pitch = pitch;
 	f->bytes = (size_t)pitch * h;
-	f->px = malloc(f->bytes);
+	f->base = malloc(f->bytes + 2 * GUARD);
 	f->sh = malloc(f->bytes);
-	if (!f->px || !f->sh) {
+	if (!f->base || !f->sh) {
 		printf("  ALLOC FAILED\n");
 		exit(2);
 	}
-	memset(f->px, SENTINEL, f->bytes);
+	memset(f->base, SENTINEL, f->bytes + 2 * GUARD);
 	memset(f->sh, SENTINEL, f->bytes);
+	f->px = f->base + GUARD;	/* Fortran only ever learns this address */
 }
 
 static void fb_free(struct fbref *f)
 {
-	free(f->px);
+	free(f->base);
 	free(f->sh);
 }
 
@@ -139,6 +162,26 @@ static void fb_verify(struct fbref *f, const char *what)
 {
 	size_t i;
 	unsigned long before = fk_fails;
+
+	/* nothing may have been written outside the framebuffer at all */
+	for (i = 0; i < GUARD; i++) {
+		fk_checks++;
+		if (f->base[i] != SENTINEL) {
+			if (fk_fails - before < 3)
+				printf("  OVERRUN %s: wrote %zu bytes BEFORE the "
+				       "framebuffer (0x%02X)\n",
+				       what, GUARD - i, f->base[i]);
+			fk_fails++;
+		}
+		fk_checks++;
+		if (f->px[f->bytes + i] != SENTINEL) {
+			if (fk_fails - before < 3)
+				printf("  OVERRUN %s: wrote %zu bytes PAST the "
+				       "framebuffer (0x%02X)\n",
+				       what, i + 1, f->px[f->bytes + i]);
+			fk_fails++;
+		}
+	}
 
 	for (i = 0; i < f->bytes; i++) {
 		fk_checks++;
@@ -198,6 +241,32 @@ int main(void)
 	vga_fill_rect(0, 0, 64, 48, 0x00FFFFFF);
 	fb_verify(&f, "inert after refused init");
 
+	/* --- (2a2) INTEGER-OVERFLOW REGRESSIONS ---------------------------
+	 * Every case below was ACCEPTED (status 0) before the guard was widened
+	 * to 64 bits: `pitch_bytes < width * 4` computed the product in int32,
+	 * so for width >= 2**29 it wrapped non-positive and the comparison was
+	 * false for every possible pitch. The renderer then armed with a stride
+	 * that could not hold one visible row, and its own per-pixel clip
+	 * (x < fb_width) authorised stores far past the real framebuffer.
+	 * The last case is the nastiest: a NEGATIVE pitch, reachable only
+	 * through that wrap, which the logical shift turns into a stride of
+	 * ~1e9 words -- the first y=1 store lands ~4 GiB from base. */
+	FK_EQ("init w=2**29-1 ok-reject", -2,
+	      (int)vga_init_framebuffer(addr_of(f.px), 536870911, 1080, 7680), "%d");
+	FK_EQ("init w=2**29 (w*4==INT32_MIN)", -2,
+	      (int)vga_init_framebuffer(addr_of(f.px), 536870912, 1080, 7680), "%d");
+	FK_EQ("init w=2**30 (w*4 wraps to 0)", -2,
+	      (int)vga_init_framebuffer(addr_of(f.px), 1073741824, 1080, 7680), "%d");
+	FK_EQ("init w=INT32_MAX (w*4 == -4)", -2,
+	      (int)vga_init_framebuffer(addr_of(f.px), 2147483647, 1080, 7680), "%d");
+	FK_EQ("init negative pitch", -2,
+	      (int)vga_init_framebuffer(addr_of(f.px), 536870912, 1080, -8), "%d");
+
+	/* and nothing above may have armed the renderer or touched memory */
+	vga_plot_pixel(0, 0, 0x00FFFFFF);
+	vga_fill_rect(0, 0, 100, 100, 0x00FFFFFF);
+	fb_verify(&f, "inert after overflow-geometry rejections");
+
 	/* --- (2b) armed: edges, clipping, strings, rectangles ------------- */
 	FK_EQ("init ok", 0, (int)vga_init_framebuffer(addr_of(f.px), 64, 48, 320), "%d");
 
@@ -239,6 +308,27 @@ int main(void)
 	ref_rect(&f, -4, -4, 200, 200, 0x00040506);
 	vga_fill_rect(10, 10, 0, 5, 0x00FF00FF); ref_rect(&f, 10, 10, 0, 5, 0x00FF00FF);
 	vga_fill_rect(10, 10, -3, 5, 0x00FF00FF);ref_rect(&f, 10, 10, -3, 5, 0x00FF00FF);
+
+	/* loop-bound overflow: `py < y + h` in int32 wrapped negative and the
+	 * fill silently drew NOTHING where it should have covered the screen */
+	vga_fill_rect(2, 0, 2147483647, 48, 0x00070809);
+	ref_rect(&f, 2, 0, 2147483647, 48, 0x00070809);
+	vga_fill_rect(0, 2, 64, 2147483647, 0x000A0B0C);
+	ref_rect(&f, 0, 2, 64, 2147483647, 0x000A0B0C);
+	vga_fill_rect(2147483640, 0, 64, 48, 0x000D0E0F);
+	ref_rect(&f, 2147483640, 0, 64, 48, 0x000D0E0F);
+
+	/* string x advance: `x + (i-1)*8` in int32 wraps for very long runs and
+	 * (with -fwrapv, quietly) puts glyphs back on the LEFT edge */
+	{
+		static char longstr[64];
+		memset(longstr, 'X', sizeof(longstr) - 1);
+		longstr[sizeof(longstr) - 1] = '\0';
+		vga_print_string(longstr, 2147483647, 0, 8, 0x00111213);
+		ref_string(&f, oracle, longstr, 2147483647, 0, 8, 0x00111213);
+		vga_print_string(longstr, 2147483647, 2147483640, 24, 0x00141516);
+		ref_string(&f, oracle, longstr, 2147483647, 2147483640, 24, 0x00141516);
+	}
 
 	fb_verify(&f, "64x48 stride-80");
 	fb_free(&f);

@@ -232,6 +232,59 @@ F90
 )
 expect_reject "banned construct reachable only after folding a continuation" tools/compliance.sh "$d"
 
+d=$(mkcase c_cont_comment <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_int32_t
+  implicit none
+  private
+  public :: fk_case, &
+  ! a comment is legal between continuation lines, and comments are stripped
+  ! BEFORE folding, so this reaches the folder as a blank line
+            fk_hidden
+contains
+  function fk_case(x) result(r) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    r = x
+  end function fk_case
+  function fk_hidden(x) result(r)
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    r = x
+  end function fk_hidden
+end module fk_case_m
+F90
+)
+expect_reject "public procedure hidden past a COMMENT inside a continuation" tools/compliance.sh "$d"
+
+# Check 6 (free-form layout) was the one mandatory rule with no fixture -- the
+# only gate in the file nobody had ever watched fail. The continuation line
+# below carries exactly five leading spaces, i.e. fixed-form's continuation
+# column; everything else in the module is compliant, so this discriminates on
+# check 6 alone.
+d=$(mkcase c_fixedform <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_int32_t
+  implicit none
+  private
+  public :: fk_case
+contains
+  function fk_case(x) result(r) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    r = x + &
+     0
+  end function fk_case
+end module fk_case_m
+F90
+)
+expect_reject "fixed-form layout (non-blank in continuation column 6)" tools/compliance.sh "$d"
+
 # The mirror image: a correctly bound export whose bind(c) sits on a
 # continuation line must still be ACCEPTED. Folding that only ever adds
 # rejections would be its own defect -- it would make the gate unusable for the
