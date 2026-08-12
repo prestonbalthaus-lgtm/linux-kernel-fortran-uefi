@@ -1,0 +1,5 @@
+#ifndef _FK_SHIM_EXPORT_H
+#define _FK_SHIM_EXPORT_H
+#define EXPORT_SYMBOL(x)
+#define EXPORT_SYMBOL_GPL(x)
+#endif

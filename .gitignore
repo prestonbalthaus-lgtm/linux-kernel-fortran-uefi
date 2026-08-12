@@ -1,0 +1,6 @@
+build/
+vendor/linux-*/
+vendor/*.tar.xz
+*.o
+*.mod
+*.smod
