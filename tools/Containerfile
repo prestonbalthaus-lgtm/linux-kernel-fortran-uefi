@@ -1,5 +1,27 @@
+# The project's only build environment. tools/run.sh runs `make` inside this;
+# the host toolchain and the host kernel are never touched.
+#
+# Package groups, and why each is here:
+#   gcc gcc-gfortran make binutils    the Phase 1 differential harness
+#   diffutils findutils               gate scripts
+#   grub2-tools                       grub2-file, the Multiboot2 header gate
+#                                     (roadmap 1.2). Fedora prefixes the GRUB2
+#                                     binaries with "grub2-", so the tool the
+#                                     specification and every tutorial call
+#                                     "grub-file" is "grub2-file" here.
+#   grub2-tools-extra grub2-pc-modules xorriso mtools
+#                                     grub2-mkrescue and the BIOS boot modules
+#                                     it embeds, for the bootable ISO the QEMU
+#                                     boot gate needs.
+#   python3                           tools/mb2-check.py (the conformance gate
+#                                     grub2-file cannot replace) and
+#                                     tools/gen-font-8x16.py. Both must run
+#                                     where the build runs, or the gate proves
+#                                     something about the host instead.
 FROM fedora:44
 RUN dnf -y install --setopt=install_weak_deps=False \
         gcc gcc-gfortran make binutils diffutils findutils \
+        grub2-tools grub2-tools-extra grub2-pc-modules xorriso mtools \
+        python3 \
     && dnf clean all
 WORKDIR /work

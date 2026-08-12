@@ -15,18 +15,19 @@ CFLAGS := -O2 -std=gnu11 -Wall -Itests/shims -Itests/harness -fno-builtin
 # exactly why it must not be dropped casually. See docs/AUDIT-PHASE1.md, A-4.
 FFLAGS := -O2 -fwrapv -fno-underscoring -Wall -J$(BUILD)
 
-# The flag set the kernel actually builds x86_64 with, mirrored from
-# $(KDIR)/arch/x86/Makefile. Used by `make kflags-test` and tools/linktest.sh.
-KFLAGS := -O2 -fwrapv -fno-underscoring \
-          -mcmodel=kernel -mno-red-zone -fno-pic -fno-stack-protector \
-          -fno-asynchronous-unwind-tables -fno-common -fno-strict-aliasing \
-          -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a \
-          -mno-80387 -mno-fp-ret-in-387
-
+# KFLAGS -- the real kernel flag set -- now lives in mk/kflags.mk, because
+# Makefile.boot and tools/linkscript-test.sh must use exactly the same list and
+# a second copy would eventually disagree with this one. It arrives via the
+# wildcard include below.
 TESTS :=
 include $(sort $(wildcard mk/*.mk))
 
-.PHONY: test symcheck clean list kflags-test selftest audit linkscript
+# Stated explicitly: mk/*.mk is a wildcard, and a fragment that ever defines a
+# rule would otherwise silently steal the default goal from `test`.
+.DEFAULT_GOAL := test
+
+.PHONY: test symcheck clean list kflags-test selftest audit linkscript \
+        kernel iso mbcheck symcheck-boot clean-boot bootgate
 test: $(addprefix $(BUILD)/run-,$(TESTS))
 	@echo "=== all $(words $(TESTS)) translation(s) matched the C oracle ==="
 
@@ -49,29 +50,60 @@ linkscript:
 selftest:
 	@bash tools/gate-selftest.sh
 
+# Roadmap 1.2/0.2: the bootable kernel image. Delegated to Makefile.boot so
+# that the Phase 1 differential harness above cannot be disturbed by boot work
+# -- different flags, different objects, different output directory.
+kernel iso mbcheck symcheck-boot clean-boot bootgate:
+	@$(MAKE) --no-print-directory -f Makefile.boot $@
+
 # Everything a translation must survive before it is considered done.
 audit: selftest test kflags-test symcheck
 	@bash tools/compliance.sh
 	@bash tools/linktest.sh
 	@bash tools/linkscript-test.sh
+	@$(MAKE) --no-print-directory -f Makefile.boot bootgate
 	@echo "=== full audit clean ==="
+
+# FSRC_<test> is a LIST, in module-dependency order: a translation may be split
+# across several modules (fk_font_8x16 + fk_gop_renderer), and splitting one is
+# a refactor of the code under test, not a reason to fight the harness.
+#
+# Objects are named fk_<test>__<basename>.o so two tests may name a source file
+# the same way without silently overwriting each other's object.
+fobj = $(foreach s,$(FSRC_$(1)),$(BUILD)/fk_$(1)__$(basename $(notdir $(s))).o)
+
+define FSRC_template
+$(BUILD)/fk_$(1)__$(basename $(notdir $(2))).o: $(2) | $(BUILD)
+	gfortran $$(FFLAGS) -c -o $$@ $$<
+endef
 
 define TEST_template
 $(BUILD)/oracle-$(1).o: $(KDIR)/$(ORACLE_$(1)) | $(BUILD)
 	gcc $(CFLAGS) $(CFLAGS_$(1)) -c -o $$@ $$<
-$(BUILD)/fk_$(1).o: $(FSRC_$(1)) | $(BUILD)
-	gfortran $(FFLAGS) -c -o $$@ $$<
 $(BUILD)/drv-$(1).o: $(DRV_$(1)) | $(BUILD)
 	gcc $(CFLAGS) $(CFLAGS_$(1)) -c -o $$@ $$<
-$(BUILD)/run-$(1): $(BUILD)/oracle-$(1).o $(BUILD)/fk_$(1).o $(BUILD)/drv-$(1).o
+$(BUILD)/run-$(1): $(BUILD)/oracle-$(1).o $(call fobj,$(1)) $(BUILD)/drv-$(1).o
 	gcc -o $$@ $$^
 	@./$$@
 endef
+$(foreach t,$(TESTS),$(foreach s,$(FSRC_$(t)),$(eval $(call FSRC_template,$(t),$(s)))))
 $(foreach t,$(TESTS),$(eval $(call TEST_template,$(t))))
+
+# gfortran emits <module>.mod as a SIDE EFFECT of producing the .o, and a USE
+# cannot compile until that .mod exists. Chain each object on the previous one
+# so `make -j` honours the order the fragment declares instead of racing on it.
+# (Spelling the prerequisite on the .o rather than on the .mod is deliberate:
+# gfortran leaves an unchanged .mod's timestamp alone, so a .mod-as-target rule
+# oscillates between out-of-date and up-to-date forever.)
+$(foreach t,$(TESTS),\
+  $(eval fk_prev :=)\
+  $(foreach o,$(call fobj,$(t)),\
+    $(if $(fk_prev),$(eval $(o): $(fk_prev)))\
+    $(eval fk_prev := $(o))))
 
 # Kernel-linkability gate: a Fortran object destined for kernel space must not
 # pull in the libgfortran runtime. Any _gfortran_* undefined symbol fails.
-symcheck: $(addprefix $(BUILD)/fk_,$(addsuffix .o,$(TESTS)))
+symcheck: $(foreach t,$(TESTS),$(call fobj,$(t)))
 	@fail=0; for o in $^; do \
 	  if nm -u $$o | grep -q '_gfortran_'; then \
 	    echo "  FAIL $$o depends on libgfortran:"; nm -u $$o | grep '_gfortran_'; fail=1; \

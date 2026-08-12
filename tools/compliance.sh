@@ -62,10 +62,27 @@ for f in $(find "$SRCDIR" -name 'fk_*.f90' | sort); do
   # delete the newlines too and fuse `public :: a, b` into a single token.
   pubs=$(grep -hE '^[[:space:]]*public[[:space:]]*::' "$code" \
          | sed 's/^[^:]*:://' | tr ',&' '\n\n' | sed 's/[[:blank:]]//g' | grep -v '^$')
+  #
+  # SCOPE OF THIS RULE. It exists because everything this project exports
+  # crosses into C or assembly, where gfortran's name mangling and calling
+  # conventions are not the contract. That applies to PROCEDURES and to module
+  # VARIABLES, both of which become real symbols.
+  #
+  # It does NOT apply to a public PARAMETER: a Fortran named constant is a
+  # compile-time value that produces no symbol, has no calling convention and
+  # has nothing to name across an ABI. FONT_W/FONT_H in fk_font_8x16 are the
+  # case in point -- they are the font's geometry, USEd by the renderer at
+  # compile time. Requiring bind(c) on them would be requiring a C binding for
+  # the number 8. The exemption is deliberately narrow: it fires only when the
+  # name really is declared PARAMETER in this file, so a public module variable
+  # is still held to the rule.
   missing=""
   for p in $pubs; do
     grep -qE "(function|subroutine)[[:space:]]+${p}[[:space:]]*\(.*bind[[:space:]]*\([[:space:]]*c" "$code" \
-      || missing="$missing $p"
+      && continue
+    grep -qiE "^[[:space:]]*[^!]*,[[:space:]]*parameter[[:space:]]*::.*(^|[^A-Za-z0-9_])${p}([^A-Za-z0-9_]|$)" "$code" \
+      && continue
+    missing="$missing $p"
   done
   if [ -z "$pubs" ]; then
     bindc=NO-PUBLIC; fail=1; notes="$notes no-public-export"

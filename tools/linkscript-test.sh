@@ -6,18 +6,18 @@
 # asserted in a commit message -- same standard tools/linktest.sh holds the
 # modules to.
 #
-# This links the REAL nine kernel modules, not a toy object, so the test fails
-# if the script cannot place what the tree actually produces. The entry symbol
-# is a throwaway stub generated here: the real one is roadmap 1.2 and does not
-# exist yet, and inventing it in this script would be building 1.2 by accident.
+# This links the REAL kernel modules and the REAL boot stub, not toy objects,
+# so the test fails if the script cannot place what the tree actually produces.
+# (Until roadmap 1.2 existed this used a throwaway `hlt` stub for ENTRY; now
+# boot/boot.S is here, the gate links the thing that will actually boot -- which
+# is what makes the .multiboot_header and .bootpt placement checks below real.)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-KFLAGS="-O2 -fwrapv -fno-underscoring \
-        -mcmodel=kernel -mno-red-zone -fno-pic -fno-stack-protector \
-        -fno-asynchronous-unwind-tables -fno-common -fno-strict-aliasing \
-        -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a \
-        -mno-80387 -mno-fp-ret-in-387"
+# The kernel flag set, read back from its single source of truth rather than
+# kept as a fourth copy. mk/kflags.mk defines KFLAGS and nothing else.
+KFLAGS=$(printf 'include mk/kflags.mk\nprint:\n\t@echo $(KFLAGS)\n' | make -s -f - print) || {
+  echo "  FAIL  cannot read KFLAGS out of mk/kflags.mk"; exit 1; }
 
 WORK=$(mktemp -d) || exit 1
 trap 'rm -rf "$WORK"' EXIT
@@ -29,32 +29,39 @@ bad() { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
 want() { [ "$2" = "$3" ] && ok "$1 = $2" || bad "$1: expected $2, got $3"; }
 
 echo "=== building the real kernel objects under KFLAGS ==="
-objs=""
-for f in $(find src -name 'fk_*.f90' | sort); do
-  n=$(basename "$f" .f90)
-  if gfortran $KFLAGS -J"$WORK" -c -o "$WORK/$n.o" "$f" 2>"$WORK/$n.err"; then
-    objs="$objs $WORK/$n.o"
-  else
-    bad "$n does not compile under KFLAGS"; sed 's/^/        /' "$WORK/$n.err" | head -3
-  fi
+# Two passes, because one module USEs another and a single alphabetical pass
+# only happens to work today: whatever fails for want of a .mod is retried once
+# the rest have been compiled. Anything still failing is a real failure.
+objs=""; pending=$(find src -name 'fk_*.f90' | sort)
+for attempt in 1 2; do
+  retry=""
+  for f in $pending; do
+    n=$(basename "$f" .f90)
+    if gfortran $KFLAGS -J"$WORK" -c -o "$WORK/$n.o" "$f" 2>"$WORK/$n.err"; then
+      objs="$objs $WORK/$n.o"
+    elif [ "$attempt" = 1 ]; then
+      retry="$retry $f"
+    else
+      bad "$n does not compile under KFLAGS"; sed 's/^/        /' "$WORK/$n.err" | head -3
+    fi
+  done
+  pending="$retry"
+  [ -z "$pending" ] && break
 done
 echo "  $(echo $objs | wc -w) objects"
 
-# Throwaway entry point. Deliberately minimal: proves the script can resolve
-# ENTRY(_start), nothing more. Roadmap 1.2 replaces this.
-cat > "$WORK/stub.S" <<'ASM'
-        .section .text.boot, "ax", @progbits
-        .globl _start
-_start:
-        hlt
-        jmp _start
-ASM
-gcc -c -o "$WORK/stub.o" "$WORK/stub.S" || bad "stub assembly failed"
+# The real entry point (roadmap 1.2). Assembled exactly the way Makefile.boot
+# assembles it -- through gcc, so cpp expands the PHYS() macro.
+if gcc -m64 -fno-pic -Wall -c -o "$WORK/boot.o" boot/boot.S 2>"$WORK/boot.err"; then
+  ok "boot/boot.S assembles"
+else
+  bad "boot/boot.S does not assemble:"; sed 's/^/        /' "$WORK/boot.err" | head -8
+fi
 
 echo
 echo "=== linking with linker.ld ==="
 if ld -nostdlib -z max-page-size=0x1000 -T linker.ld \
-      -o "$WORK/kernel.elf" "$WORK/stub.o" $objs 2>"$WORK/link.err"; then
+      -o "$WORK/kernel.elf" "$WORK/boot.o" $objs 2>"$WORK/link.err"; then
   ok "links (ASSERTs in linker.ld all held)"
 else
   bad "link failed:"; sed 's/^/        /' "$WORK/link.err" | head -12
@@ -121,6 +128,69 @@ done
 bs=$(sym __bss_start); be=$(sym __bss_end)
 if [ $(( be > bs )) -eq 1 ]; then ok ".bss is non-empty ($(( be - bs )) bytes incl. 16 KiB stack)"
 else bad ".bss is empty or inverted"; fi
+
+echo
+echo "=== roadmap 1.2: the Multiboot2 header and the boot page tables ==="
+# boot.S cannot import a linker script constant, so it redefines KERNEL_VMA.
+# A silent divergence would shift every PHYS() by a fixed offset and produce a
+# kernel that triple-faults the instant paging comes on. boot.S's header comment
+# promises this gate diffs the two; this is that diff.
+# Compared as normalised hex TEXT, not as numbers: 0xFFFFFFFF80000000 exceeds
+# the range of bash's signed 64-bit arithmetic, so `printf %d` fails on both
+# sides and a numeric comparison passes by accident -- a check that cannot fail
+# is worse than no check.
+norm_hex() { printf '%s' "$1" | tr 'A-F' 'a-f' | sed 's/^0x0*/0x/'; }
+vma_ld=$(sed -n 's/^ *KERNEL_VMA *= *\(0x[0-9A-Fa-f]*\).*/\1/p' linker.ld | head -1)
+vma_s=$(sed -n 's/^#define KERNEL_VMA *\(0x[0-9A-Fa-f]*\).*/\1/p' boot/boot.S | head -1)
+if [ -z "$vma_ld" ] || [ -z "$vma_s" ]; then
+  bad "cannot read KERNEL_VMA from linker.ld ('${vma_ld:-?}') or boot.S ('${vma_s:-?}')"
+elif [ "$(norm_hex "$vma_ld")" = "$(norm_hex "$vma_s")" ]; then
+  ok "KERNEL_VMA agrees between linker.ld and boot.S ($vma_ld)"
+else
+  bad "KERNEL_VMA differs: linker.ld says '$vma_ld', boot.S says '$vma_s'"
+fi
+
+mbaddr=$(secaddr .multiboot_header)
+want "the Multiboot2 header sits at the image base" "$(sym __kernel_start)" "$mbaddr"
+want "mb2_header_start is the first byte of the image" "$(sym __kernel_start)" "$(sym mb2_header_start)"
+first=$(readelf -SW "$K" | sed 's/^ *\[[ 0-9]*\] *//' | awk '$2 ~ /^(PROGBITS|NOBITS)$/{print $1; exit}')
+want "the first section in the image is the header" ".multiboot_header" "$first"
+hdrlen=$(( $(sym mb2_header_end) - $(sym mb2_header_start) ))
+if [ "$hdrlen" -gt 0 ] && [ "$hdrlen" -le 32768 ]; then
+  ok "header is $hdrlen bytes, inside the 32 KiB the spec lets a loader scan"
+else bad "header length is $hdrlen bytes"; fi
+
+# The page tables must NOT be in the region boot.S zeroes -- see the .bootpt
+# comment in linker.ld. This is the check that keeps that argument true.
+bp_s=$(sym __bootpt_start); bp_e=$(sym __bootpt_end)
+bs=$(sym __bss_start);      be=$(sym __bss_end)
+if [ -z "$bp_s" ]; then bad "__bootpt_start missing: where did the page tables go?"
+elif [ $(( bp_s >= be || bp_e <= bs )) -eq 1 ]; then
+  ok "boot page tables [$bp_s,$bp_e) are outside the .bss clear [$bs,$be)"
+else
+  bad "boot page tables OVERLAP the region boot.S zeroes -- clearing .bss would"
+  bad "erase the live PML4 and triple-fault on the next instruction fetch"
+fi
+if [ $(( bp_s & 0xFFF )) -eq 0 ]; then ok "boot page tables are 4 KiB aligned"
+else bad "boot page tables at $bp_s are not 4 KiB aligned (CR3 requires it)"; fi
+for t in pml4_table pdpt_low pdpt_high pd_table; do
+  a=$(sym $t)
+  if [ -z "$a" ]; then bad "$t is not in the image"
+  elif [ $(( a >= bp_s && a < bp_e )) -eq 1 ]; then ok "$t is inside .bootpt"
+  else bad "$t at $a is outside .bootpt [$bp_s,$bp_e)"; fi
+done
+bptype=$(readelf -SW "$K" | sed 's/^ *\[[ 0-9]*\] *//' | awk '$1==".bootpt"{print $2}')
+want ".bootpt occupies no file space" "NOBITS" "$bptype"
+
+# GRUB's own rule about the entry point, plus the whole header contract.
+echo
+echo "=== the linked image is one GRUB would accept (tools/mb2-check.py) ==="
+if python3 tools/mb2-check.py "$K" --quiet; then
+  ok "Multiboot2 conformance of the fully-linked image"
+else
+  bad "the fully-linked image fails Multiboot2 conformance"
+  python3 tools/mb2-check.py "$K" | sed 's/^/        /'
+fi
 
 echo
 echo "=== the font really is read-only ==="

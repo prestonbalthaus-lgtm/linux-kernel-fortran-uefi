@@ -5,3 +5,4 @@ vendor/*.tar.xz
 *.mod
 *.smod
 build-kflags/
+__pycache__/

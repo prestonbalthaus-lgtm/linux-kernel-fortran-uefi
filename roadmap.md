@@ -20,20 +20,33 @@ Before any Fortran is written, the autonomous build environment must be establis
 
         Validation: Makefile successfully runs gfortran -ffreestanding and links with ld.
 
-        NOT DONE. The existing Makefile builds and runs HOST differential tests; it has no
-        kernel link rule and produces no kernel image. `make linkscript` links one only to
-        validate 0.1, in a temp dir, then throws it away. When this is built it MUST pass
-        `-z max-page-size=0x1000` to ld, or GNU ld pads every PT_LOAD to 2 MiB and a
-        ~19 KiB kernel becomes multi-megabyte.
+        SUBSTANTIALLY DONE by 1.2, not ticked because the box is the Lead Architect's
+        to close. `Makefile.boot` builds and links a real kernel image
+        (`./tools/run.sh kernel`, or `iso`, `bootgate`), separate from ./Makefile so the
+        Phase 1 differential harness cannot be disturbed by boot work. It passes
+        `-z max-page-size=0x1000`, without which GNU ld pads every PT_LOAD to 2 MiB and
+        the 19 KiB kernel becomes multi-megabyte.
+
+        One deviation from the wording: `-ffreestanding` is NOT passed. It is a C-only
+        flag; f951 does not accept it. The property it stands for -- no libc, no
+        libgfortran -- is enforced directly instead, by `make symcheck-boot` and
+        tools/linktest.sh, which fail on any undefined symbol this tree does not itself
+        define. KFLAGS now lives in `mk/kflags.mk` so the harness, the kernel build and
+        the layout gate cannot drift apart.
 
   *  [ ] 0.3 Configure QEMU Test Harness
 
         Validation: A script (run.sh) exists that packages the kernel into an ISO and launches qemu-system-x86_64 -m 24G -smp 6 -bios OVMF.fd.
 
-        NOT DONE, and mind the NAME COLLISION: `tools/run.sh` already exists and is the
-        podman wrapper that runs make inside the container. It is unrelated. Call the QEMU
-        harness something else (`tools/qemu-run.sh`) rather than overwriting a script the
-        whole build depends on.
+        HALF DONE by 1.2. `tools/qemu-boot-test.sh` packages the kernel into a GRUB
+        rescue ISO and launches `qemu-system-x86_64 -smp 6 -m 24G` headless, then asserts
+        the boot in guest physical memory over QMP (see 1.2). The name collision was
+        heeded: `tools/run.sh` is untouched and still the podman wrapper.
+
+        The MISSING half is `-bios OVMF.fd`. Today's harness boots the BIOS/GRUB path,
+        which is what Multiboot2 is; the UEFI path that the Minisforum actually uses is a
+        different first stage (linker.ld's header describes it) and is not exercised by
+        anything yet. Do not read the current PASS as evidence about UEFI.
 
 ## ⚙️ Phase 1: The Boot Layer & Bare-Metal Runtime
 
@@ -52,9 +65,39 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
         must translate lib/string.c first. Note 1.3 below needs memcpy/memset anyway, so
         that is where the debt gets paid.
 
-  *  [ ] 1.2 Multiboot2 / EFI Assembly Stub
+  *  [x] 1.2 Multiboot2 / EFI Assembly Stub  (Multiboot2 half only)
 
         Validation: Assembly code (boot.S) successfully transitions CPU to 64-bit Long Mode and jumps to kernel_main().
+
+        DONE for the MULTIBOOT2 path, and proven on a running CPU rather than asserted:
+        `tools/qemu-boot-test.sh` boots the ISO headless (-smp 6 -m 24G) and reads the
+        four-word sentinel back out of guest physical memory over QMP. Word 3 is
+        TAG xor magic, computed by Fortran at run time from the value GRUB left in EAX,
+        so a pass is evidence that LIVE loader data crossed the asm -> Fortran ABI --
+        not merely that the machine failed to crash.
+
+        `grub2-file --is-x86-multiboot2` exits 0 (Fedora prefixes the GRUB binaries with
+        "grub2-"; it is the tool the spec calls grub-file). That gate is necessary and
+        NOT sufficient: tools/mb2-selftest.sh injects seven defects and five of them --
+        including a boot-fatal entry point -- are accepted by grub2-file and caught only
+        by tools/mb2-check.py.
+
+        THE ONE THAT COST A BOOT: e_entry must stay VIRTUAL. GRUB's ELF64 loader finds
+        the PT_LOAD whose [p_vaddr, p_vaddr+p_memsz) contains e_entry and translates it
+        into that segment's physical terms itself. ENTRY(_start_phys) -- the obvious
+        "the loader jumps with paging off, so give it a physical address" reading -- is
+        refused with "entry point isn't in a segment", BEFORE the Multiboot2 entry-address
+        tag is consulted. Both are now emitted and must agree; the gate asserts it.
+
+        The EFI half of this box is NOT done. There is no BOOTX64.EFI, and the framebuffer
+        tag is deliberately absent (see 2.2).
+
+  *  [ ] 1.2b Long-mode entry hardening (deferred, not started)
+
+        The identity map built by boot.S covers the low 1 GiB only, and PML4[0] is left
+        mapped after the higher-half jump because GDTR still holds a physical base. Both
+        are 3.5's to clean up: unmapping the identity window requires reloading GDTR with
+        the higher-half address first.
 
   *  [ ] 1.3 Custom Fortran Runtime Stubs
 
@@ -76,10 +119,12 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
 
         Validation: Multiboot2 header successfully requests the framebuffer; Fortran pointer maps to the physical video memory address.
 
-        HALF DONE, deliberately not ticked: the Fortran side is finished and tested
-        (`vga_init_framebuffer` maps the pointer via c_f_pointer and validates the
-        geometry). The Multiboot2 header that REQUESTS the framebuffer does not exist and
-        cannot until 1.2. Both halves of the validation must hold.
+        STILL HALF DONE. The Fortran side is finished and tested (`vga_init_framebuffer`
+        maps the pointer via c_f_pointer and validates the geometry). The Multiboot2
+        header now EXISTS (1.2) but deliberately does NOT request a framebuffer: tag
+        type 5 switches GRUB into a graphics mode, and the address it then reports is
+        routinely outside the 1 GiB the boot stub identity-maps. boot/boot.S carries the
+        exact tag to add and the mapping work that must land with it.
 
         HAZARD FOR WHOEVER DOES 1.2: the GOP framebuffer is a PCI BAR that on modern
         hardware sits ABOVE 4 GiB, while a bootloader identity map usually covers only the
@@ -93,7 +138,16 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
 
         Validation: An 8x16 hex bitmap font array is hardcoded into a Fortran module.
 
-        DONE: `src/drivers/video/fk_gop_renderer.f90`, `FONT_8X16`, 4096 bytes in .rodata.
+        DONE, and since moved: the table lives in its own module,
+        `src/drivers/video/fk_font_8x16.f90` (`FONT_8X16`, 4096 bytes in .rodata), with
+        `vga_font_row()` as its only interface. The renderer USEs it and carries no glyph
+        data at all. The accessor is not decoration: a Fortran PARAMETER array is
+        materialised into the .rodata of every object that indexes it, so a renderer that
+        indexed the array directly would put a SECOND 4 KiB copy in the kernel image.
+        Verified: one `MOD_font_8x16` symbol, in .rodata, `nm` on the renderer object
+        shows only an undefined `vga_font_row`.
+
+        Previously: `src/drivers/video/fk_gop_renderer.f90`, `FONT_8X16`, 4096 bytes in .rodata.
         Generated from the kernel's own `lib/fonts/font_8x16.c` by `tools/gen-font-8x16.py`
         (re-running it yields a zero diff), and all 4096 bytes are diffed against the
         compiled `font_vga_8x16` oracle by the test suite. A single flipped bit is caught.

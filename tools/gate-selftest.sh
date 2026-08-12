@@ -320,6 +320,54 @@ else
   bad "compliance.sh rejects a correctly bound multi-line signature"
 fi
 
+# The bind(c) rule exempts public PARAMETERs (a named constant has no symbol
+# and no ABI -- see the rule's comment in compliance.sh). These two cases fix
+# the boundary of that exemption in place: a public constant is fine, a public
+# module VARIABLE is not. Without the second case, "it's not a procedure" would
+# have quietly become a way to export unbound data.
+d=$(mkcase c_param_ok <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_int32_t
+  implicit none
+  private
+  public :: FK_WIDTH, fk_case
+  integer(c_int32_t), parameter :: FK_WIDTH = 8_c_int32_t
+contains
+  function fk_case(x) result(r) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    integer(c_int32_t) :: r
+    r = x * FK_WIDTH
+  end function fk_case
+end module fk_case_m
+F90
+)
+if bash "$REPO/tools/compliance.sh" "$d" >/dev/null 2>&1; then
+  ok "compliance.sh accepts a public PARAMETER with no bind(c)"
+else
+  bad "compliance.sh rejects a public PARAMETER -- a named constant has no ABI"
+fi
+
+d=$(mkcase c_pubvar <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_int32_t
+  implicit none
+  private
+  public :: fk_counter, fk_case
+  integer(c_int32_t) :: fk_counter = 0_c_int32_t
+contains
+  subroutine fk_case(x) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    fk_counter = x
+  end subroutine fk_case
+end module fk_case_m
+F90
+)
+expect_reject "public module VARIABLE exported without bind(c)" tools/compliance.sh "$d"
+
 echo
 echo "=== linktest.sh: freestanding gates reject a runtime-dependent module ==="
 
@@ -340,6 +388,36 @@ end module fk_case_m
 F90
 )
 expect_reject "module that calls into libgfortran (print *)" tools/linktest.sh "$d"
+
+# linktest's undefined-symbol rule was relaxed from "zero undefined symbols" to
+# "every undefined symbol is defined elsewhere in this tree" when roadmap 1.2
+# introduced fk_kmain -> fk_cpu_halt (assembly) and fk_gop_renderer ->
+# vga_font_row (the font module). This case is the proof that the relaxation
+# did not turn into "any undefined symbol is fine": nothing in the tree defines
+# fk_no_such_primitive, so it must still be rejected. Without it, a typo in an
+# interface block would link cleanly in the gate and fail at kernel link time.
+d=$(mkcase l_orphan <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_int32_t
+  implicit none
+  private
+  public :: fk_case
+  interface
+    subroutine fk_no_such_primitive() bind(c, name="fk_no_such_primitive")
+      implicit none
+    end subroutine fk_no_such_primitive
+  end interface
+contains
+  subroutine fk_case(x) bind(c, name="fk_case")
+    implicit none
+    integer(c_int32_t), intent(in), value :: x
+    if (x > 0_c_int32_t) call fk_no_such_primitive()
+  end subroutine fk_case
+end module fk_case_m
+F90
+)
+expect_reject "call to an external nothing in the tree defines" tools/linktest.sh "$d"
 
 echo
 echo "=== FP/vector detector fires on an object that really contains SSE ==="
