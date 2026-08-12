@@ -3,7 +3,8 @@
 #
 # Drives the mutation table in docs/HARNESS-VALIDATION-PHASE3.md: injects one
 # defect at a time into the roadmap 3.1/3.2 code, rebuilds from clean, boots it
-# and restores the tree.  A mutation the boot gate ACCEPTS is an ESCAPE.
+# and restores the tree.  The baseline run must PASS; a MUTATION that passes is
+# an ESCAPE, because the gate accepted a kernel with a known defect in it.
 #
 # Edits the working tree in place and restores with `git checkout`, so run it on
 # a clean tree.  Needs a VM, so it runs on the host, not in the container.
@@ -31,9 +32,9 @@ run_case() {
   line=$(grep -aE "EXCEPTION 0x|RBX|RBP|QEMU EXITED|did NOT trap" "$OUT/$name.log" \
          | head -4 | tr -d '\r' | sed 's/^ *//' | paste -sd'|')
   if [ $rc -eq 0 ]; then
-    echo "$name: gate PASSED (ESCAPE) :: $line"
+    echo "$name: gate PASSED :: $line"
   else
-    echo "$name: gate FAILED (caught) :: $line"
+    echo "$name: gate FAILED :: $line"
   fi
 }
 

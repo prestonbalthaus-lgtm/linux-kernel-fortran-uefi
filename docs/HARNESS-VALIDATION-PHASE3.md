@@ -72,7 +72,7 @@ and restored. A mutation the gate accepts is an ESCAPE.
 | M1 | `ISR_NOERR` pushes no dummy error code | **caught** — headline reads `ERR 0xFFFFFFFF80101E1F`, a return address where a zero belongs |
 | M2 | IDT gates installed with the present bit clear | **caught** — triple fault; QEMU exits under `-no-reboot` |
 | M3 | `%rbx` and `%rbp` pushed in the wrong order | ESCAPE |
-| M4 | `fk_isr_stub` returns the stub for vector n+1 | **caught** — `EXCEPTION 0x01 -- #DB Debug` |
+| M4 | `fk_isr_stub` returns the stub for vector n+1 | **caught** — `EXCEPTION 0x01 ERR 0x0000000000000000 -- #DB Debug` |
 | M5 | no `CLD` before calling into Fortran | ESCAPE |
 
 M1 escaped on the first pass and is the reason the panic headline carries the
