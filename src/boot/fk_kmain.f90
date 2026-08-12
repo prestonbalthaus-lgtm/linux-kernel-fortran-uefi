@@ -1,13 +1,16 @@
 ! SPDX-License-Identifier: GPL-2.0
 ! Fortran entry point for the Multiboot2 boot path.  boot/boot.S calls
-! kernel_main once the CPU is in 64-bit long mode; it records the loader
-! handoff in fk_boot_sentinel, brings COM1 up, prints a banner and parks the
-! CPU.  tools/qemu-boot-test.sh reads the sentinel back over QMP and greps the
+! kernel_main once the CPU is in 64-bit long mode; it records the loader handoff
+! in fk_boot_sentinel, brings COM1 up, installs the GDT and IDT, and then faults
+! on purpose so roadmap 3.2's catcher has something to catch.
+! tools/qemu-boot-test.sh reads the sentinel back over QMP and greps the
 ! captured COM1 log.
 module fk_kmain_m
   use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t, c_char, &
                                          c_null_char
   use fk_serial_m, only: FK_SERIAL_COM1, serial_init, serial_print_string
+  use fk_gdt_m,    only: gdt_init
+  use fk_idt_m,    only: idt_init
   implicit none
   private
   public :: kernel_main
@@ -40,6 +43,24 @@ module fk_kmain_m
   ! this string is ABSENT from the log.
   character(kind=c_char, len=*), parameter :: FK_SELFTEST_FAILED = &
        "Fortran Kernel: COM1 loopback self-test FAILED." // FK_CRLF // c_null_char
+
+  character(kind=c_char, len=*), parameter :: FK_GDT_READY = &
+       "Fortran Kernel: GDT loaded, flat 64-bit model." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IDT_READY = &
+       "Fortran Kernel: IDT loaded, 32 CPU exceptions armed." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TRIGGER = &
+       "Fortran Kernel: dividing by zero on purpose (roadmap 3.2)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NO_FAULT = &
+       "Fortran Kernel: the divide by zero did NOT trap." // FK_CRLF // c_null_char
+
+  ! BOTH operands are volatile, and that is not belt and braces: with a literal
+  ! numerator gcc rewrites 1/x into a compare against +-1 and emits no DIV at
+  ! all, so the fault this milestone exists to raise never happens.  Module
+  ! scope keeps the values inspectable in guest memory.
+  integer(c_int32_t), volatile :: fk_dividend = 1_c_int32_t
+  integer(c_int32_t), volatile :: fk_divisor  = 0_c_int32_t
+  integer(c_int32_t), volatile :: fk_quotient = 0_c_int32_t
 
   interface
     ! Parks this CPU permanently (CLI; HLT) and never returns.  In boot/boot.S,
@@ -80,6 +101,20 @@ contains
 
     if (status /= 0_c_int32_t) call serial_print_string(FK_SELFTEST_FAILED)
 
+    call gdt_init()
+    call serial_print_string(FK_GDT_READY)
+    call idt_init()
+    call serial_print_string(FK_IDT_READY)
+
+    ! Roadmap 3.2's validation: a real #DE, raised by the CPU rather than
+    ! simulated by a call.
+    call serial_print_string(FK_TRIGGER)
+    fk_dividend = 1_c_int32_t
+    fk_divisor  = 0_c_int32_t
+    fk_quotient = fk_dividend / fk_divisor
+
+    ! Reached only if vector 0 returned, which no gate installed here does.
+    call serial_print_string(FK_NO_FAULT)
     call fk_cpu_halt()
   end subroutine kernel_main
 

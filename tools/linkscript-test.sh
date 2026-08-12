@@ -20,20 +20,27 @@ want() { [ "$2" = "$3" ] && ok "$1 = $2" || bad "$1: expected $2, got $3"; }
 echo "=== building the real kernel objects under KFLAGS ==="
 # Two passes: a module that USEs another may need a .mod not written yet.
 objs=""; pending=$(find src -name 'fk_*.f90' | sort)
-for attempt in 1 2; do
+# Retry until a pass adds nothing.  Path order is not USE order, and the chains
+# are deeper than one level (fk_kmain -> fk_idt -> fk_gdt), so a fixed number of
+# passes silently mistakes "not compiled yet" for "does not compile".
+while [ -n "$pending" ]; do
   retry=""
   for f in $pending; do
     n=$(basename "$f" .f90)
     if gfortran $KFLAGS -J"$WORK" -c -o "$WORK/$n.o" "$f" 2>"$WORK/$n.err"; then
       objs="$objs $WORK/$n.o"
-    elif [ "$attempt" = 1 ]; then
-      retry="$retry $f"
     else
-      bad "$n does not compile under KFLAGS"; sed 's/^/        /' "$WORK/$n.err" | head -3
+      retry="$retry $f"
     fi
   done
+  if [ "$(echo $retry | wc -w)" -eq "$(echo $pending | wc -w)" ]; then
+    for f in $retry; do
+      n=$(basename "$f" .f90)
+      bad "$n does not compile under KFLAGS"; sed 's/^/        /' "$WORK/$n.err" | head -3
+    done
+    break
+  fi
   pending="$retry"
-  [ -z "$pending" ] && break
 done
 echo "  $(echo $objs | wc -w) objects"
 

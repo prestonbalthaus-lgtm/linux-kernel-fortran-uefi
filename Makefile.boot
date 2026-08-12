@@ -54,11 +54,11 @@ LDFLAGS_KERNEL := -nostdlib -z max-page-size=0x1000 -T linker.ld
 
 # Fortran sources linked into the image, in module-dependency order.
 #
-# THE ORDER OF THIS LIST IS SEMANTIC, not cosmetic: fk_kmain USEs fk_serial_m,
-# so fk_serial.f90 must be compiled first for its .mod to exist. The generator
-# under "module ordering" below turns this list's order into real prerequisites,
-# which is what makes that true under `make -j` as well as serially. Reordering
-# these two lines reorders the build.
+# THE ORDER OF THIS LIST IS SEMANTIC, not cosmetic: fk_idt USEs fk_gdt_m and
+# fk_serial_m, fk_kmain USEs all three, and a .mod exists only once the module
+# that produces it has been compiled. The generator under "module ordering"
+# below turns this list's order into real prerequisites, which is what makes
+# that true under `make -j` as well as serially.
 #
 # Only the boot path is here, and that rule has NOT been relaxed. The library
 # and driver modules are proven to link into this layout by
@@ -67,9 +67,11 @@ LDFLAGS_KERNEL := -nostdlib -z max-page-size=0x1000 -T linker.ld
 # the thing being booted, which is exactly the kind of unexplained bulk a boot
 # failure then has to be untangled from. fk_serial is in the image for precisely
 # the reason the rule states: roadmap 2.1 made kernel_main CALL it, so it is
-# boot path now, not library. The next module to appear here should have to
-# clear the same bar.
+# boot path now, not library. fk_gdt and fk_idt clear the same bar for roadmap
+# 3.1/3.2, and the next module to appear here has to clear it too.
 FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
+               src/cpu/fk_gdt.f90 \
+               src/cpu/fk_idt.f90 \
                src/boot/fk_kmain.f90
 
 # Assembly sources. NAMED ONE BY ONE, deliberately not $(wildcard boot/*.S):
@@ -89,7 +91,9 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
 # with KEEP() as its first output section and ASSERTs the 32 KiB bound, so input
 # object order does not decide it, and `make mbcheck` would catch it if it did.
 ASRC_KERNEL := boot/boot.S \
-               boot/io.S
+               boot/io.S \
+               boot/gdt_flush.S \
+               boot/interrupts.S
 
 AOBJ := $(patsubst boot/%.S,$(BUILD)/%.o,$(ASRC_KERNEL))
 FOBJ := $(foreach s,$(FSRC_KERNEL),$(BUILD)/$(basename $(notdir $(s))).o)

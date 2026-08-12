@@ -51,7 +51,10 @@ for s in "$BOOTDIR"/*.S; do
   fi
 done
 pending=$(find "$SRCDIR" -name "fk_*.f90" | sort)
-for attempt in 1 2; do
+# Retry until a pass adds nothing: USE chains here are deeper than one level
+# (fk_kmain -> fk_idt -> fk_gdt), and a fixed pass count would leave the later
+# modules out of PROVIDED and report their callers' symbols as orphans.
+while [ -n "$pending" ]; do
   retry=""
   for f in $pending; do
     n=$(basename "$f" .f90)
@@ -61,8 +64,8 @@ for attempt in 1 2; do
       retry="$retry $f"
     fi
   done
+  [ "$(echo $retry | wc -w)" -eq "$(echo $pending | wc -w)" ] && break
   pending="$retry"
-  [ -z "$pending" ] && break
 done
 
 # Every global symbol this tree DEFINES. nm -P prints "name Type Value Size";
