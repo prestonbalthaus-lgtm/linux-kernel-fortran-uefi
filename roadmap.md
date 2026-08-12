@@ -43,6 +43,11 @@ Before any Fortran is written, the autonomous build environment must be establis
         the boot in guest physical memory over QMP (see 1.2). The name collision was
         heeded: `tools/run.sh` is untouched and still the podman wrapper.
 
+        2.1 EXTENDED IT, still without closing it: the harness now also attaches a
+        serial chardev (`-serial file:`) and asserts what COM1 carried, so the VM is
+        interrogated on two independent channels rather than one. `-bios OVMF.fd` is
+        untouched by that, and remains what this box is waiting on.
+
         The MISSING half is `-bios OVMF.fd`. Today's harness boots the BIOS/GRUB path,
         which is what Multiboot2 is; the UEFI path that the Minisforum actually uses is a
         different first stage (linker.ld's header describes it) and is not exercised by
@@ -111,9 +116,67 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
 
 The Minisforum has no legacy VGA text mode. The kernel must render its own pixels via UEFI GOP.
 
-  *  [ ] 2.1 UART Serial Driver (Headless Debugging)
+  *  [x] 2.1 UART Serial Driver (Headless Debugging)
 
         Validation: Kernel can write strings to COM1 (0x3F8) using assembly outb wrappers. QEMU serial console outputs text.
+
+        DONE, and the validation was met literally: the bytes were read coming out of
+        QEMU's virtual COM1, not inferred from a gate's exit status.
+
+            00000000  46 6f 72 74 72 61 6e 20  4b 65 72 6e 65 6c 3a 20  |Fortran Kernel: |
+            00000010  55 41 52 54 20 53 65 72  69 61 6c 20 49 6e 69 74  |UART Serial Init|
+            00000020  69 61 6c 69 7a 65 64 2e  0d 0a                    |ialized...|
+
+        `boot/io.S` -- `fk_outb`/`fk_inb`, SysV AMD64, four instructions each. Port I/O
+        is the SECOND of exactly two things in this kernel that must be assembly (the
+        first is CLI/HLT): IN and OUT reach a separate 16-bit address space that no
+        Fortran expression can name. Both carry `int32_t` rather than `uint16_t`/`uint8_t`
+        because Fortran has no unsigned types -- 0xC7 in an int8 would have to be written
+        -57 -- so the truncation is concentrated in two instructions instead of becoming
+        a rule every caller has to remember.
+
+        `src/drivers/serial/fk_serial.f90` -- 115200 8N1, FIFOs on, interrupts off (there
+        is no IDT; one UART IRQ would be a triple fault), plus an internal-loopback
+        self-test. Every register offset and bit mask is diffed against the kernel's own
+        `include/uapi/linux/serial_reg.h`, included straight from the vendor tree -- that
+        header is this translation's oracle, which is why `mk/serial.mk` is the first
+        fragment with no ORACLE (a driver written against a hardware specification has no
+        single C original). The TX spin bound is 65535, Linux's own `0xffff` from
+        `arch/x86/boot/tty.c:30` around the identical LSR/XMTRDY poll; an absent UART
+        drops a byte instead of hanging the one instrument that could explain the hang.
+
+        THE ONE DESIGN DECISION WORTH ARGUING WITH: a failed self-test does NOT disable
+        the console. It arms anyway and says so on COM1. A debug console that refuses to
+        speak because it doubts itself is worse than one that speaks into a void.
+
+        PROVEN, at three levels. `build/run-serial`: 4742 checks against a modelled 16550
+        (DLAB routing, FIFO clears, loopback, floating-bus 0xFF), asserting the 13-step
+        port trace byte for byte. `tools/qemu-boot-test.sh`: now asserts THREE things --
+        the 1.2 sentinel, the banner on COM1, and the ABSENCE of the self-test failure
+        line. `--smoke` shows both positive halves refusing a kernel-less guest.
+        16 injected defects, 16 caught -- `docs/HARNESS-VALIDATION-SERIAL.md`, which also
+        records what none of it can catch (no real silicon; timing is asserted as a count,
+        never a duration).
+
+        ONE ESCAPE, FOUND AND CLOSED RATHER THAN ASSUMED AWAY. Deleting the zero-extension
+        from `fk_inb` boots completely clean: the host suite supplies its own `fk_inb` in
+        C so it never sees `boot/io.S` at all, and on the boot gate the stale upper bits
+        of EAX happen to be zero, so the loopback probe still matches. It is caught now by
+        a white-box check in `tools/linkscript-test.sh`, labelled there as a spelling
+        assertion rather than a semantic one. See M15.
+
+        Wording deviation, same pattern as 0.2's `-ffreestanding` note: the spec says
+        `-fno-leading-underscore`. gfortran spells it `-fno-underscoring`, and it was
+        already in `mk/kflags.mk`.
+
+        A GATE DEFECT THIS WORK INTRODUCED AND THEN FIXED, recorded because the tree's
+        standard is that gates get watched failing. Character literals arrived in `src/`
+        for the first time, so `tools/compliance.sh`'s `sed 's/!.*//'` had to become
+        quote-aware (`tools/strip-comments.awk`). The first version removed two false
+        positives and bought a FALSE NEGATIVE: on a line-continued literal the closing
+        quote reads as an opening one and a real `go to` after it is blanked -- something
+        the old sed caught. It now REFUSES source it cannot analyse instead of guessing,
+        with a fixture in `tools/gate-selftest.sh` (27 checks, up from 24).
 
   *  [ ] 2.2 UEFI GOP Framebuffer Mapping
 

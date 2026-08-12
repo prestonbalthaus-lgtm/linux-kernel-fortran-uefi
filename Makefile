@@ -77,12 +77,41 @@ $(BUILD)/fk_$(1)__$(basename $(notdir $(2))).o: $(2) | $(BUILD)
 	gfortran $$(FFLAGS) -c -o $$@ $$<
 endef
 
+# Of the four variables a fragment declares, ORACLE_<name> is the only one that
+# is OPTIONAL.
+#
+# Every translation up to now had a single C function it was translated FROM, so
+# naming that file under $(KDIR) and diffing against it was the entire method.
+# mk/serial.mk is the first fragment with no such original: a 16550 UART driver
+# is a translation of a hardware specification, not of a C file, and the nearest
+# thing the kernel tree holds -- include/uapi/linux/serial_reg.h -- is a header
+# of register offsets and bit masks that compiles to no code at all. Its test
+# includes that header DIRECTLY, so the register numbers are still checked
+# against the kernel's own, and diffs the driver's port-write trace against a
+# reference model in the test itself. There is simply nothing for gcc to build
+# into oracle-serial.o.
+#
+# Without the guard, omitting ORACLE_<name> does not produce a clear error: the
+# prerequisite expands to "$(KDIR)/" -- the vendor directory itself -- and gcc is
+# asked to compile a directory, naming neither the fragment nor the variable
+# that is missing.
+#
+# The guard has to appear TWICE and both halves are load-bearing: once around
+# the compile rule, so no rule for an oracle object is generated at all, and
+# once in run-<name>'s prerequisites, so the link does not ask for an object
+# that nothing knows how to build.
+#
+# The promise at the top of this file is intact: adding a translation still
+# requires NO edit here. A fragment declares an oracle if it has one and stays
+# silent if it does not.
 define TEST_template
+$(if $(ORACLE_$(1)),
 $(BUILD)/oracle-$(1).o: $(KDIR)/$(ORACLE_$(1)) | $(BUILD)
 	gcc $(CFLAGS) $(CFLAGS_$(1)) -c -o $$@ $$<
+)
 $(BUILD)/drv-$(1).o: $(DRV_$(1)) | $(BUILD)
 	gcc $(CFLAGS) $(CFLAGS_$(1)) -c -o $$@ $$<
-$(BUILD)/run-$(1): $(BUILD)/oracle-$(1).o $(call fobj,$(1)) $(BUILD)/drv-$(1).o
+$(BUILD)/run-$(1): $(if $(ORACLE_$(1)),$(BUILD)/oracle-$(1).o) $(call fobj,$(1)) $(BUILD)/drv-$(1).o
 	gcc -o $$@ $$^
 	@./$$@
 endef

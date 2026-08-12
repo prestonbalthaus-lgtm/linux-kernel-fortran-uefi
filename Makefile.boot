@@ -54,17 +54,60 @@ LDFLAGS_KERNEL := -nostdlib -z max-page-size=0x1000 -T linker.ld
 
 # Fortran sources linked into the image, in module-dependency order.
 #
-# Only the boot path is here on purpose. The library and driver modules are
-# proven to link into this layout by tools/linkscript-test.sh, which links ALL
-# of them against the real boot stub; putting them in the bootable image as
-# well would add code with no caller to the thing being booted, which is
-# exactly the kind of unexplained bulk a boot failure then has to be untangled
-# from.
-FSRC_KERNEL := src/boot/fk_kmain.f90
+# THE ORDER OF THIS LIST IS SEMANTIC, not cosmetic: fk_kmain USEs fk_serial_m,
+# so fk_serial.f90 must be compiled first for its .mod to exist. The generator
+# under "module ordering" below turns this list's order into real prerequisites,
+# which is what makes that true under `make -j` as well as serially. Reordering
+# these two lines reorders the build.
+#
+# Only the boot path is here, and that rule has NOT been relaxed. The library
+# and driver modules are proven to link into this layout by
+# tools/linkscript-test.sh, which links ALL of them against the real boot stub;
+# putting them in the bootable image as well would add code with no caller to
+# the thing being booted, which is exactly the kind of unexplained bulk a boot
+# failure then has to be untangled from. fk_serial is in the image for precisely
+# the reason the rule states: roadmap 2.1 made kernel_main CALL it, so it is
+# boot path now, not library. The next module to appear here should have to
+# clear the same bar.
+FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
+               src/boot/fk_kmain.f90
 
-AOBJ := $(BUILD)/boot.o
-FOBJ := $(patsubst src/boot/%.f90,$(BUILD)/%.o,$(FSRC_KERNEL))
+# Assembly sources. NAMED ONE BY ONE, deliberately not $(wildcard boot/*.S):
+# with a wildcard, what ends up inside the bootable image would be a function of
+# what happens to be sitting in the directory -- a half-finished experiment, a
+# file left behind by a rebase -- and nothing would say so. The image's contents
+# are a decision, so they are written down.
+#
+# tools/linkscript-test.sh does the exact OPPOSITE and globs boot/*.S, which is
+# not a contradiction to resolve but two different jobs: that gate exists so
+# that no assembly file in the tree can escape review, so it must see whatever
+# is on disk; this list exists to state what the shipped image contains, so it
+# must see only what somebody chose to put in it.
+#
+# boot.S is listed first by convention only. It is NOT what puts the Multiboot2
+# header in the first 32 KiB: linker.ld pins .multiboot_header by section name
+# with KEEP() as its first output section and ASSERTs the 32 KiB bound, so input
+# object order does not decide it, and `make mbcheck` would catch it if it did.
+ASRC_KERNEL := boot/boot.S \
+               boot/io.S
+
+AOBJ := $(patsubst boot/%.S,$(BUILD)/%.o,$(ASRC_KERNEL))
+FOBJ := $(foreach s,$(FSRC_KERNEL),$(BUILD)/$(basename $(notdir $(s))).o)
 OBJS := $(AOBJ) $(FOBJ)
+
+# Objects are flattened into one directory by basename, so two sources whose
+# basenames match -- in different directories, which this tree already has --
+# would compile onto the SAME .o, and the image would quietly contain whichever
+# one make built last. ./Makefile survives that by mangling the name
+# (fk_<test>__<base>.o) because it juggles many independent test binaries; the
+# kernel image is a single namespace where the honest answer is to refuse to
+# build rather than to invent a mangling nobody reads. $(sort) removes
+# duplicates, so a sorted list that is shorter than the original IS the
+# collision, detected before a single compiler runs.
+ifneq ($(words $(OBJS)),$(words $(sort $(OBJS))))
+$(error two kernel sources share a basename, so they would share an object file \
+  in $(BUILD): [$(OBJS)] -- rename one, or teach this file to mangle names)
+endif
 
 # Undefined symbols that mean a libgfortran or libc runtime crept in.
 # _gfortran_ is matched as a substring (the prefix is the whole tell); the libc
@@ -81,11 +124,52 @@ kernel: $(KERNEL)
 iso: $(ISO)
 
 # --- compilation -------------------------------------------------------------
-$(AOBJ): boot/boot.S | $(BUILD)
+# The assembly sources stay on ONE pattern rule: every file in ASRC_KERNEL lives
+# in boot/, so a single stem covers all of them and there is no second directory
+# for the stem to be ambiguous about. Explicit rules always beat a pattern rule
+# in GNU make, so the Fortran objects generated below are never matched against
+# a boot/<name>.S that does not exist.
+$(BUILD)/%.o: boot/%.S | $(BUILD)
 	$(CC) $(AFLAGS_KERNEL) -c -o $@ $<
 
-$(BUILD)/%.o: src/boot/%.f90 | $(BUILD)
-	$(FC) $(FFLAGS_KERNEL) -c -o $@ $<
+# One EXPLICIT rule per Fortran source, generated with $(foreach)/$(eval) --
+# the same idiom ./Makefile uses for FSRC_template, for the same reason.
+#
+# What this replaces is the single pattern rule '$(BUILD)/%.o: src/boot/%.f90',
+# which matched src/boot and nothing else; fk_serial.f90 lives in
+# src/drivers/serial. The one-line repair would be a vpath, and it is the wrong
+# repair: vpath resolves a stem by SEARCHING a directory list and takes the
+# first basename that matches, so the file compiled into the kernel would be
+# chosen by directory order rather than named by FSRC_KERNEL. This tree already
+# holds same-named sources in different directories -- that is exactly why
+# ./Makefile has to name its objects fk_<test>__<base>.o -- so the day a second
+# fk_<something>.f90 appears, a vpath build silently compiles the wrong one and
+# still succeeds. An explicit rule carries the full path of its prerequisite and
+# has nothing to search.
+define FOBJ_template
+$(BUILD)/$(basename $(notdir $(1))).o: $(1) | $(BUILD)
+	$(FC) $$(FFLAGS_KERNEL) -c -o $$@ $$<
+endef
+$(foreach s,$(FSRC_KERNEL),$(eval $(call FOBJ_template,$(s))))
+
+# --- module ordering ---------------------------------------------------------
+# gfortran writes fk_serial_m.mod as a SIDE EFFECT of producing fk_serial.o, and
+# fk_kmain.f90's `use fk_serial_m` cannot compile until that .mod exists on the
+# -I path. Nothing in the graph above orders the two compilations, so under
+# `make -j` they race: the build fails perhaps one time in N with "Cannot open
+# module file", and both a serial rebuild and a plain retry then pass. That is
+# the most expensive class of build bug there is, so the order is stated instead
+# of hoped for.
+#
+# Chain each object on the previous one in FSRC_KERNEL order, exactly as
+# ./Makefile does for FSRC_<test>. Spelling the prerequisite on the .o rather
+# than on the .mod is deliberate: gfortran leaves an unchanged .mod's timestamp
+# alone when it recompiles, so a .mod-as-target rule never looks satisfied and
+# oscillates between out-of-date and up-to-date forever.
+fk_prev :=
+$(foreach o,$(FOBJ),\
+  $(if $(fk_prev),$(eval $(o): $(fk_prev)))\
+  $(eval fk_prev := $(o)))
 
 # --- link --------------------------------------------------------------------
 $(KERNEL): $(OBJS) linker.ld | $(BUILD)
@@ -114,6 +198,17 @@ mbcheck: $(KERNEL)
 # Necessary condition for a kernel with no runtime: no Fortran object may
 # reference libgfortran or a libc. nm -P prints "name Type ...", so the bare
 # symbol name is field 1.
+#
+# WHAT THIS GATE MUST NOT FLAG, now that there are two Fortran objects:
+# fk_serial.o legitimately arrives with fk_outb and fk_inb UNDEFINED. They are
+# defined in $(BUILD)/io.o, assembled from boot/io.S, because IN and OUT are
+# privileged instructions with no Fortran spelling -- the same situation as
+# fk_kmain.o's undefined fk_cpu_halt, which this gate has always let through.
+# BADSYM_RE does not match either name and cannot start to: '_gfortran_' is a
+# substring test that no name beginning "fk_" can satisfy, and the libc half is
+# anchored ^(...)$ around whole symbol names, so only those seven exact names
+# hit. Nothing here proves those two symbols RESOLVE -- the link does, and an
+# unresolved fk_outb fails $(KERNEL) loudly rather than silently.
 symcheck-boot: $(FOBJ)
 	@fail=0; for o in $^; do \
 	  bad=`$(NM) -u -P $$o | cut -d' ' -f1 | grep -E '$(BADSYM_RE)'`; \

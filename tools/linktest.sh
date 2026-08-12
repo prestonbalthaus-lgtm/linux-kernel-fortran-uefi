@@ -28,13 +28,21 @@
 # That was the right rule while every module was a self-contained leaf
 # translation, and it was a proxy for the property actually wanted: no
 # dependency on a runtime that will not exist in kernel space. Roadmap 1.2
-# introduced two references that are correct and unavoidable:
+# introduced two references that are correct and unavoidable, and roadmap 2.1
+# added a third:
 #
 #   fk_kmain       -> fk_cpu_halt   (boot/boot.S: CLI/HLT is a privileged
 #                                    instruction with no Fortran spelling)
 #   fk_gop_renderer-> vga_font_row  (fk_font_8x16: the font is DATA in its own
 #                                    module, reached through an accessor so the
 #                                    4 KiB table is not duplicated per object)
+#   fk_serial      -> fk_outb,      (boot/io.S: IN and OUT address a separate
+#                     fk_inb         16-bit port space that no Fortran
+#                                    expression can reach)
+#
+# That list is kept exhaustive on purpose: it is the answer to "why is this
+# undefined symbol allowed", and a list that has quietly stopped being complete
+# stops being an answer.
 #
 # Keeping the literal rule would have meant either fusing modules that have no
 # business being fused, or deleting the gate. Instead the rule now states the
@@ -58,14 +66,61 @@ fail=0
 # PASS 0: build everything first, so that (c) can ask "does anything in this
 # tree define this symbol?" instead of "is this symbol absent?".
 #
-# boot/boot.S is part of the tree even when SRCDIR is not src/: it is where the
-# privileged-instruction primitives live, and a Fortran module calling
-# fk_cpu_halt is depending on the tree, not on a runtime. Two passes over the
-# Fortran, because one module USEs another and the .mod it needs may not have
-# been written yet on the first pass.
+# EVERY boot/*.S is part of the tree even when SRCDIR is not src/: that is where
+# the primitives with no Fortran spelling live, and a Fortran module calling
+# fk_cpu_halt or fk_outb is depending on the tree, not on a runtime.
+#
+# The glob replaced a hardcoded boot/boot.S when roadmap 2.1 added boot/io.S.
+# Under the old form the symbols io.S defines were absent from PROVIDED, so
+# fk_serial's calls to fk_outb/fk_inb would have been reported as symbols
+# "NOTHING in this tree defines" -- a FALSE FAILURE against a correct module,
+# which is the most expensive kind of gate defect there is: the obvious response
+# to it is to go and change the module.
+#
+# [ -e ] guards the unmatched glob. Without nullglob an empty boot/ leaves the
+# literal string "boot/*.S" in $s and gcc then fails on a file that does not
+# exist; tools/gate-selftest.sh drives this script against synthetic
+# single-module directories, so "no assembly present at all" has to stay a
+# quiet no-op rather than an error.
+#
+# A .S that does not assemble is reported HERE, and fails the run. The previous
+# form ended in `2>/dev/null && objs=...`, which dropped a broken object in
+# silence -- and every symbol that object defines then vanishes from PROVIDED
+# below, so the visible symptom was a pile of spurious "nothing in this tree
+# defines fk_cpu_halt" reports against modules that were never wrong. Say the
+# real cause once, at the point where it is known.
+#
+# Two passes over the Fortran, because one module USEs another and the .mod it
+# needs may not have been written yet on the first pass.
+# BOOTDIR is overridable for ONE reason: so that the failure branch below can be
+# watched failing. This script cd's to the repo root, so a hardcoded `boot/*.S`
+# always assembles the tree's own two files -- both of which assemble -- and
+# there is no input tools/gate-selftest.sh could pass (it varies SRCDIR only)
+# that ever reaches the `does not assemble` arm. That arm exists because its
+# predecessor swallowed assembler errors with 2>/dev/null, which dropped every
+# symbol the broken object defined out of PROVIDED and produced a pile of
+# spurious "nothing in this tree defines fk_cpu_halt" reports against modules
+# that were never wrong. Re-introducing that bug would ship green under a gate
+# nobody had ever watched fail -- docs/AUDIT-PHASE1.md, A-1. FK_BOOTDIR is what
+# lets the selftest point this at a directory holding a deliberately broken .S.
+BOOTDIR="${FK_BOOTDIR:-boot}"
+
 objs=""
-[ -f boot/boot.S ] && gcc -m64 -fno-pic -c -o "$WORK/boot.o" boot/boot.S 2>/dev/null \
-  && objs="$WORK/boot.o"
+for s in "$BOOTDIR"/*.S; do
+  [ -e "$s" ] || continue
+  a=$(basename "$s" .S)
+  # -m64 -fno-pic -Wall is Makefile.boot's AFLAGS_KERNEL verbatim. Assembling
+  # through gcc rather than as is not a convenience: it is what runs cpp over
+  # the file, and boot.S's PHYS() macro does not survive without it.
+  if gcc -m64 -fno-pic -Wall -c -o "$WORK/$a.o" "$s" 2>"$WORK/$a.aserr"; then
+    objs="$objs $WORK/$a.o"
+  else
+    echo "  FAIL  $s does not assemble (everything it defines is now missing"
+    echo "        from the in-tree symbol set, so ignore any orphan reports below)"
+    sed 's/^/        /' "$WORK/$a.aserr" | head -5
+    fail=1
+  fi
+done
 pending=$(find "$SRCDIR" -name "fk_*.f90" | sort)
 for attempt in 1 2; do
   retry=""
