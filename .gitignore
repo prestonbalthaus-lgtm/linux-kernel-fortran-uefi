@@ -4,3 +4,4 @@ vendor/*.tar.xz
 *.o
 *.mod
 *.smod
+build-kflags/
