@@ -19,17 +19,35 @@ Rules of Engagement for AI Agents:
 
 Before any Fortran is written, the autonomous build environment must be established.
 
-    [ ] 0.1 Create Custom Linker Script (linker.ld)
+    [x] 0.1 Create Custom Linker Script (linker.ld)
 
         Validation: Script properly aligns .text, .data, and .bss sections for a 64-bit ELF kernel.
+        DONE: linker.ld. Proven, not asserted -- tools/linkscript-test.sh links
+        the REAL nine modules under KFLAGS and checks 25 properties; `make
+        linkscript` or `make audit` runs it. .text/.rodata/.data/.bss each start
+        on a 4 KiB boundary in their own PT_LOAD (RE / R / RW), so the VMM (3.5)
+        can set per-section permissions without two sections sharing a page.
+        VMA 0xFFFFFFFF80100000 is forced by -mcmodel=kernel, LMA 0x100000 via
+        AT(); exports __bss_start/__bss_end (for 1.3's zeroing), a 16 KiB boot
+        stack, and __kernel_phys_start/end (for 3.4's PMM). 9 injected layout
+        defects were all rejected by the gate.
 
     [ ] 0.2 Write the Root Makefile
 
         Validation: Makefile successfully runs gfortran -ffreestanding and links with ld.
+        NOT DONE. The existing Makefile builds and runs HOST differential tests;
+        it has no kernel link rule and produces no kernel image. `make linkscript`
+        links one only to validate 0.1, in a temp dir, and throws it away. When
+        this is built it MUST pass -z max-page-size=0x1000 to ld, or GNU ld pads
+        every PT_LOAD to 2 MiB and a ~19 KiB kernel becomes multi-megabyte.
 
     [ ] 0.3 Configure QEMU Test Harness
 
         Validation: A script (run.sh) exists that packages the kernel into an ISO and launches qemu-system-x86_64 -m 24G -smp 6 -bios OVMF.fd.
+        NOT DONE, and mind the NAME COLLISION: tools/run.sh already exists and is
+        the podman wrapper that runs make inside the container. It is unrelated.
+        Call the QEMU harness something else (tools/qemu-run.sh) rather than
+        overwriting a script the whole build depends on.
 
 ⚙️ Phase 1: The Boot Layer & Bare-Metal Runtime
 
@@ -38,6 +56,14 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
     [x] 1.1 The Core Library Translation (Completed)
 
         Validation: String manipulation and math modules exist without libgfortran.
+        CAUTION -- THIS BOX IS OVER-TICKED. Only the MATH half was delivered:
+        src/lib/math/ has 7 modules plus src/lib/fk_bcd.f90. There are ZERO
+        string handlers -- no strlen, strcpy, memcmp, memcpy. docs/AUDIT-PHASE1.md
+        flagged this already: "Phase 1 delivered no string handlers ... any Phase 2
+        planning that assumes lib/string.c is already translated is working from a
+        wrong inventory." Anything downstream needing string ops (the ELF loader
+        at 6.4, VFS paths at 6.1) must translate lib/string.c first. Note 1.3
+        below needs memcpy/memset anyway, so that is where the debt gets paid.
 
     [ ] 1.2 Multiboot2 / EFI Assembly Stub
 

@@ -26,7 +26,7 @@ KFLAGS := -O2 -fwrapv -fno-underscoring \
 TESTS :=
 include $(sort $(wildcard mk/*.mk))
 
-.PHONY: test symcheck clean list kflags-test selftest audit
+.PHONY: test symcheck clean list kflags-test selftest audit linkscript
 test: $(addprefix $(BUILD)/run-,$(TESTS))
 	@echo "=== all $(words $(TESTS)) translation(s) matched the C oracle ==="
 
@@ -40,6 +40,11 @@ kflags-test:
 	         FFLAGS="$(KFLAGS) -Jbuild-kflags" test
 	@echo "=== oracle match holds under the real kernel flag set ==="
 
+# Roadmap 0.1: does linker.ld lay the image out the way it claims? Links the
+# real nine modules, not a toy object.
+linkscript:
+	@bash tools/linkscript-test.sh
+
 # Prove the gates reject what they claim to reject before trusting their output.
 selftest:
 	@bash tools/gate-selftest.sh
@@ -48,6 +53,7 @@ selftest:
 audit: selftest test kflags-test symcheck
 	@bash tools/compliance.sh
 	@bash tools/linktest.sh
+	@bash tools/linkscript-test.sh
 	@echo "=== full audit clean ==="
 
 define TEST_template
