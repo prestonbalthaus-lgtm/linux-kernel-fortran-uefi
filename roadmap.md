@@ -1,19 +1,3 @@
-Here is the complete, start-to-finish roadmap formatted specifically for GitHub.
-
-You can drop this directly into a ROADMAP.md or README.md file in your repository. It is written with explicit markdown checkboxes ([ ]) and clear validation criteria so your AI agents can read it, update it with [x], and systematically prove their progress without hallucinating skips.
-🗺️ Project Fortran-Kernel: The Minisforum Roadmap
-
-Objective: Engineer a 64-bit, UEFI-booting, bare-metal OS kernel written in modern Fortran, capable of daily-driving a Minisforum mini PC and booting a BusyBox user-space shell.
-
-Rules of Engagement for AI Agents:
-
-    You may not check a box until the validation criteria are met.
-
-    Code must compile freestanding (-nostdlib, -fno-leading-underscore).
-
-    Standard libgfortran I/O is strictly banned.
-
-    All memory and hardware interaction must use iso_c_binding.
 
 🏗️ Phase 0: Project Initialization & Toolchain
 
