@@ -62,14 +62,27 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
     [ ] 2.2 UEFI GOP Framebuffer Mapping
 
         Validation: Multiboot2 header successfully requests the framebuffer; Fortran pointer maps to the physical video memory address.
+        HALF DONE, deliberately not ticked: the Fortran side is finished and tested
+        (vga_init_framebuffer maps the pointer via c_f_pointer and validates the
+        geometry). The Multiboot2 header that REQUESTS the framebuffer does not exist
+        and cannot until 1.2. Both halves of the validation must hold.
 
-    [ ] 2.3 Bitmap Font System
+    [x] 2.3 Bitmap Font System
 
         Validation: An 8x16 hex bitmap font array is hardcoded into a Fortran module.
+        DONE: src/drivers/video/fk_gop_renderer.f90, FONT_8X16, 4096 bytes in .rodata.
+        Generated from the kernel's own lib/fonts/font_8x16.c by tools/gen-font-8x16.py
+        (re-running it yields a zero diff), and all 4096 bytes are diffed against the
+        compiled font_vga_8x16 oracle by the test suite. A single flipped bit is caught.
 
     [ ] 2.4 The Software Renderer
 
         Validation: vga_print_string() successfully iterates over the font array and plots individual colored pixels to the screen.
+        CODE COMPLETE, not ticked: vga_print_string/vga_print_char/vga_plot_pixel are
+        written and verified byte-exact against a reference model on a simulated
+        framebuffer with pitch > width (184,336 checks, 0 mismatches, holds under the
+        real kernel flag set). But "to the screen" has never happened -- no boot path
+        exists. Tick this after QEMU (0.3) shows the pixels.
 
 🧠 Phase 3: Core CPU & Memory Management
 
