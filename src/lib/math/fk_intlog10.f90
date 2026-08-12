@@ -57,7 +57,7 @@
 !!    kind c_int32_t it counts within 32 bits, so msb = 31 - LEADZ(value). The
 !!    value == 0 case is returned before this, matching the C early exit.
 module fk_intlog10_m
-  use iso_c_binding, only: c_int32_t, c_int64_t
+  use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t
   implicit none
   private
   public :: fk_intlog10

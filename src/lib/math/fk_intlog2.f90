@@ -39,7 +39,7 @@
 !!     explicit lower bound logtable(0:255) so the index arithmetic is a
 !!     literal transcription of the C -- no +1 fixups anywhere.
 module fk_intlog2_m
-  use iso_c_binding, only: c_int32_t, c_int64_t
+  use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t
   implicit none
   private
   public :: fk_intlog2

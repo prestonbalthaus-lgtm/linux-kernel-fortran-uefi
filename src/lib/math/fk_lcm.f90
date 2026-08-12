@@ -52,7 +52,7 @@
 !!
 !!   * ARRAY INDEXING: none -- this translation uses no lookup tables.
 module fk_lcm_m
-  use iso_c_binding, only: c_int64_t
+  use, intrinsic :: iso_c_binding, only: c_int64_t
   implicit none
   private
   public :: fk_lcm

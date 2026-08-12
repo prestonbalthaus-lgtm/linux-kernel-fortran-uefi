@@ -75,7 +75,7 @@
 !!   fallback is therefore reached exactly on the a==0 / b==0 inputs.  The code
 !!   still follows the C structure literally rather than relying on that.
 module fk_lcm_not_zero_m
-  use iso_c_binding, only: c_long
+  use, intrinsic :: iso_c_binding, only: c_long
   implicit none
   private
   public :: fk_lcm_not_zero

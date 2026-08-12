@@ -18,7 +18,7 @@
 !!     multiplication has the identical bit pattern, so this is exact --
 !!     built with -fwrapv so the wrap is defined rather than UB.
 module fk_int_pow_m
-  use iso_c_binding, only: c_int64_t, c_int32_t
+  use, intrinsic :: iso_c_binding, only: c_int64_t, c_int32_t
   implicit none
   private
   public :: fk_int_pow

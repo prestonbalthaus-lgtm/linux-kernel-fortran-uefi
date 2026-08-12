@@ -49,7 +49,7 @@
 !!     signed or unsigned (and a > b here, so it does not even wrap).
 !!   * No array indexing in this routine, so no 0-based/1-based hazard.
 module fk_gcd_m
-  use iso_c_binding, only: c_int64_t
+  use, intrinsic :: iso_c_binding, only: c_int64_t
   implicit none
   private
   public :: fk_gcd

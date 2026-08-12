@@ -48,7 +48,7 @@
 !!
 !!   * No lookup tables are used, so no 0-based array-indexing hazard arises.
 module fk_bcd_m
-  use iso_c_binding, only: c_int8_t, c_int32_t
+  use, intrinsic :: iso_c_binding, only: c_int8_t, c_int32_t
   implicit none
   private
   public :: fk__bcd2bin, fk__bin2bcd

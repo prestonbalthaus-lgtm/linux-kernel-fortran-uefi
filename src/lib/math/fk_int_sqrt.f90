@@ -38,7 +38,7 @@
 !! BITS_PER_LONG == 64 and the int_sqrt64 variant in the C file is compiled
 !! out; it is deliberately not translated here.
 module fk_int_sqrt_m
-  use iso_c_binding, only: c_int64_t
+  use, intrinsic :: iso_c_binding, only: c_int64_t
   implicit none
   private
   public :: fk_int_sqrt
