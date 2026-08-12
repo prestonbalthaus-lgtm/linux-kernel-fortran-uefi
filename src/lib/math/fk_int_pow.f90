@@ -1,3 +1,7 @@
+! SPDX-License-Identifier: GPL-2.0
+!
+! Derived from Linux 7.1.8 lib/math/int_pow.c
+! Original C authors retain copyright; this is a translation, not new work.
 !> Fortran translation of linux-7.1.8 lib/math/int_pow.c
 !!
 !! Original C signature:  u64 int_pow(u64 base, unsigned int exp)
@@ -23,6 +27,7 @@ contains
 
   !> Computes base**exp with u64 wrapping semantics.
   function fk_int_pow(base, exp) result(res) bind(c, name="fk_int_pow")
+    implicit none
     integer(c_int64_t), intent(in), value :: base
     integer(c_int32_t), intent(in), value :: exp
     integer(c_int64_t)                    :: res
@@ -35,8 +40,8 @@ contains
 
     do while (e /= 0_c_int32_t)
        if (iand(e, 1_c_int32_t) /= 0_c_int32_t) res = res * b
-       e = shiftr(e, 1)
-       b = b * b
+       e = shiftr(e, 1)          ! zero-fill: SHIFTA here would hang forever
+       b = b * b                 ! wraps mod 2**64, bit-identical signed
     end do
   end function fk_int_pow
 

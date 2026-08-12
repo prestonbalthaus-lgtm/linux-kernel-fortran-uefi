@@ -8,7 +8,7 @@ set -uo pipefail
 KFLAGS="-O2 -fwrapv -fno-underscoring -mcmodel=kernel -mno-red-zone -fno-pic \
         -fno-stack-protector -fno-asynchronous-unwind-tables -fno-common"
 fail=0
-for f in src/lib/*/fk_*.f90 src/lib/*/*/fk_*.f90; do
+for f in $(find src -name "fk_*.f90" | sort); do
   [ -e "$f" ] || continue
   n=$(basename "$f" .f90)
   if ! gfortran $KFLAGS -c -o "/tmp/$n.ko.o" "$f" 2>/tmp/$n.err; then
