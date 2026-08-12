@@ -26,8 +26,9 @@ All three checklist areas pass on the code itself, with exactly one mechanical v
 own quality gates report PASS on inputs they are supposed to reject. The code is bare-metal-safe;
 the *evidence* that it is bare-metal-safe was weaker than the commit messages claim.
 
-**Go / no-go for linking to the bootloader:** the code is a **go**. Treating the current gate
-output as proof of kernel-safety is a **no-go** until A-1 and A-2 are fixed.
+**Go / no-go for linking to the bootloader:** the code is a **go**. Treating the gate output as
+proof of kernel-safety was a **no-go** until A-1 and A-2 were fixed — now done, see
+[Gate patches](#gate-patches--applied).
 
 To be precise about what is and is not caught: a translation that added `print *` **would** be
 caught, by `symcheck` and by `linktest.sh`'s line-18 `nm -u` emptiness check — both of which
@@ -276,10 +277,22 @@ claim to refute. So the evidence here is "eight independent re-derivations found
 which is corroboration of the differential suite, **not** an exhaustive proof over the u64
 domains. `bcd` remains the only translation proven exhaustively, by its 4.3-billion-check sweep.
 
-## Recommended gate patches (NOT applied — awaiting authorisation)
+## Gate patches — APPLIED
 
-These change project infrastructure and the CI contract, which is outside "output the corrected
-`.f90` files". Each is small and each closes a proven hole.
+> **Status:** applied on branch `audit/harden-phase1-gates`. The findings above describe the
+> state at `a352905`, which is the revision this audit examined; they are kept as the
+> point-in-time record. A-1 through A-5 are closed by that branch, and `make audit` now runs
+> every gate in one command.
+>
+> The most important addition is `tools/gate-selftest.sh`. The root cause of A-1 and A-2 was not
+> a bad regex — it was that **nobody had ever watched those gates fail**. The self-test feeds
+> each gate a file that violates it and requires rejection, then feeds it the real sources and
+> requires acceptance. It immediately earned its place: it caught a parsing bug in the very
+> `bind(c)` check written to close A-1 (`tr -d '[:space:]'` deleted the newlines separating
+> public names, fusing `public :: a, b` into one token, so `fk_bcd` alone was wrongly rejected).
+> That bug would otherwise have shipped as a new false positive.
+
+Each patch below is small and each closes a proven hole.
 
 **1. `tools/linktest.sh:8` — adopt the kernel's real flag set:**
 
