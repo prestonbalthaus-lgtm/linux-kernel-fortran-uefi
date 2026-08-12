@@ -21,13 +21,32 @@ fail=0
 # code), so this substitution is exact here. Revisit if that ever changes.
 strip_comments() { sed 's/!.*//' "$1"; }
 
+# Fold Fortran free-form line continuations into one logical line each.
+#
+# WITHOUT THIS EVERY CHECK BELOW IS BLIND TO ANYTHING PAST THE FIRST LINE OF A
+# STATEMENT. Two ways that bit, both found on the Phase 2 GOP renderer, and both
+# the same A-1 class of defect (a gate reporting PASS on what it must reject):
+#
+#   public :: a, b, &      <- the gate saw only a and b. c was never required to
+#             c               be bind(c) at all, and nothing would have said so.
+#
+#   function f(x) &            <- the gate saw a first line with no bind(c) and
+#        result(r) bind(c,...)    reported MISSING on a correctly bound export.
+#
+# A trailing '&' continues the statement onto the next line, which may itself
+# begin with an optional '&'. Comments are stripped before folding, so a '&'
+# left trailing only because a comment followed it folds correctly too.
+fold_continuations() {
+  sed -e ':a' -e '/&[[:space:]]*$/{N; s/&[[:space:]]*\n[[:space:]]*&\{0,1\}/ /; ba' -e '}'
+}
+
 printf "%-22s %-9s %-7s %-8s %-10s %-5s %s\n" \
        MODULE implicit banned "bind(c)" intrinsic SPDX form
 
 for f in $(find "$SRCDIR" -name 'fk_*.f90' | sort); do
   n=$(basename "$f" .f90)
   code=$(mktemp) || exit 1
-  strip_comments "$f" > "$code"
+  strip_comments "$f" | fold_continuations > "$code"
   notes=""
 
   # --- 1. implicit none in EVERY program unit, not merely once per file -----
