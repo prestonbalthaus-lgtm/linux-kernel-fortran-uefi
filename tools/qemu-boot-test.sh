@@ -1,74 +1,17 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# THE BOOT GATE (roadmap 1.2 AND 2.1, and the first half of 0.3).
-#
-# Boots build/boot/fortran-kernel.iso in a headless QEMU and makes THREE
-# assertions about the guest while it is running -- two positive, one negative.
-# All must hold for a pass, and the verdict reports them separately so a failure
-# says which one broke instead of leaving the human to re-run the gate to find
-# out.
-#
-#   (1) THE SENTINEL (roadmap 1.2), read out of the guest's PHYSICAL memory
-#       over QMP: the four-word record src/boot/fk_kmain.f90 wrote into .data.
-#       The fourth word is TAG xor magic, computed by Fortran at run time from
-#       the value GRUB left in EAX, so a pass is evidence that live loader data
-#       crossed the assembly -> Fortran ABI boundary -- not merely that the
-#       machine did not crash.
-#
-#   (2) THE COM1 BANNER (roadmap 2.1), read out of the file QEMU's serial
-#       chardev writes: the exact string the kernel's UART driver emits once it
-#       has initialised 0x3F8. A pass is evidence that Fortran code drove a
-#       REAL DEVICE MODEL -- real OUT instructions, accepted by QEMU's 16550A
-#       in the order a 16550A demands.
-#
-#   (3) NO SELF-TEST FAILURE ON COM1 (roadmap 2.1), the one NEGATIVE assertion
-#       here: the kernel must not have reported that its own UART loopback
-#       probe failed. serial_init transmits 0xAE into internal loopback and
-#       reads it back; when that does not match, src/boot/fk_kmain.f90 says so
-#       on the console. Without this check a kernel whose read path is broken
-#       still prints the banner -- transmission is unaffected -- so (1) and (2)
-#       both hold while COM1 is literally reporting a fault. A gate that only
-#       greps for text it WANTS cannot notice a kernel telling it something is
-#       wrong.
-#
-# NEITHER HALF REPLACES THE OTHER, which is the entire reason both are here.
-# The sentinel is a memory store: it passes unchanged on a kernel whose console
-# is completely broken, because nothing about it ever leaves the CPU. The
-# banner cannot be shown by any dump of guest memory, because those bytes are
-# not IN guest memory -- they went out a port and into QEMU's chardev, and the
-# only trace they leave is on the host side of the emulator. So "reached
-# Fortran with the loader's live values but cannot talk" and "talks but never
-# received a real handoff" are distinguishable failures here, and it takes both
-# assertions to distinguish them.
-#
-# Everything before this gate (grub2-file, tools/mb2-check.py, the linker
-# script's ASSERTs) checks a FILE. This is the only gate that checks a
-# RUNNING CPU, and it is the only one that can catch a forgotten PHYS() in the
-# 32-bit half of boot.S, a bad GDT, or a stack that is not 16-byte aligned at
-# the call site.
-#
-# Binary parsing and the sentinel assertion itself live in
-# tools/qmp-sentinel.py, because bash is the wrong tool for that. The serial
-# assertion is one fixed-string grep and stays here. This script owns the VM
-# lifecycle.
-#
-# SAFETY: the host is never modified. Nothing is installed, no bootloader is
-# written, no systemd unit is created, no network device is attached. The
-# guest's serial output is captured into this run's own scratch directory,
-# which cleanup() removes. The only execution boundary crossed is QEMU, and the
-# VM is torn down unconditionally.
+# Boots build/boot/fortran-kernel.iso in a headless QEMU and asserts three
+# things about the running guest: the four-word handoff record in guest
+# physical memory (read over QMP), the banner the kernel puts on COM1, and the
+# absence of the kernel's own report that its UART self-test failed.
 #
 # Usage:
-#   tools/qemu-boot-test.sh              boot the ISO and assert all three:
-#                                        sentinel, COM1 banner, and no
-#                                        self-test failure reported
+#   tools/qemu-boot-test.sh              boot the ISO and assert all three
 #   tools/qemu-boot-test.sh --selftest   prove the assertion logic (no QEMU)
-#   tools/qemu-boot-test.sh --smoke      prove the QMP/pmemsave plumbing against
-#                                        a kernel-less guest, and prove BOTH
-#                                        POSITIVE assertions REFUSE it (the
-#                                        negative one is vacuous with no kernel,
-#                                        so it is not reported there)
+#   tools/qemu-boot-test.sh --smoke      prove the QMP plumbing against a
+#                                        kernel-less guest, and that both
+#                                        positive assertions refuse it
 #
 # Environment overrides (all optional):
 #   FK_ISO            path to the ISO           (default build/boot/...)
@@ -77,12 +20,9 @@
 #   FK_BOOT_DEADLINE  seconds to keep retrying  (default 45)
 #   FK_POLL_INTERVAL  seconds between attempts  (default 1)
 #   FK_EXPECT_SERIAL  the exact string COM1 must carry
-#                     (default "Fortran Kernel: UART Serial Initialized.")
-#   FK_REJECT_SERIAL  the exact string COM1 must NOT carry -- the kernel's own
-#                     report that its UART self-test failed
-#                     (default "Fortran Kernel: COM1 loopback self-test FAILED.")
+#   FK_REJECT_SERIAL  the exact string COM1 must NOT carry
 #   FK_ACCEL          force 'kvm' or 'tcg'
-#   FK_SMP / FK_MEM   override the project's mandated 6 vCPU / 24 GB allocation
+#   FK_SMP / FK_MEM   override the mandated 6 vCPU / 24 GB allocation
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -93,34 +33,14 @@ BOOT_WAIT="${FK_BOOT_WAIT:-3}"
 DEADLINE="${FK_BOOT_DEADLINE:-45}"
 POLL_INTERVAL="${FK_POLL_INTERVAL:-1}"
 
-# The string the kernel's UART driver must put on COM1 (roadmap 2.1). It is
-# overridable because this gate outlives any single banner text, but the
-# DEFAULT is deliberately the exact literal in src/boot/fk_kmain.f90: if the
-# two ever drift apart the gate must fail loudly and be looked at, not be
-# quietly retuned to whatever the kernel happens to say today.
-#
-# Matched with grep -F, so the trailing '.' is a period and not a regex
-# "any character". A gate that would also accept "Initialized!" is not
-# asserting the string it says it is asserting.
+# The default must stay byte-for-byte the literal in src/boot/fk_kmain.f90.
 EXPECT_SERIAL="${FK_EXPECT_SERIAL:-Fortran Kernel: UART Serial Initialized.}"
 
-# -smp 6 -m 24G is the project's mandated hard resource allocation (roadmap
-# 0.3). QEMU does not preallocate, so the 24 GB is address space, not resident
-# memory -- but the VM is still killed unconditionally below, because a stray
-# guest holding that reservation is exactly the kind of thing that is only
-# noticed the next time something else needs the machine.
+# The project's mandated allocation; QEMU does not preallocate the 24G.
 SMP="${FK_SMP:-6}"
 MEM="${FK_MEM:-24G}"
 
-# The help text IS the header comment above: one copy, so the documentation
-# cannot drift away from the script the way a hand-maintained second copy does.
-#
-# The block is delimited by the first non-comment line rather than by a
-# hardcoded line range. The range this replaces ('3,45p') had already outlived
-# its header and was printing 'set -uo pipefail' plus two lines of shell as
-# though they were documentation; adding the 2.1 half above would have pushed
-# it further out still. A line number that has to be hand-updated on every edit
-# is a comment that is wrong by default.
+# --help prints the header block above.
 usage() { sed -n '3,${/^#/!q;s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]}"; }
 
 MODE=gate
@@ -156,7 +76,6 @@ if [[ "$MODE" == gate ]]; then
   done
   say "image      : $ISO ($(stat -c %s "$ISO") bytes)"
   say "kernel     : $KERNEL"
-  # The address is read out of the ELF, never hardcoded: linker.ld decides it.
   if ! ADDR_OUT=$(python3 "$SENTINEL" addr "$KERNEL" 2>&1 >/dev/null); then
     say "FAIL: cannot locate the sentinel symbol in $KERNEL"; say "$ADDR_OUT"; exit 1
   fi
@@ -166,14 +85,8 @@ else
   [[ -f "$KERNEL" ]] || { say "FAIL: --smoke still needs $KERNEL for the symbol address"; exit 1; }
   DEADLINE=0
 fi
-# Printed in both modes and quoted, because the two ways this half of the gate
-# goes wrong are invisible otherwise: a banner that differs from the kernel's
-# by one character, and an FK_EXPECT_SERIAL override still in the environment
-# from a previous experiment.
 say "banner     : \"$EXPECT_SERIAL\""
 
-# KVM if we can have it, TCG otherwise. Say which -- a TCG boot is far slower
-# and that changes how a timeout should be read.
 if [[ -n "${FK_ACCEL:-}" ]]; then ACCEL="$FK_ACCEL"
 elif [[ -r /dev/kvm && -w /dev/kvm ]]; then ACCEL=kvm
 else ACCEL=tcg; fi
@@ -185,14 +98,9 @@ TMP="$(mktemp -d /tmp/fk-boot-test.XXXXXX)"
 SOCK="$TMP/qmp.sock"
 DUMP="$TMP/sentinel.bin"
 QEMU_LOG="$TMP/qemu.log"
-# Everything the guest puts on COM1 lands here; see the -serial argument below
-# for why this is a file and not stdio. It is inside $TMP, so the same cleanup()
-# that kills the VM also removes it -- a boot gate leaves nothing behind.
 SERIAL_LOG="$TMP/serial.log"
 QPID=""
 
-# Kill the VM unconditionally -- on success, on assertion failure, on Ctrl-C,
-# on an unexpected error.
 cleanup() {
   local rc=$?
   if [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null; then
@@ -209,9 +117,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Sleep as a background child and wait on it: bash defers trap handlers until
-# the current FOREGROUND child exits, so a plain `sleep 45` would leave the VM
-# alive for up to 45s after a SIGTERM.
+# bash defers trap handlers until the current foreground child exits, so a bare
+# `sleep` would leave the VM alive for the whole nap after a SIGTERM.
 nap() { sleep "$1" & wait $! 2>/dev/null || true; }
 qemu_alive() { [[ -n "$QPID" ]] && kill -0 "$QPID" 2>/dev/null; }
 show_qemu_log() {
@@ -219,50 +126,21 @@ show_qemu_log() {
   if [[ -s "$QEMU_LOG" ]]; then sed 's/^/  /' "$QEMU_LOG"; else say "  (QEMU said nothing)"; fi
 }
 
-# Is the banner on the wire YET? Re-reads the capture from scratch every time,
-# because the guest keeps writing to it while this script polls: an answer of
-# "no" one second ago says nothing about now. Cheap enough to run on every
-# iteration -- it is a grep over a file that is normally a few hundred bytes.
-#
-#   -F  the banner is a LITERAL. Its trailing '.' must be a period, not a
-#       regex wildcard that would also accept "Initialized!".
-#   -a  never let one stray control byte from the firmware make grep decide the
-#       file is binary and change what it reports about a match.
-#   --  the expected string is user-overridable and could begin with '-'.
+#   -F  the banner is a literal, so its trailing '.' is not a regex wildcard
+#   -a  a stray control byte must not make grep treat the capture as binary
+#   --  the expected string is overridable and could begin with '-'
 serial_has_banner() {
   [[ -s "$SERIAL_LOG" ]] && grep -aFq -- "$EXPECT_SERIAL" "$SERIAL_LOG"
 }
 
-# The NEGATIVE assertion, and the only one in this gate with that shape.
-#
-# src/boot/fk_kmain.f90 prints REJECT_SERIAL when serial_init's loopback probe
-# does not read back the byte it wrote. A gate that only ever greps for text it
-# WANTS cannot notice a kernel that is actively reporting a fault -- the banner
-# would still be there, the sentinel would still be correct, and the run would
-# be green while COM1 said the UART was broken.
-#
-# WHAT IT DOES NOT COVER, stated because the obvious guess is wrong and was
-# measured. This assertion was expected to also catch a broken fk_inb: strip the
-# `xorl %eax, %eax` from boot/io.S and the loopback probe should read back a byte
-# with stale upper bits and compare unequal. It does not. That mutant was built
-# and booted, and the run is clean -- at that call site the stale bits happen to
-# be zero. boot/io.S's zero-extension is covered by the white-box check in
-# tools/linkscript-test.sh instead. See docs/HARNESS-VALIDATION-SERIAL.md, M15.
-#
-# What it does cover is a UART that genuinely does not answer -- absent port
-# floating to 0xFF, a mis-decoded port, loopback that never engages -- each of
-# which would otherwise present as a green run.
+# The negative assertion: src/boot/fk_kmain.f90 prints this when serial_init's
+# loopback probe does not read back the byte it wrote.
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.}"
 serial_has_failure() {
   [[ -s "$SERIAL_LOG" ]] && grep -aFq -- "$REJECT_SERIAL" "$SERIAL_LOG"
 }
 
-# Show the bytes the guest actually emitted, not just the assertion's verdict
-# on them: a banner that is wrong by one character is only diagnosable if the
-# human can see it. CRs are stripped FOR DISPLAY ONLY (the file itself is what
-# serial_has_banner greps) -- a UART driver that ends lines with CRLF would
-# otherwise walk the terminal cursor back over the two-space indent and make
-# correct output look mangled.
+# CRs are stripped for display only; serial_has_banner greps the file itself.
 show_serial_log() {
   say ""; say "--- COM1 output (captured from the guest's serial port) ---"
   if [[ -s "$SERIAL_LOG" ]]; then
@@ -272,8 +150,6 @@ show_serial_log() {
   fi
 }
 
-# Both halves, printed in EVERY verdict path. "FAIL" on its own would make the
-# human re-run a 45-second gate just to learn which assertion broke.
 assertion_summary() {
   local sent ser
   if   (( SENTINEL_OK == 1 )); then sent="PASS  the four-word handoff record is present and correct"
@@ -285,9 +161,7 @@ assertion_summary() {
   fi
   say "  sentinel   (1.2) : $sent"
   say "  COM1 banner(2.1) : $ser"
-  # Reported only in gate mode: --smoke runs a guest with no kernel, so "the
-  # kernel did not report a self-test failure" is trivially true there and
-  # printing it would read as evidence when it is an absence of evidence.
+# --smoke boots no kernel, so the negative assertion is vacuous there.
   if [[ "$MODE" == gate ]]; then
     local slf
     if serial_has_failure; then
@@ -299,28 +173,10 @@ assertion_summary() {
   fi
 }
 
-# --- launch ----------------------------------------------------------------
 # -display none : headless.
-# -no-reboot    : a triple fault EXITS QEMU instead of silently resetting
-#                 forever, which turns an unbootable kernel into a diagnosable
-#                 failure rather than a timeout.
-# -serial file: : capture COM1 into $TMP, which is what the 2.1 half asserts
-#                 against. Deliberately NOT stdio, for two reasons. First, this
-#                 gate is scripted: it prints its own structured verdict, and
-#                 guest bytes interleaved into that same stream would corrupt
-#                 it -- a guest emitting a bare CR would overwrite the gate's
-#                 own line, and a guest emitting nothing would be
-#                 indistinguishable from a gate that forgot to look. Second, a
-#                 file can be RE-READ on every poll iteration; a consumed
-#                 stream cannot, and the poll loop below depends on asking the
-#                 same question repeatedly. file: is also output-only, so
-#                 nothing on the host's stdin can be steered into the guest --
-#                 the VM gains no new reach over the host from this change.
-# -nic none     : no network device at all. Without it QEMU attaches a default
-#                 e1000 on user-mode slirp, and a guest that fails to boot the
-#                 ISO falls through to iPXE and gets outbound egress through
-#                 the host's network stack. A boot gate has no business
-#                 touching the network.
+# -no-reboot    : a triple fault exits QEMU instead of resetting forever.
+# -serial file: : a file can be re-read on every poll; a consumed stream cannot.
+# -nic none     : without it QEMU attaches a default e1000 on user-mode slirp.
 QEMU_ARGS=(
   -smp "$SMP" -m "$MEM"
   -display none
@@ -351,20 +207,8 @@ while [[ ! -S "$SOCK" ]]; do
 done
 say "qemu running as pid $QPID, QMP socket up"
 
-# --- poll for BOTH proofs --------------------------------------------------
-# Retrying beats one fixed sleep: a pass breaks out immediately, while a slow
-# GRUB menu or a TCG boot still gets the full deadline before being called dead.
-#
-# The two proofs live in SEPARATE flags and neither is ever allowed to stand in
-# for the other, because they do not land at the same instant: the banner
-# appears whenever the UART driver is first called, the sentinel store happens
-# somewhere else in kernel_main, and pmemsave can only be issued once the QMP
-# monitor answers. Treating either as implying the other would let this gate
-# report a pass on evidence it never collected -- so the loop keeps going until
-# BOTH hold, or the deadline expires. ATTEMPT therefore counts POLL ITERATIONS,
-# not pmemsave calls: after the sentinel is satisfied the loop keeps spinning on
-# the cheap half alone, and reading it as "the dumper needed 40 tries" would be
-# wrong.
+# Poll until both proofs hold: they do not land at the same instant, and neither
+# stands in for the other. ATTEMPT counts poll iterations, not pmemsave calls.
 nap "$BOOT_WAIT"
 
 GOT_DUMP=0; SENTINEL_OK=0; SERIAL_OK=0; QEMU_DIED=0; ATTEMPT=0; START=$SECONDS
@@ -376,11 +220,8 @@ while :; do
     QPID=""
     break
   fi
-  # Checked first, and on every iteration: it costs one grep over a few hundred
-  # bytes, and it has to keep being checked after the sentinel is satisfied.
   if (( SERIAL_OK == 0 )) && serial_has_banner; then SERIAL_OK=1; fi
-  # Once the sentinel holds there is nothing further to learn from pmemsave,
-  # and re-running it would overwrite the passing dump the verdict prints back.
+# Re-running pmemsave would overwrite the passing dump the verdict prints back.
   if (( SENTINEL_OK == 0 )); then
     if python3 "$SENTINEL" dump --qmp "$SOCK" --elf "$KERNEL" --out "$DUMP" \
          --timeout 10 --no-quit 2>"$TMP/dump.err"; then
@@ -388,8 +229,7 @@ while :; do
       if python3 "$SENTINEL" check "$DUMP" --quiet >/dev/null 2>&1; then
         SENTINEL_OK=1
       fi
-      # --smoke wants exactly one look at a guest that can never satisfy either
-      # assertion. There is nothing to wait for, so do not wait.
+      # --smoke wants one look at a guest that can never satisfy either assertion.
       [[ "$MODE" == smoke ]] && break
     fi
   fi
@@ -399,18 +239,14 @@ while :; do
 done
 ELAPSED=$(( SECONDS - START ))
 
-# One last look before the verdict. Bytes can land between the final poll and
-# the moment the loop broke, and that matters most on the QEMU_DIED path:
-# "printed the banner, THEN triple-faulted" is a completely different bug
-# report from "never said anything at all". The capture is a host-side file, so
-# it stays readable long after the guest is gone.
+# Bytes can land between the last poll and the loop breaking, which separates
+# "printed the banner, then triple-faulted" from "never said anything".
 if (( SERIAL_OK == 0 )) && serial_has_banner; then SERIAL_OK=1; fi
 
 if qemu_alive; then
   python3 "$SENTINEL" quit --qmp "$SOCK" --timeout 5 >/dev/null 2>&1 || true
 fi
 
-# --- verdict ---------------------------------------------------------------
 if [[ "$MODE" == smoke ]]; then
   rule
   if (( GOT_DUMP == 1 )) && (( SENTINEL_OK == 0 )) && (( SERIAL_OK == 0 )); then
@@ -457,22 +293,6 @@ if [[ "$MODE" == smoke ]]; then
   rule; exit 1
 fi
 
-# QEMU_DIED == 0 is part of the pass condition, not decoration. Before the 2.1
-# half existed the loop broke the instant the sentinel held, so "both proofs
-# collected" and "the guest is still alive" could not come apart. Waiting for a
-# second, later proof re-opens that gap: the sentinel can pass at second 4, the
-# guest can triple-fault at second 9, and the final re-read of the capture can
-# still find a banner the guest printed before it died. Both assertions would
-# then be true of a kernel that crashed, and this gate would call it a pass.
-#
-# SELFTEST_BAD is the third condition, and it is a NEGATIVE one: the kernel must
-# not have reported its own UART self-test as failed. Everything else this gate
-# checks is "did the thing I hoped for appear"; this one is "did the thing I
-# dread appear". Without it, a kernel whose loopback probe reads back garbage
-# still prints the banner (the transmitter works; only the read path is broken),
-# so both positive assertions hold and the gate goes green while COM1 is
-# literally saying the UART is not right. What it does NOT cover is fk_inb's
-# zero-extension -- that was measured and escapes; see serial_has_failure above.
 SELFTEST_BAD=0
 if serial_has_failure; then SELFTEST_BAD=1; fi
 
@@ -480,9 +300,6 @@ rule
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
    && (( QEMU_DIED == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
-  # The actual bytes, not merely "the assertion held". This is the only part of
-  # the output that can reveal a banner which matched but arrived mangled,
-  # duplicated, or wrapped in garbage from a half-configured divisor latch.
   show_serial_log
   rule
   assertion_summary
@@ -499,8 +316,6 @@ if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
   exit 0
 fi
 
-# Reported before every failure branch, so the first thing on screen is which
-# half broke -- not a bare FAIL that costs another 45-second run to interpret.
 assertion_summary
 say ""
 if (( QEMU_DIED == 1 )); then
@@ -526,9 +341,6 @@ if (( QEMU_DIED == 1 )); then
   say "    * rsp not 16-byte aligned immediately before 'call kernel_main'"
   say "    * kernel_main RETURNING -- the contract says it never does"
   show_qemu_log
-  # Whatever reached COM1 before the fault is the guest's last words, and on a
-  # kernel that prints before it crashes they are the most specific evidence
-  # available about how far it got.
   show_serial_log
 elif (( GOT_DUMP == 0 )); then
   say "FAIL: never managed to read the guest's memory (${ELAPSED}s, $ATTEMPT attempt(s))."
@@ -543,9 +355,6 @@ elif (( SENTINEL_OK == 0 )); then
   say "The guest is alive and its memory is readable, so the machine did NOT"
   say "triple-fault: execution reached somewhere and stopped. If every word is"
   say "still 0x11111111, kernel_main was never called."
-  # The banner line in the summary above still stands on its own here: a kernel
-  # that talks but stores a wrong sentinel is a different bug from one that
-  # does neither, and this branch must not hide that.
 elif (( SELFTEST_BAD == 1 )); then
   say "THE KERNEL REPORTED ITS OWN UART SELF-TEST AS FAILED -- ${ELAPSED}s,"
   say "$ATTEMPT attempt(s)."

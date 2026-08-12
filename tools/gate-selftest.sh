@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
-# Proves the quality gates actually reject what they claim to reject.
-#
-# The Phase 1 audit found three gates that reported PASS on inputs they were
-# supposed to fail (docs/AUDIT-PHASE1.md, A-1 and A-2). The root cause was that
-# nobody had ever watched them fail. This script is the fix for that class of
-# defect: every gate is fed a file that violates it and must reject it, and is
-# fed the real sources and must accept them.
-#
-# Run it in the container:  ./tools/run.sh -f /dev/null  # (or directly)
+# Feeds every gate a file that violates it and must be rejected, plus the real
+# sources that must be accepted.
+# Run in the container:
 #   podman run --rm -v "$PWD:/work:Z" -w /work fortran-kernel-dev:f44 \
 #       bash tools/gate-selftest.sh
 set -uo pipefail
@@ -21,7 +15,6 @@ pass=0; fail=0
 ok()   { printf "  \033[32mPASS\033[0m  %s\n" "$1"; pass=$((pass+1)); }
 bad()  { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
 
-# expect_reject <name> <gate-script> <heredoc-file>
 expect_reject() {
   local name=$1 gate=$2 dir=$3
   if bash "$REPO/$gate" "$dir" >/dev/null 2>&1; then
@@ -179,10 +172,7 @@ expect_reject "missing SPDX identifier" tools/compliance.sh "$d"
 echo
 echo "=== compliance.sh sees past line continuations (Phase 2 regression) ==="
 
-# Fortran statements continue across lines; the gate used to read one line at a
-# time. Both cases below reported PASS before fold_continuations existed. The
-# first is the dangerous one: a public procedure hidden on a continuation line
-# was never checked for bind(c) at all.
+# Both fixtures below are only reachable after continuations are folded.
 d=$(mkcase c_cont_public <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -260,11 +250,7 @@ F90
 )
 expect_reject "public procedure hidden past a COMMENT inside a continuation" tools/compliance.sh "$d"
 
-# Check 6 (free-form layout) was the one mandatory rule with no fixture -- the
-# only gate in the file nobody had ever watched fail. The continuation line
-# below carries exactly five leading spaces, i.e. fixed-form's continuation
-# column; everything else in the module is compliant, so this discriminates on
-# check 6 alone.
+# The continuation line has exactly five leading spaces: fixed-form's column 6.
 d=$(mkcase c_fixedform <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -285,10 +271,7 @@ F90
 )
 expect_reject "fixed-form layout (non-blank in continuation column 6)" tools/compliance.sh "$d"
 
-# The mirror image: a correctly bound export whose bind(c) sits on a
-# continuation line must still be ACCEPTED. Folding that only ever adds
-# rejections would be its own defect -- it would make the gate unusable for the
-# multi-line signatures the GOP renderer needs.
+# Folding must not add rejections: a bind(c) split across lines stays accepted.
 d=$(mkcase c_cont_ok <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -320,11 +303,7 @@ else
   bad "compliance.sh rejects a correctly bound multi-line signature"
 fi
 
-# The bind(c) rule exempts public PARAMETERs (a named constant has no symbol
-# and no ABI -- see the rule's comment in compliance.sh). These two cases fix
-# the boundary of that exemption in place: a public constant is fine, a public
-# module VARIABLE is not. Without the second case, "it's not a procedure" would
-# have quietly become a way to export unbound data.
+# The bind(c) rule exempts public PARAMETERs; these two cases fix that boundary.
 d=$(mkcase c_param_ok <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -371,23 +350,8 @@ expect_reject "public module VARIABLE exported without bind(c)" tools/compliance
 echo
 echo "=== compliance.sh reads character literals as text, not as code (2.1) ==="
 
-# Until roadmap 2.1 the gate stripped comments with `sed 's/!.*//'`, justified
-# by a comment saying no translated module contained a character literal. The
-# serial driver and the kernel banner ended that precondition, and
-# tools/strip-comments.awk replaced the sed. The five fixtures below pin down
-# BOTH halves of that replacement: it must stop reading string text as code
-# (the three acceptances), and it must not start reading code as text (the two
-# rejections). Every one of them was run against the OLD sed before being
-# written down, and the verdict quoted in each comment is what that run printed.
 
-# MUST ACCEPT. FK_PROMPT and FK_BANNER share one declaration, with a '!' inside
-# FK_PROMPT's text. The old sed cut the line at that '!', so FK_BANNER was
-# never seen as declared anywhere and check 3's public-PARAMETER exemption
-# could not fire: the old gate exited 1 with `-> unbound: FK_BANNER`, a false
-# positive about a public constant that has no ABI and never needed bind(c).
-# MSG is the plain shape 2.1 actually introduces -- a banner with a '!' in it.
-# On its own the old sed tolerated MSG, because the text it destroyed was text
-# no check reads; the two-constant declaration is the half that discriminates.
+# The '!' inside FK_PROMPT must not hide the FK_BANNER declared after it.
 d=$(mkcase c_lit_bang <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -413,11 +377,6 @@ else
   bad "compliance.sh treats a '!' inside a character literal as a comment"
 fi
 
-# MUST ACCEPT. Check 2 greps the whole line for `go to`, and a banner that
-# tells the operator where to look contains those exact two words. The old gate
-# exited 1 with `-> banned-construct` on a module with no GOTO in it. The fix
-# is not a smarter regex -- it is that literal CONTENTS are blanked before any
-# check sees the line, so there is no banner text left to match.
 d=$(mkcase c_lit_goto_text <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -442,13 +401,7 @@ else
   bad "compliance.sh reads 'go to' in a character literal as a banned construct"
 fi
 
-# MUST ACCEPT. `""` inside a "..." literal is how Fortran writes a quote, and
-# getting it wrong is not cosmetic: a scanner that treats the first of the pair
-# as the CLOSING delimiter re-opens the literal on the second and has the
-# polarity inverted for the rest of the line. The trailing '!' then looks like
-# it is outside a literal, the line is cut there, and FK_TAIL disappears
-# exactly as in c_lit_bang. FK_TAIL is public so that failure is visible rather
-# than silent; under the old sed this file exited 1 with `-> unbound: FK_TAIL`.
+# "" is Fortran's escaped quote: mis-reading it inverts quote state for the line.
 d=$(mkcase c_lit_dquote <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -473,14 +426,6 @@ else
   bad "compliance.sh mis-tracks Fortran's doubled-delimiter escape"
 fi
 
-# MUST STILL REJECT, and this is the case that matters most. A real inline
-# `go to` follows a character literal on the same line, and the literal happens
-# to be the '!' character. The OLD gate ACCEPTED this file -- exit 0 -- because
-# the cut landed inside the literal and took the `go to` with it: a banned
-# construct rendered invisible by a string earlier on the line, which is a
-# false NEGATIVE and strictly worse than the noise the other fixtures describe.
-# It is also the proof that blanking literal contents did not turn into
-# blanking code: everything outside the delimiters must survive intact.
 d=$(mkcase c_lit_real_goto <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -503,12 +448,6 @@ F90
 )
 expect_reject "inline GOTO hidden behind a character literal on the same line" tools/compliance.sh "$d"
 
-# MUST STILL REJECT. The bind(c) rule is the one a quote-aware pass could most
-# easily make lenient by accident -- blank too much and every export starts
-# looking bound. fk_unbound is a public procedure with no bind(c) at all, in a
-# file that also carries a '!'-bearing literal so the new pass is genuinely
-# exercised on it. The old gate rejected this correctly (`-> unbound:
-# fk_unbound`) and the new one must keep doing so for the same reason.
 d=$(mkcase c_lit_unbound <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -535,27 +474,7 @@ F90
 )
 expect_reject "public procedure with no bind(c) in a file containing literals" tools/compliance.sh "$d"
 
-# MUST REJECT -- and this is the fixture that pays for the quote-aware pass.
-#
-# A Fortran character literal may be CONTINUED across lines with '&'.
-# tools/strip-comments.awk resets quote state at end of line, so on the
-# continuation line the CLOSING quote reads as an OPENING one and everything
-# after it is blanked as if it were string content. The real `go to` below is
-# inside that blanked tail.
-#
-# This is a FALSE NEGATIVE the sed it replaced did not have: `sed 's/!.*//'`
-# left the whole second line alone and the banned-construct grep matched it.
-# Fixing two false positives had therefore quietly bought one false negative, in
-# the gate whose entire job is to make "NO go to anywhere" true -- docs/AUDIT-
-# PHASE1.md A-1 all over again, from the other direction.
-#
-# The stripper now REFUSES a line that ends inside a literal (exit 2) instead of
-# guessing, and compliance.sh turns that into a named failure. So this module is
-# rejected -- not because the gate understood the GOTO, but because the gate
-# declined to certify source it cannot read. That distinction is the point, and
-# it is why the case belongs here rather than in the "reads literals as text"
-# group above: those five prove the stripper is RIGHT, this one proves it knows
-# when it is not.
+# Rejected because the stripper refuses (exit 2) a line that ends inside a literal.
 d=$(mkcase c_cont_literal <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -601,13 +520,7 @@ F90
 )
 expect_reject "module that calls into libgfortran (print *)" tools/linktest.sh "$d"
 
-# linktest's undefined-symbol rule was relaxed from "zero undefined symbols" to
-# "every undefined symbol is defined elsewhere in this tree" when roadmap 1.2
-# introduced fk_kmain -> fk_cpu_halt (assembly) and fk_gop_renderer ->
-# vga_font_row (the font module). This case is the proof that the relaxation
-# did not turn into "any undefined symbol is fine": nothing in the tree defines
-# fk_no_such_primitive, so it must still be rejected. Without it, a typo in an
-# interface block would link cleanly in the gate and fail at kernel link time.
+# Undefined symbols are tolerated only when something else in the tree defines them.
 d=$(mkcase l_orphan <<'F90'
 ! SPDX-License-Identifier: GPL-2.0
 module fk_case_m
@@ -646,28 +559,16 @@ subroutine fpwork(a, b, n) bind(c, name="fpwork")
   end do
 end subroutine fpwork
 F90
-# built WITHOUT -mno-sse on purpose: proves the detector sees FP when present
+# No -mno-sse here: the object must really contain FP for the detector to find.
 gfortran -O2 -J"$WORK" -c -o "$WORK/fp.o" "$WORK/fp.f90" 2>/dev/null
 hits=$(objdump -d "$WORK/fp.o" | grep -oE '%(x|y|z)mm[0-9]+|%mm[0-7]|[[:space:]]f(ld|st|add|mul|div|sub)[a-z]*[[:space:]]' | sort -u | wc -l)
 if [ "$hits" -gt 0 ]; then ok "FP detector finds $hits distinct FP/vector operand(s)"
 else bad "FP detector saw nothing in an object built with SSE enabled"; fi
 
 
-# linktest.sh PASS 0 assembles every boot/*.S to build the set of symbols "this
-# tree defines". Roadmap 2.1 turned that from a hardcoded boot/boot.S into a
-# glob, and added an arm that FAILS the run when one of them does not assemble.
-# That arm replaced a `2>/dev/null && objs=...` which swallowed the error --
-# and a swallowed error is not quiet, it is LOUD IN THE WRONG PLACE: every
-# symbol the broken object defines vanishes from PROVIDED, so the visible
-# symptom is a list of modules accused of calling things "nothing in this tree
-# defines", none of which is the file that is actually broken.
-#
-# Nothing could watch that arm fire, because the script cd's to the repo root
-# and the repo's own two .S files both assemble. FK_BOOTDIR exists so this case
-# can exist; without it the branch would be exactly the untested gate that
-# docs/AUDIT-PHASE1.md A-1/A-2 are about.
 echo
 echo "=== linktest.sh: a boot/*.S that does not assemble fails the run (2.1) ==="
+# The repo's own boot/*.S all assemble, so FK_BOOTDIR is the only way to test this.
 bad_boot="$WORK/bootdir_broken"
 mkdir -p "$bad_boot"
 cat > "$bad_boot/broken.S" <<'ASM'
@@ -682,9 +583,7 @@ if FK_BOOTDIR="$bad_boot" bash "$REPO/tools/linktest.sh" "$REPO/src" >/dev/null 
 else
   ok "linktest.sh rejects a boot/*.S that does not assemble"
 fi
-# The mirror image: pointing FK_BOOTDIR at a directory with no .S at all must
-# stay a quiet no-op, not an error. The [ -e ] unmatched-glob guard is what makes
-# that true, and the synthetic single-module cases above depend on it.
+# An unmatched *.S glob must stay a quiet no-op; the cases above depend on it.
 empty_boot="$WORK/bootdir_empty"
 empty_src="$WORK/srcdir_empty"
 mkdir -p "$empty_boot" "$empty_src"
