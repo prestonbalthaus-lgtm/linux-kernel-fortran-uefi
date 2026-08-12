@@ -262,7 +262,7 @@ The most critical mathematical and structural phase. Setting up the brain of the
 
             *** FORTRAN KERNEL PANIC ***
             EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error
-            RIP     = 0xFFFFFFFF80101E9F
+            RIP     = 0xFFFFFFFF80101E5F
             CS      = 0x0000000000000008
             RFLAGS  = 0x0000000000010086
             RSP     = 0xFFFFFFFF80109100

@@ -47,7 +47,7 @@ the reason the pass means something:
 
 | Field reported | Cross-check |
 |---|---|
-| `RIP = 0xFFFFFFFF80101E9F` | the address of the `idivl` in `kernel_main` (`objdump -d`) |
+| `RIP = 0xFFFFFFFF80101E5F` | the address of the `idivl` in `kernel_main` (`objdump -d`; it moves whenever the image does, so re-derive it rather than trusting this number) |
 | `CS = 0x08`, `SS = 0x10` | the selectors `fk_gdt_m` defines, i.e. the LRETQ in `gdt_flush.S` ran |
 | `ERR = 0x0` on #DE | the stub's dummy push, since #DE carries no error code |
 | `ERR = 0x2` on #PF | the CPU's own code (write, not-present) — the other branch |
