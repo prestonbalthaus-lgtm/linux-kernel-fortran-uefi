@@ -6,8 +6,8 @@ module fk_serial_m
   use, intrinsic :: iso_c_binding, only: c_int32_t, c_char
   implicit none
   private
-  public :: FK_SERIAL_COM1, serial_init, serial_print_char, &
-            serial_print_string
+  public :: FK_SERIAL_COM1, serial_init, serial_print_byte, &
+            serial_print_char, serial_print_string
 
   integer(c_int32_t), parameter :: FK_SERIAL_COM1 = int(z'3F8', c_int32_t)
 
@@ -148,16 +148,33 @@ contains
     serial_ready = .true.
   end function serial_init
 
-  ! Write one byte, raw.  A timeout drops the character.
-  subroutine serial_print_char(c) bind(c, name="serial_print_char")
+  ! Write one byte, raw.  A timeout drops it.
+  !
+  ! FORTRAN CALLERS MUST USE THIS AND NOT serial_print_char.  gfortran 16.1
+  ! passes a character(kind=c_char), VALUE dummy by ADDRESS for some actual
+  ! argument forms -- achar(...) as an argument expression is one -- while the
+  ! callee reads it as a value, so what reaches the UART is the low byte of a
+  ! pointer.  A C caller is unaffected, which is why the differential test never
+  ! saw it.  An integer by value has no such ambiguity; it is what boot/io.S has
+  ! taken since 2.1.
+  subroutine serial_print_byte(b) bind(c, name="serial_print_byte")
     implicit none
-    character(kind=c_char), intent(in), value :: c
+    integer(c_int32_t), intent(in), value :: b
 
     if (.not. serial_ready) return
     if (.not. lsr_wait(serial_base, UART_LSR_THRE)) return
 
+    call fk_outb(serial_base + UART_TX, iand(b, 255_c_int32_t))
+  end subroutine serial_print_byte
+
+  ! The C spelling of the same thing (roadmap 2.1), kept because
+  ! tests/drivers/serial/test_serial.c is written against it.
+  subroutine serial_print_char(c) bind(c, name="serial_print_char")
+    implicit none
+    character(kind=c_char), intent(in), value :: c
+
     ! iachar is ASCII by definition and yields 0..255, never a negative.
-    call fk_outb(serial_base + UART_TX, iachar(c, c_int32_t))
+    call serial_print_byte(iachar(c, c_int32_t))
   end subroutine serial_print_char
 
   ! Write a NUL-terminated C string.  s(*) and not s(:): an assumed-shape dummy
@@ -165,14 +182,15 @@ contains
   subroutine serial_print_string(s) bind(c, name="serial_print_string")
     implicit none
     character(kind=c_char), intent(in) :: s(*)
-    integer(c_int32_t) :: i
+    integer(c_int32_t) :: i, b
 
     if (.not. serial_ready) return
 
     ! Integer compare: s(i) == c_null_char would emit _gfortran_compare_string.
     do i = 1_c_int32_t, FK_SERIAL_MAX_STRING
-       if (iachar(s(i), c_int32_t) == 0_c_int32_t) return
-       call serial_print_char(s(i))
+       b = iachar(s(i), c_int32_t)
+       if (b == 0_c_int32_t) return
+       call serial_print_byte(b)
     end do
   end subroutine serial_print_string
 
