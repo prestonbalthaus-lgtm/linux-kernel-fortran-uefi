@@ -57,7 +57,7 @@ Before any Fortran is written, the autonomous build environment must be establis
 
 Bypassing Fortran's reliance on the OS and successfully handing control from UEFI to the Fortran entry point.
 
-  *  [x] 1.1 The Core Library Translation (Completed)
+  *  [ ] 1.1 The Core Library Translation (Completed)
 
         Validation: String manipulation and math modules exist without libgfortran.
 
@@ -70,7 +70,7 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
         must translate lib/string.c first. Note 1.3 below needs memcpy/memset anyway, so
         that is where the debt gets paid.
 
-  *  [x] 1.2 Multiboot2 / EFI Assembly Stub  (Multiboot2 half only)
+  *  [ ] 1.2 Multiboot2 / EFI Assembly Stub  (Multiboot2 half only)
 
         Validation: Assembly code (boot.S) successfully transitions CPU to 64-bit Long Mode and jumps to kernel_main().
 
