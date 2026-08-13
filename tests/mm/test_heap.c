@@ -116,11 +116,13 @@ static uint8_t *arena;
 static size_t   arena_cap;	/* how much of the arena heap_sbrk may hand out */
 static size_t   arena_used;
 static size_t   sbrk_skew;	/* one-shot: bytes to waste before the next answer */
+static long     sbrk_calls;	/* every ask, met or not: see expect_refused() */
 
 int64_t heap_sbrk(int64_t bytes)
 {
 	uint8_t *p;
 
+	sbrk_calls++;
 	if (bytes <= 0)
 		return 0;
 	/* An injected discontinuity is consumed whether or not the request can
@@ -228,8 +230,14 @@ static void audit(const char *what)
 	EQ32(L(what, "every live block still holds its own fill byte"), 0, dirty);
 	EQ32(L(what, "no two live blocks overlap"), 0, overlapping);
 
+	/* The running counter, read BEFORE heap_check refreshes it: take() adds
+	 * and kfree() subtracts, and a drift between the two is invisible from
+	 * the moment the walk overwrites the word with its own total. */
+	EQ64(L(what, "the running used counter matches the model"), on_loan,
+	     fk_heap_stat[HS_USED]);
+
 	/* heap_check() recomputes the statistics from its own walk, so it has
-	 * to run before any of them is read. */
+	 * to run before any of the rest of them is read. */
 	EQ64(L(what, "heap_check"), 0, heap_check());
 	EQ64(L(what, "the counters agree on allocations"), m_allocs,
 	     fk_heap_stat[HS_ALLOCS]);
@@ -466,6 +474,51 @@ static void scenario_split(void)
 	assert_one_block("split");
 }
 
+/* --- scenario: growing more than once ------------------------------------ */
+
+/* The module's promise about growth: the new chunk is coalesced with the old
+ * last block if that one was free, "so a heap that grows repeatedly does not
+ * accumulate a boundary per growth".  Nothing above reaches it.  It needs a
+ * growth that happens while the block at the TOP of the window is free and
+ * merely too small, and the random churn passes through that state without
+ * ever stopping on it -- so a heap that dropped the merge and left a fragment
+ * below every growth boundary went through every other scenario in this file
+ * untouched.  The state has to be built on purpose.
+ *
+ * The assertion is where the second allocation LANDS.  Merged, the tail and
+ * the new chunk are one free block starting below the old top and first fit
+ * serves the request out of it; unmerged, the tail is too small, the scan
+ * walks past it, and the request is served above the old top -- leaving 5520
+ * bytes that no later allocation of any size can ever reach. */
+static void scenario_growth(void)
+{
+	int64_t a, b, top;
+
+	fresh("growth", ARENA_BYTES);
+
+	/* 60000 bytes is a 60016-byte block, so 5520 of the 64 KiB chunk are
+	 * left over as a free tail. */
+	a = model_alloc("growth", 60000);
+	EQ32("growth: the first chunk was mapped", 1, a != 0);
+	EQ64("growth: one chunk of window", HEAP_CHUNK, heap_top() - heap_base());
+	EQ64("growth: two blocks in it", 2, fk_heap_stat[HS_BLOCKS]);
+	EQ64("growth: and a free tail too small for what comes next", 5520,
+	     fk_heap_stat[HS_FREE]);
+
+	top = heap_top();
+	b = model_alloc("growth", 10000);
+	EQ32("growth: the second request was served", 1, b != 0);
+	EQ64("growth: by mapping exactly one more chunk", top + HEAP_CHUNK,
+	     heap_top());
+	EQ32("growth: out of the old tail, which the new chunk absorbed", 1,
+	     b < top);
+	EQ64("growth: leaving no boundary behind at the seam", 3,
+	     fk_heap_stat[HS_BLOCKS]);
+
+	drain("growth");
+	assert_one_block("growth");
+}
+
 /* --- scenario: the remainder that is too small to be a block ------------- */
 
 static void scenario_no_split(void)
@@ -645,15 +698,25 @@ static void scenario_guards(void)
 
 /* --- scenario: what kmalloc refuses -------------------------------------- */
 
-static void expect_refused(const char *what, int64_t n)
+/* asks is how many times the supplier must be consulted, and it is the whole
+ * difference between the two ways kmalloc can say no.  A request the BOUND
+ * rejects must never reach heap_sbrk: the cap exists so that a size that
+ * wrapped is refused as arithmetic rather than being handed to the memory
+ * supplier to fail on, and a heap without the cap refuses the same requests
+ * with the same counter for as long as the supplier happens to be too small.
+ * Only the call count tells them apart. */
+static void expect_refused(const char *what, int64_t n, int asks)
 {
 	int64_t failed = fk_heap_stat[HS_FAILED];
 	int64_t top    = heap_top();
+	long    asked  = sbrk_calls;
 
 	EQ64(L(what, "is refused"), 0, kmalloc(n));
 	EQ64(L(what, "is counted exactly once"), failed + 1,
 	     fk_heap_stat[HS_FAILED]);
 	EQ64(L(what, "does not grow the heap"), top, heap_top());
+	EQ32(L(what, "reaches the memory supplier exactly this often"), asks,
+	     (int)(sbrk_calls - asked));
 	audit(what);
 }
 
@@ -662,18 +725,19 @@ static void scenario_refusals(void)
 	fresh("refusals", ARENA_BYTES);
 	(void)model_alloc("refusals", 64);	/* a window to refuse things against */
 
-	expect_refused("kmalloc(0)", 0);
-	expect_refused("kmalloc(-1)", -1);
+	expect_refused("kmalloc(0)", 0, 0);
+	expect_refused("kmalloc(-1)", -1, 0);
 	/* n is a signed quadword carrying an unsigned request: a caller that
 	 * wrapped must not have n + header wrap back into something small
 	 * enough for a first-fit scan to satisfy. */
-	expect_refused("kmalloc(INT64_MIN)", INT64_MIN);
-	expect_refused("kmalloc(-16)", -16);
-	expect_refused("kmalloc over the 1 GiB cap", HEAP_MAX_REQ + 1);
-	expect_refused("kmalloc far over the cap", HEAP_MAX_REQ * 4);
-	/* The cap itself is a legitimate request that no supplier here can
-	 * meet: refused by the growth, not by the bound, and counted the same. */
-	expect_refused("kmalloc of the cap itself", HEAP_MAX_REQ);
+	expect_refused("kmalloc(INT64_MIN)", INT64_MIN, 0);
+	expect_refused("kmalloc(-16)", -16, 0);
+	expect_refused("kmalloc over the 1 GiB cap", HEAP_MAX_REQ + 1, 0);
+	expect_refused("kmalloc far over the cap", HEAP_MAX_REQ * 4, 0);
+	/* The cap itself is a legitimate request, and the contrast that gives
+	 * the call count above its meaning: this one IS put to the supplier,
+	 * which cannot meet it, and is refused by the growth instead. */
+	expect_refused("kmalloc of the cap itself", HEAP_MAX_REQ, 1);
 
 	EQ32("refusals: nothing was handed out", 1, nlive == 1);
 	drain("refusals");
@@ -772,6 +836,14 @@ static void scenario_noncontiguous(void)
 
 int main(void)
 {
+	/* Line buffered, and not for tidiness.  A defect in a block allocator
+	 * does not stop at a wrong answer -- it writes a header through a
+	 * pointer computed from a corrupted one -- so the process can die
+	 * before it returns.  Block-buffered output dies with it and leaves
+	 * "Segmentation fault" as the entire diagnosis; line-buffered, the
+	 * MISMATCH that came first is already on the terminal. */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	arena = aligned_alloc(HEAP_PAGE, ARENA_BYTES);
 	if (!arena) {
 		printf("  FATAL: cannot allocate the %zu-byte arena\n", ARENA_BYTES);
@@ -789,6 +861,7 @@ int main(void)
 	scenario_order("free in descending address order", ORD_DESC);
 	scenario_order("free in scrambled address order", ORD_SCRAMBLED);
 	scenario_split();
+	scenario_growth();
 	scenario_no_split();
 	scenario_kzalloc();
 	scenario_guards();
