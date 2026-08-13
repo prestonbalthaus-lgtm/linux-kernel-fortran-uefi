@@ -493,7 +493,12 @@ prints tracks what the loader said, so live loader data crossed into Fortran and
 was parsed, not merely received.
 
 The 24G arithmetic checks by hand: 159 + 786144 + 5505024 = 6291327 frames. The
-531 used are the kernel's 530 (0x100000-0x314000, outward) plus frame 0.
+531 used are the kernel's 530 plus frame 0 — `0x100000` to `0x312000` rounded
+outward is frames 256 to 785. **That end is the BOOTED image's**, and it is not
+the `0x314000` in the static-gate block above: `linkscript-test.sh` links every
+module in `src/`, including the library ones the bootable image deliberately
+leaves out, so its ELF is two frames longer. Two images, two extents, and the
+number that has to reconcile with the console is the one the console booted.
 
 **And a finding worth more than the numbers.** The sentinel reports the MBI at
 physical `0x103540` — which is *inside* `[__kernel_phys_start,
@@ -512,6 +517,11 @@ proves it, and only because the host suite can put the MBI where it likes.
 `M14`-`M20` re-run defects the host suite already catches, on a real machine,
 because the host suite parses a map this tree wrote and the boot gate parses one
 GRUB wrote.
+
+Every row in BOTH tables was re-measured against the committed branch after the
+sixth verdict was added, so what is quoted here is what
+`tools/mutate-phase3.sh` prints from the image in the tree — 23 boots. M1-M13
+came back byte-identical to the 3.2.5 results above, including both escapes.
 
 | # | Defect | Result |
 |---|---|---|
@@ -569,6 +579,13 @@ machine word is testing the word, not the algorithm.**
   answer from `pmm_alloc_page` on this machine and the kernel cannot yet map it.
   That is roadmap 3.5's, and until then an allocation above the identity window
   is a number, not memory.
+* **`pmm_verify` assumes at least 101 free frames at the bottom of RAM** — 5 for
+  the contiguity test and 96 for the cursor one. QEMU's low region has 158, and
+  a conventional PC's has about the same, so this holds everywhere the kernel
+  has run. On a machine whose first available region is smaller the block would
+  not be contiguous, the computed-address frees would refuse, and the CURSOR
+  verdict would print FAIL on healthy hardware. That is the H6/M18 family again,
+  pointed the other way: a fixture that assumes something about the machine.
 * **64 GiB is a ceiling, not the architecture's.** Above `FK_PMM_MAX_PHYS` the
   memory is counted into `pmm_ignored_bytes` and reported. It reads 0 on every
   boot so far, which means the reporting path itself is only proven by the host

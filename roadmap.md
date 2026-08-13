@@ -491,7 +491,8 @@ The most critical mathematical and structural phase. Setting up the brain of the
 
         THE NUMBERS ARE THE PROOF, AND THEY ARE LIVE. 159 + 786144 + 5505024 =
         6291327 = 0x5FFF7F frames, which is the three AVAILABLE regions rounded
-        INWARD. The 531 used are the kernel's 530 plus frame 0. Booting the SAME
+        INWARD. The 531 used are the kernel's 530 -- 0x100000 to 0x312000
+        rounded OUTWARD, frames 256 to 785 -- plus frame 0. Booting the SAME
         IMAGE at -m 4G gives 0x0FFF7F, and at -m 2G gives 0x07FF7F and SEVEN
         regions rather than eight -- QEMU emits no above-4 GiB entry at all. A
         table of constants cannot do that; this is 1.2's "word 3 is computed at
