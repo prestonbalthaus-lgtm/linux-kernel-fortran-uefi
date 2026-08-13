@@ -24,6 +24,16 @@
 #   FK_EXPECT_SERIAL  strings COM1 must carry, ONE PER LINE -- all must appear
 #   FK_REJECT_SERIAL  strings COM1 must NOT carry, one per line -- any is fatal
 #   FK_CHECK_HW       non-empty: also assert TR and the 8259s over QMP
+#   FK_CHECK_FB       0 to skip the framebuffer assertion (default: on). The
+#                     bar is drawn once, before the CPU parks, so it survives a
+#                     panic build too.
+#   FK_FB_EXPECT      'console' (default) or 'panic': which palette the console
+#                     band must be carrying. Set it to panic for an
+#                     FK_FAULT_MODE build -- that is what asserts the register
+#                     dump reached the SCREEN and not only COM1.
+#   FK_CHECK_SCHED    0 to skip the scheduler/heap assertion (default: on).
+#                     Set it to 0 for a build that ends in a deliberate panic:
+#                     the CPU is halted, so no thread is running to count.
 #   FK_CHECK_TICKS    0 to skip the "still ticking" assertion (default: on).
 #                     Set it to 0 for a build that ends in a deliberate panic:
 #                     the CPU is halted with IF clear, so the counter is frozen
@@ -120,13 +130,85 @@ Fortran Kernel: RFLAGS.IF is CLEAR after STI.
 Fortran Kernel: IRQ0 never reached the tick target; the timer interrupt did not arrive.
 Fortran Kernel: the first tick\'s saved frame is NOT kernel .text with IF set.'
 
+# roadmap 2.2 and 2.4. Three of these carry a value rather than a prefix:
+#
+#   "IA32_PAT is 0x0007010600070106" is READ BACK OFF THE CPU after the wrmsr.
+#   The reset value differs from it in exactly the byte -- PA1 -- that decides
+#   whether the framebuffer is write-combining or write-through, so a prefix
+#   match, or a kernel that printed the constant it meant to write, would
+#   accept a PAT nobody programmed.
+#
+#   "no write-back alias in the linear map" is the SDM 11.12.4 property. The
+#   linear map covers every byte below top-of-RAM, and the framebuffer BAR is
+#   under 4 GiB on this machine, so the aperture is inside it by default and
+#   the hole has to be punched deliberately.
+#
+#   The channel line carries the packed masks in full. 0x...0810 means red at
+#   bit 16 and blue at bit 0 -- BGRX -- and a kernel that assumed RGB would
+#   print the same geometry line above it and draw a blue panic banner.
+FK_FB_PASS_LINES=$'Fortran Kernel: GOP IA32_PAT is 0x0007010600070106, PAT index 1 is write-combining.
+Fortran Kernel: GOP framebuffer PTE selects PAT index 1, write-combining.
+Fortran Kernel: GOP framebuffer has no write-back alias in the linear map.
+Fortran Kernel: GOP renderer armed on the mapped framebuffer (roadmap 2.4).'
+FK_FB_FAIL_LINES=$'Fortran Kernel: GOP framebuffer tag REJECTED, status 0x
+Fortran Kernel: GOP could NOT program the PAT; the framebuffer is not write-combining.
+Fortran Kernel: GOP framebuffer mapping FAILED, status 0x
+Fortran Kernel: GOP framebuffer PTE is NOT write-combining.
+Fortran Kernel: GOP framebuffer is ALIASED write-back in the linear map.
+Fortran Kernel: GOP renderer REFUSED the framebuffer, status 0x'
+
+# roadmap 2.4 and 4.0. The console line carries cols/rows in full: a console
+# that armed on the wrong geometry still prints "live" and then draws off the
+# end of a scanline.
+#
+# The heap's coalescing verdict is the one worth reading twice. Every other
+# heap line passes on an allocator that never merges anything -- alignment,
+# non-overlap, patterns and the guards are all properties of a heap that leaks
+# a fragment per free. "blocks 0x00000001" after everything is freed is the
+# only line that fails on one.
+FK_CON_PASS_LINES=$'Fortran Kernel: console is live on the framebuffer, cols/rows 0x00000080/0x0000002F
+Fortran Kernel: console scrolled 0x'
+FK_CON_FAIL_LINES=$'Fortran Kernel: console REFUSED the framebuffer geometry, status 0x
+Fortran Kernel: console never scrolled.'
+
+FK_HEAP_PASS_LINES=$'Fortran Kernel: heap returned 16-byte aligned, non-overlapping blocks.
+Fortran Kernel: heap kept every block\'s contents across the other allocations.
+Fortran Kernel: kzalloc returned memory that was already zero.
+Fortran Kernel: heap refused a double free, a stray pointer and a wrapped size.
+Fortran Kernel: heap tiles its window exactly, blocks/used/free 0x00000001/0x00000000/
+Fortran Kernel: heap coalesced every freed block back into one, largest free 0x'
+# roadmap 4.0's scheduler. "switches/A/B" carries three live counts, so it is
+# a prefix -- but the line only prints after the boot thread has watched BOTH
+# spawned threads' own counters pass 2, which no single switch can produce.
+FK_SCHED_PASS_LINES=$'Fortran Kernel: scheduler tasks/current 0x00000003/0x00000001
+Fortran Kernel: preemption is on; the timer now switches tasks.
+Fortran Kernel: both threads ran, switches/A/B 0x'
+FK_SCHED_FAIL_LINES=$'Fortran Kernel: scheduler could NOT spawn a thread, status 0x
+Fortran Kernel: a spawned thread NEVER ran; the switch did not happen.'
+
+FK_HEAP_FAIL_LINES=$'Fortran Kernel: heap could not get memory from the PMM/VMM.
+Fortran Kernel: heap blocks are misaligned or OVERLAP.
+Fortran Kernel: heap blocks OVERWROTE each other.
+Fortran Kernel: kzalloc returned DIRTY memory.
+Fortran Kernel: heap ACCEPTED a free it should have refused.
+Fortran Kernel: heap did NOT coalesce; it is fragmented, blocks 0x
+Fortran Kernel: heap FAILED its own consistency walk, faults 0x'
+
 EXPECT_SERIAL="${FK_EXPECT_SERIAL:-Fortran Kernel: UART Serial Initialized.
 $FK_PMM_PASS_LINES
 $FK_VMM_PASS_LINES
+$FK_FB_PASS_LINES
+$FK_CON_PASS_LINES
+$FK_HEAP_PASS_LINES
+$FK_SCHED_PASS_LINES
 $FK_IRQ_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
 $FK_VMM_FAIL_LINES
+$FK_FB_FAIL_LINES
+$FK_CON_FAIL_LINES
+$FK_HEAP_FAIL_LINES
+$FK_SCHED_FAIL_LINES
 $FK_IRQ_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
@@ -193,6 +275,10 @@ for pat in "${REJECTS[@]}"; do say "must not   : \"$pat\""; done
 [[ -n "${FK_CHECK_HW:-}" ]] && say "hw check   : task register and both 8259s, over QMP"
 CHECK_TICKS="${FK_CHECK_TICKS:-1}"
 [[ "$CHECK_TICKS" != 0 ]] && say "tick check : fk_tick_count read twice from the running guest"
+CHECK_SCHED="${FK_CHECK_SCHED:-1}"
+[[ "$CHECK_SCHED" != 0 ]] && say "sched check: fk_task_runs and fk_heap_stat, read twice while it runs"
+CHECK_FB="${FK_CHECK_FB:-1}"
+[[ "$CHECK_FB" != 0 ]] && say "fb check   : fk_fb_info, then the pixels at the base it names (${FK_FB_EXPECT:-console} palette)"
 
 if [[ -n "${FK_ACCEL:-}" ]]; then ACCEL="$FK_ACCEL"
 elif [[ -r /dev/kvm && -w /dev/kvm ]]; then ACCEL=kvm
@@ -379,6 +465,18 @@ assertion_summary() {
       else                        say "  hardware state   : FAIL  see the monitor output above"
       fi
     fi
+    if [[ "$CHECK_FB" != 0 ]]; then
+      if   (( FB_OK == 1 )); then  say "  framebuffer      : PASS  the bar in guest memory matches the loader's masks"
+      elif (( FB_RAN == 0 )); then say "  framebuffer      : FAIL  the guest died before it could be asked"
+      else                         say "  framebuffer      : FAIL  see the pixel comparison above"
+      fi
+    fi
+    if [[ "$CHECK_SCHED" != 0 ]]; then
+      if   (( SCHED_OK == 1 )); then  say "  scheduler + heap : PASS  both threads' own counters grew, heap is whole"
+      elif (( SCHED_RAN == 0 )); then say "  scheduler + heap : FAIL  the guest died before it could be asked"
+      else                            say "  scheduler + heap : FAIL  see the counters above"
+      fi
+    fi
     if [[ "$CHECK_TICKS" != 0 ]]; then
       if   (( TICK_OK == 1 )); then say "  tick advance     : PASS  fk_tick_count grew between two reads"
       elif (( TICK_RAN == 0 )); then say "  tick advance     : FAIL  the guest died before it could be asked"
@@ -476,6 +574,44 @@ if [[ -n "${FK_CHECK_HW:-}" && "$MODE" == gate ]]; then
   fi
 fi
 
+# roadmap 2.2/2.4. The handoff block is read first and the framebuffer's
+# physical address comes OUT of it, so this asserts the pixels at the address
+# the guest itself says it mapped -- not at one this script knows.
+FB_RAN=0; FB_OK=0
+if [[ "$CHECK_FB" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    FB_RAN=1
+    rule
+    say "--- the framebuffer, read back out of guest memory ---"
+    if python3 "$SENTINEL" fb --qmp "$SOCK" --elf "$KERNEL" --timeout 10 \
+         --expect "${FK_FB_EXPECT:-console}"; then
+      FB_OK=1
+    fi
+  else
+    say ""
+    say "framebuffer NOT asserted: the guest was already gone."
+  fi
+fi
+
+# roadmap 4.0. Two reads, a moment apart, of counters the THREADS increment --
+# so "both threads are running" is a fact about a machine that is still
+# switching between them, which nothing the kernel printed can establish: the
+# boot thread prints its verdict and could then never be scheduled again.
+SCHED_RAN=0; SCHED_OK=0
+if [[ "$CHECK_SCHED" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    SCHED_RAN=1
+    rule
+    say "--- the scheduler and the heap, read out of guest memory twice ---"
+    if python3 "$SENTINEL" sched --qmp "$SOCK" --elf "$KERNEL" --timeout 10; then
+      SCHED_OK=1
+    fi
+  else
+    say ""
+    say "scheduler NOT asserted: the guest was already gone."
+  fi
+fi
+
 # roadmap 3.2b. Deliberately NOT folded into the hwstate block: that one reads
 # state the guest set up once, and this one reads state the guest is producing
 # right now. A build whose kernel_main ends in a panic satisfies the first and
@@ -553,9 +689,14 @@ HW_BAD=0
 if [[ -n "${FK_CHECK_HW:-}" && "$MODE" == gate ]] && (( HW_OK == 0 )); then HW_BAD=1; fi
 TICK_BAD=0
 if [[ "$CHECK_TICKS" != 0 && "$MODE" == gate ]] && (( TICK_OK == 0 )); then TICK_BAD=1; fi
+FB_BAD=0
+if [[ "$CHECK_FB" != 0 && "$MODE" == gate ]] && (( FB_OK == 0 )); then FB_BAD=1; fi
+SCHED_BAD=0
+if [[ "$CHECK_SCHED" != 0 && "$MODE" == gate ]] && (( SCHED_OK == 0 )); then SCHED_BAD=1; fi
 
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
-   && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )); then
+   && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )) \
+   && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule
@@ -573,6 +714,22 @@ if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
     say "          The task register and both 8259s were then read back out of"
     say "          the device models, so those are the machine's answers and"
     say "          not the kernel's."
+  fi
+  if [[ "$CHECK_FB" != 0 ]]; then
+    say "          The four-primary bar was then read back out of the"
+    say "          framebuffer at the physical address the guest itself"
+    say "          reported, and every pixel matched a colour the HOST packed"
+    say "          from the loader's channel masks -- so the renderer reached"
+    say "          real video memory and packed the channels the firmware"
+    say "          asked for, not the ones an x86 kernel usually gets away with."
+  fi
+  if [[ "$CHECK_SCHED" != 0 ]]; then
+    say "          Two counters that only the two SPAWNED threads increment"
+    say "          were then read twice while the guest ran, and both had"
+    say "          grown -- so the timer interrupt is switching between three"
+    say "          stacks and coming back to each of them, which is the whole"
+    say "          of roadmap 4.0 and cannot be inferred from any line printed"
+    say "          by the thread that prints lines."
   fi
   if [[ "$CHECK_TICKS" != 0 ]]; then
     say "          And fk_tick_count was read out of guest memory TWICE, a"

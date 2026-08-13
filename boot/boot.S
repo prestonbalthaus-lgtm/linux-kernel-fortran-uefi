@@ -83,7 +83,18 @@
 	.set MB2_MAGIC,       0xE85250D6	/* Multiboot2 header magic       */
 	.set MB2_ARCH_I386,   0			/* architecture 0 = 32-bit i386  */
 	.set MB2_TAG_ENTRY,   3			/* entry address tag             */
+	.set MB2_TAG_FB,      5			/* framebuffer request           */
 	.set MB2_TAG_END,     0			/* required list terminator      */
+
+	/*
+	 * The mode ASKED FOR (roadmap 2.2).  It is a request and not a
+	 * contract: the loader answers with whatever it could set, in tag 8
+	 * of the MBI, and src/drivers/video/fk_fbinfo.f90 believes the answer
+	 * rather than these three numbers.
+	 */
+	.set MB2_FB_WIDTH,    1024
+	.set MB2_FB_HEIGHT,   768
+	.set MB2_FB_DEPTH,    32
 
 	.set CR4_PAE,         (1 << 5)		/* physical address extension    */
 	.set CR0_PE,          (1 << 0)		/* protected mode (GRUB set it)  */
@@ -163,22 +174,29 @@ mb2_tag_entry:
 	/* size 12 is not a multiple of 8; the .align 8 below is the padding. */
 
 	/*
-	 * DELIBERATELY ABSENT: the framebuffer tag (type 5), which roadmap 2.2
-	 * needs and which is the next thing to add here.  It is left out now
-	 * because it changes the boot mode -- GRUB switches to a graphics mode
-	 * and the text-mode assumptions of this milestone stop holding -- and
-	 * because the framebuffer GOP reports on real hardware is frequently a
-	 * PCI BAR above 4 GiB, outside the 1 GiB identity map built below.
-	 * Requesting it before the map covers it produces a page fault with no
-	 * IDT (roadmap 3.2), i.e. a triple fault and a silent reboot.
+	 * Framebuffer tag (type 5), roadmap 2.2.  Its presence is what puts
+	 * GRUB into a graphics mode at all; without it the MBI carries no
+	 * tag 8 and there is no linear framebuffer to draw on.
 	 *
-	 * When 2.2 lands, the tag is:
-	 *     .align 8
-	 *     .short 5 ; .short 0 ; .long 20
-	 *     .long <width> ; .long <height> ; .long <depth>
-	 * and the identity map below must be widened to cover the reported
-	 * framebuffer before vga_init_framebuffer() is handed the address.
+	 * flags = 0, i.e. REQUIRED.  A loader that silently ignored this
+	 * would hand over a machine with no console this kernel can use,
+	 * which is worse than not booting.
+	 *
+	 * The physical address that comes back is a PCI BAR and is routinely
+	 * outside the 1 GiB identity map built below -- on this hardware it
+	 * is under 4 GiB, on newer hardware it is above it.  Nothing here
+	 * widens the map to reach it: the VMM (roadmap 3.5) maps the reported
+	 * range explicitly, write-combining, at a virtual address the kernel
+	 * chooses, and the renderer is armed with THAT.
 	 */
+	.align 8
+mb2_tag_fb:
+	.short	MB2_TAG_FB
+	.short	0
+	.long	20
+	.long	MB2_FB_WIDTH
+	.long	MB2_FB_HEIGHT
+	.long	MB2_FB_DEPTH
 
 	/* Required list terminator: type 0, flags 0, size 8. */
 	.align 8

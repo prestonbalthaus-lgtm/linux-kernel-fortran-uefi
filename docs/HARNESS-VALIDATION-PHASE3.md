@@ -964,3 +964,142 @@ printed is the same class of problem.
 
 `irq_bringup` is now a function returning 0 only when all four properties held,
 and the headline is conditional on it. A verdict has to be earned.
+
+---
+
+## Roadmap 2.2, 2.4, 3.6 and 3.7: the screen, the heap and two threads
+
+Four milestones landed together, and they share a gate: `tools/qemu-boot-test.sh`
+grew two channels and `tools/qmp-sentinel.py` grew two subcommands.
+
+### The channels, and what each is the only one to see
+
+**`fb`** reads `fk_fb_info` — ten quadwords the guest itself filled in — and then
+pmemsaves the framebuffer **at the physical address that block names**, so
+nothing on the host knows or assumes where a PCI BAR landed. It asserts three
+different things about those pixels:
+
+* The four-primary bar, compared against colours the HOST packs from the
+  loader's channel masks. Not against constants: a renderer that ignores the
+  reported positions and hardcodes RGB draws a bar that is non-black,
+  correct-looking, and rejected.
+* The bar's **last** row as well as its first. The console lives immediately
+  below and has scrolled several screens by the time this runs, so the bottom
+  row is where a scroll that reached one row too high shows up — as ordinary
+  text, not as corruption.
+* The signature string `FK-GOP 2.4`, compared **glyph for glyph against the
+  kernel's own font table read out of guest memory**, in both directions: a lit
+  font bit must be foreground *and* a clear one must not be. A cell that was
+  filled rather than rendered fails; so does a font walked LSB-first.
+
+**`sched`** reads `fk_sched_state`, `fk_task_runs` and `fk_heap_stat`, waits, and
+reads the first two again. Two reads and not one, because a counter that is
+merely non-zero proves a thread ran **once** — which a scheduler that switches
+away and never comes back also produces, and that kernel prints every serial
+verdict in this section before it sticks. It also reads RSP0 out of the TSS and
+requires it to equal the top of a *spawned* task's stack, computed from
+`fk_task_stacks` in the ELF: nothing in ring 0 consults RSP0, so
+`tss_set_rsp0` never being called is otherwise completely silent.
+
+`FK_FB_EXPECT=panic` switches the console-band assertion to the panic palette,
+which is what asserts a register dump reached the **screen** and not only COM1.
+It reads the last two text rows, not the first: a panic dump is 26 lines on a
+47-row screen and cannot reach the top, and every line the handler prints ends
+in CRLF, so the bottom row of a finished panic is blank by construction.
+
+### Mutations
+
+M34-M39 were injected alone into a known-good tree, rebuilt from clean, booted
+and restored, on the same terms as M1-M33.
+
+| # | Defect | Result |
+|---|---|---|
+| M34 | `FK_VMM_WC` without `FK_PTE_PWT` — the framebuffer mapped write-back | **caught** — `GOP framebuffer PTE is NOT write-combining.`, a line the gate forbids |
+| M35 | `map_physmap` stops skipping the aperture — the framebuffer aliased | **caught** — `GOP framebuffer is ALIASED write-back in the linear map.` |
+| M36 | `coalesce_back` removed from `kfree` | **caught twice** — `heap did NOT coalesce; it is fragmented` on COM1, and `the heap came back to 5 block(s)` from the QMP read |
+| M37 | a spawned task's RFLAGS with IF clear | **caught by the QMP channel** — `0 spawned threads have executed`, and the tick counter stops too: the round robin reaches the first task and the machine never leaves it |
+| M38 | `movq %rax, %rsp` deleted from `irq_common` | **caught twice** — `a spawned thread NEVER ran; the switch did not happen.` and `0 spawned threads have executed`. Every task is created and the scheduler's own counters advance; not one instruction of either thread executes, which is exactly why `fk_task_runs` is incremented by the THREAD |
+| M39 | `sched_start()` never called | **caught three ways by the QMP channel** — `context switches grew 0 -> 0`, `0 spawned threads have executed`, and `TSS RSP0 is 0x0000000000000000`, which is the only mutation in the table that the RSP0 assertion catches on its own |
+
+M39's first run reported `BUILD FAILED (caught at build time)` and that result
+was **discarded rather than believed**: the log said `make: Makefile: Permission
+denied`, which is a podman `:Z` relabel race with a second container running the
+host suite at the same time, not a defect the static gate found. Re-run alone it
+is caught by the boot gate as above. A mutation harness that accepts a build
+failure as a catch will happily report a catch for a full disk.
+
+**M34 and M35 are the two no picture would show.** A framebuffer mapped
+write-back renders identically — every pixel lands, just after a
+read-modify-write of a cache line nothing reads — and an aliased one has no
+symptom at all until the two memory types disagree. Both are decoded from the
+**live page-table entry**, which is why `fb_bringup` prints a verdict about the
+PTE's meaning rather than only the PTE's value: the address in that line is
+machine-specific and cannot be asserted, while "PAT index 1" is one bit.
+
+### Two harness defects this milestone found, both watched failing
+
+**M34 and M35 ESCAPED on their first run, and the escape was in the harness.**
+`tools/mutate-phase3.sh` carries its own `FK_EXPECT_SERIAL`/`FK_REJECT_SERIAL`
+sets rather than using the boot gate's defaults, and they still described the
+boot as it was before any of this existed. Every case in the table was therefore
+attributable only for the subsystems that existed at 3.2b. This is the same class
+of defect the tree already has on record from 3.4: a gate carrying its own copy
+of what the kernel prints is a copy that goes stale the moment the kernel prints
+something new.
+
+**`restore()` could not restore three of the files the new cases mutate.** It
+rewinds exactly `$FILES`, and `fk_heap.f90`, `fk_sched.f90` and `fk_console.f90`
+were not in it. The M36 mutation therefore survived its own case, poisoned every
+later one, and was picked up by the next `git add -A` — HEAD carried a `kfree`
+with no backward coalescing for two commits before the next run's failure
+signature (`the heap came back to 5 block(s)` appearing under an unrelated
+framebuffer mutation) gave it away. The list now says out loud that adding a case
+means checking it first.
+
+### A defect the host suite found and the boot did not
+
+`tests/drivers/video/test_console.c` runs 937,980 pixel-exact checks against a C
+reference model of both the character grid and the expected framebuffer. It
+failed on 19,458 of them the first time, and what it found is the fourth
+instance of a gfortran trap this tree tracks:
+
+```fortran
+call vga_print_char(achar(code, c_char), cx * FONT_W, org_y + cy * FONT_H, fg)
+```
+
+`vga_print_char`'s first dummy is `bind(c)`, `character(kind=c_char)`, `VALUE`.
+Handed a **function-result expression**, gfortran 16.1.1 materialises a temporary
+and passes its ADDRESS; the callee reads the low byte of RDI. From `objdump` of
+the two objects:
+
+```
+caller  put:            lea    0x1f(%rsp),%rdi     <- ADDRESS of the temporary
+                        mov    %al,0x1f(%rsp)      <- the character goes INTO it
+                        call   vga_print_char
+callee  vga_print_char: movzbl %dil,%edi           <- reads the low byte of RDI
+```
+
+Every glyph on screen became the same CP437 symbol — the low byte of a stack
+address, constant per call site: `0xAF` from `console_putc`, `0x9F` from
+`console_write`. Cursor motion, wrapping, scrolling, tab stops and the reserved
+band were all perfectly correct. **The boot passed**, and so did the framebuffer
+assertion as it stood, because counting lit pixels cannot tell one glyph from
+another. Assigning to a local first fixes it; the glyph-identity check described
+above is what would now catch it from outside the guest.
+
+The lesson generalises past this call site: a `bind(c)` `VALUE` character dummy
+must be handed a plain variable, never an expression. `vga_print_string` was
+always safe because it passes `s(i)`, an array element.
+
+### What is NOT claimed
+
+* **Ring 3.** `tss_set_rsp0` is called on every switch and asserted over QMP, but
+  there are no user segment descriptors in the GDT and nothing to run there.
+  The mechanism is in place; it has never been exercised.
+* **A preemption-safe heap.** `fk_heap_m` takes no lock. The boot thread does all
+  the allocating and stops before `sched_start`; kmalloc from an interrupt
+  handler or from two threads at once would corrupt the block list.
+* **The scroll's right margin.** `vga_scroll_up` moves whole scanlines while
+  `console_clear` paints only `cols*FONT_W`, so a framebuffer whose width is not
+  a multiple of 8 scrolls up to seven columns it never clears. Bounded and
+  stated rather than fixed.

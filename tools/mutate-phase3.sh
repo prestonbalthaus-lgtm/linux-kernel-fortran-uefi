@@ -19,11 +19,19 @@ echo "logs: $OUT"
 
 # Every file any mutation below touches.  A short restore list is how a defect
 # survives into the NEXT case and gets attributed to it.
+# EVERY FILE ANY CASE BELOW MUTATES MUST BE IN THIS LIST. restore() rewinds
+# exactly these, so a case that seds a file not named here leaves its mutation
+# behind: it survives into every later case, is reported against the wrong
+# defect, and -- the way it was actually discovered -- gets committed by the
+# next `git add -A`. Adding a case therefore means checking this list first,
+# which is why fk_heap, fk_sched and fk_console had to be added with M34-M39.
 FILES="boot/interrupts.S boot/gdt_flush.S boot/faultgen.S boot/ksyms.S \
        boot/mmu.S \
        src/cpu/fk_gdt.f90 src/cpu/fk_idt.f90 src/cpu/fk_tss.f90 \
+       src/cpu/fk_sched.f90 \
        src/drivers/pic/fk_pic.f90 src/drivers/pit/fk_pit.f90 \
-       src/mm/fk_pmm.f90 src/mm/fk_vmm.f90 \
+       src/drivers/video/fk_console.f90 \
+       src/mm/fk_pmm.f90 src/mm/fk_vmm.f90 src/mm/fk_heap.f90 \
        src/boot/fk_kmain.f90"
 
 restore() { git checkout -- $FILES 2>/dev/null; }
@@ -70,26 +78,52 @@ VMM_REJECT=$'Fortran Kernel: VMM init FAILED, status 0x\nFortran Kernel: VMM cou
 IRQ_EXPECT=$'Fortran Kernel: PIT channel 0 hz/divisor 0x00000064/0x00002E9C.\nFortran Kernel: 8259 IMR now 0x0000FFFE, IRQ0 is the only line open.\nFortran Kernel: RFLAGS.IF is set, the CPU is interruptible, RFLAGS = 0x\nFortran Kernel: IRQ0 ticks before/after/spurious 0x\nFortran Kernel: the first tick interrupted kernel .text with IF set, RIP/RFLAGS 0x'
 IRQ_REJECT=$'Fortran Kernel: PIT divisor is 0, so channel 0 was NOT programmed.\nFortran Kernel: IRQ0 is STILL MASKED after the unmask.\nFortran Kernel: RFLAGS.IF is CLEAR after STI.\nFortran Kernel: IRQ0 never reached the tick target; the timer interrupt did not arrive.\nFortran Kernel: the first tick\'s saved frame is NOT kernel .text with IF set.'
 
-DE_EXPECT="EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error"$'\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
-DF_EXPECT=$'EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault\n*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
+# roadmap 2.2/2.4 and 3.6 ride on every case for the reason 3.4's and 3.5's do:
+# all of it runs before the deliberate fault in every build, so a mutation is
+# only attributable if everything it did not touch still holds.
+#
+# The two lines that carry the milestone are the PAT one and the alias one. A
+# framebuffer mapped write-back renders IDENTICALLY -- no picture, no pixel
+# dump and no console line would differ -- and a framebuffer aliased in the
+# linear map has no symptom at all until the day the two memory types disagree.
+# Both are decoded from the LIVE page-table entry.
+GOP_EXPECT=$'Fortran Kernel: GOP IA32_PAT is 0x0007010600070106, PAT index 1 is write-combining.\nFortran Kernel: GOP framebuffer PTE selects PAT index 1, write-combining.\nFortran Kernel: GOP framebuffer has no write-back alias in the linear map.\nFortran Kernel: GOP renderer armed on the mapped framebuffer (roadmap 2.4).\nFortran Kernel: console is live on the framebuffer, cols/rows 0x00000080/0x0000002F'
+GOP_REJECT=$'Fortran Kernel: GOP framebuffer tag REJECTED, status 0x\nFortran Kernel: GOP could NOT program the PAT; the framebuffer is not write-combining.\nFortran Kernel: GOP framebuffer PTE is NOT write-combining.\nFortran Kernel: GOP framebuffer mapping FAILED, status 0x\nFortran Kernel: GOP framebuffer is ALIASED write-back in the linear map.\nFortran Kernel: GOP renderer REFUSED the framebuffer, status 0x\nFortran Kernel: console REFUSED the framebuffer geometry, status 0x'
+
+# roadmap 3.6. "blocks 0x00000001" after everything is freed is the only one of
+# these a heap that never coalesces fails; the rest pass on a fragmented one.
+HEAP_EXPECT=$'Fortran Kernel: heap returned 16-byte aligned, non-overlapping blocks.\nFortran Kernel: kzalloc returned memory that was already zero.\nFortran Kernel: heap refused a double free, a stray pointer and a wrapped size.\nFortran Kernel: heap tiles its window exactly, blocks/used/free 0x00000001/0x00000000/\nFortran Kernel: heap coalesced every freed block back into one, largest free 0x'
+HEAP_REJECT=$'Fortran Kernel: heap could not get memory from the PMM/VMM.\nFortran Kernel: heap blocks are misaligned or OVERLAP.\nFortran Kernel: heap blocks OVERWROTE each other.\nFortran Kernel: kzalloc returned DIRTY memory.\nFortran Kernel: heap ACCEPTED a free it should have refused.\nFortran Kernel: heap did NOT coalesce; it is fragmented, blocks 0x\nFortran Kernel: heap FAILED its own consistency walk, faults 0x'
+
+# roadmap 3.7. NOT on the fault builds: kernel_main raises its deliberate fault
+# before sched_bringup on none of them -- it raises it after -- so these do ride
+# on every case, and a panic build that halts simply stops the threads later.
+SCHED_EXPECT=$'Fortran Kernel: scheduler tasks/current 0x00000003/0x00000001\nFortran Kernel: preemption is on; the timer now switches tasks.\nFortran Kernel: both threads ran, switches/A/B 0x'
+SCHED_REJECT=$'Fortran Kernel: scheduler could NOT spawn a thread, status 0x\nFortran Kernel: a spawned thread NEVER ran; the switch did not happen.'
+
+DE_EXPECT="EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error"$'\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
+DF_EXPECT=$'EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault\n*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
 # The OOM build's proof is three facts: the allocator refused, it said so, and
 # the panic that followed came from the CPU with a full register dump.
-OOM_EXPECT=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
-COMMON_REJECT=$'Fortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.\n'"$PMM_REJECT"$'\n'"$VMM_REJECT"$'\n'"$IRQ_REJECT"
+OOM_EXPECT=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
+COMMON_REJECT=$'Fortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.\n'"$PMM_REJECT"$'\n'"$VMM_REJECT"$'\n'"$IRQ_REJECT"$'\n'"$GOP_REJECT"$'\n'"$HEAP_REJECT"$'\n'"$SCHED_REJECT"
 
 # roadmap 3.5's two page-fault builds. The CR2 line is the whole assertion: both
 # faults are vector 14 with error code 0, so without it the two cases are
 # indistinguishable and either would satisfy the other's expectation.
-PF_EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000000 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
+PF_EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000000 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
 DF_REJECT="*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***"$'\n'"$COMMON_REJECT"
 
 # roadmap 3.2b's build is the DEFAULT now, because it is what ships. It is the
 # only one whose kernel_main does not end in a register dump, so it is also the
 # only one where the tick counter must still be moving when the gate reads it.
-NONE_EXPECT="$IRQ_EXPECT"$'\nFortran Kernel: interrupts are live and the kernel is still running (roadmap 3.2b).\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"
+NONE_EXPECT="$IRQ_EXPECT"$'\nFortran Kernel: interrupts are live and the kernel is still running (roadmap 3.2b).\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
 NONE_REJECT=$'*** FORTRAN KERNEL PANIC ***\n'"$COMMON_REJECT"
 
-EXPECT="$NONE_EXPECT"; REJECT="$NONE_REJECT"; CHECK_TICKS=1
+# The shipped build's settings, and the per-case defaults reset before every
+# mutation. A case that forgets to call fault_build gets these.
+EXPECT="$NONE_EXPECT"; REJECT="$NONE_REJECT"
+CHECK_TICKS=1; CHECK_SCHED=1; FB_EXPECT=console
 
 # subst <file> <old> <new> -- and ABORT the run if the text was not there.
 # A sed that quietly matches nothing rebuilds the pristine kernel, the gate
@@ -109,13 +143,31 @@ PY
 # so every one of them also turns the tick assertion OFF: the panic handler
 # halts with IF clear, and a frozen counter is the CORRECT answer there.
 #
+# roadmap 4.0 added two more assertions that are wrong for a halted CPU, and
+# they are switched together with the tick one by fault_build() below:
+#
+#   FK_CHECK_SCHED reads fk_task_runs TWICE while the guest runs. With the CPU
+#   parked in a panic no thread is running, both reads are equal, and the gate
+#   would report a scheduling failure for every panic build -- a false alarm
+#   that would make the whole mutation table unreadable.
+#
+#   FK_FB_EXPECT goes from console to panic. The console band is repainted
+#   white on red by the handler, so demanding the console palette there would
+#   fail on a kernel whose panic screen works, and demanding nothing would stop
+#   asserting the panic reached the screen at all.
+#
 # Rebuild kernel_main's deliberate fault as the #DF that was the default until
 # roadmap 3.2b -- the only build that exercises the IST1 stack switch.
+# What every fault build shares: a halted CPU, and a screen the panic owns.
+fault_build() {
+  CHECK_TICKS=0; CHECK_SCHED=0; FB_EXPECT=panic
+}
+
 mode_df() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t"
-  EXPECT="$DF_EXPECT"; REJECT="$DF_REJECT"; CHECK_TICKS=0
+  EXPECT="$DF_EXPECT"; REJECT="$DF_REJECT"; fault_build
 }
 
 # ...or as a #DE instead.
@@ -123,7 +175,7 @@ mode_de() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = 0_c_int32_t"
-  EXPECT="$DE_EXPECT"; REJECT="$COMMON_REJECT"; CHECK_TICKS=0
+  EXPECT="$DE_EXPECT"; REJECT="$COMMON_REJECT"; fault_build
 }
 
 # ...or as roadmap 3.4's out-of-memory panic: drain the PMM, then INT3.
@@ -131,7 +183,7 @@ mode_oom() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -1_c_int32_t"
-  EXPECT="$OOM_EXPECT"; REJECT="$COMMON_REJECT"; CHECK_TICKS=0
+  EXPECT="$OOM_EXPECT"; REJECT="$COMMON_REJECT"; fault_build
 }
 
 # The guard page, whose address is READ OUT OF THE IMAGE that was just built
@@ -143,7 +195,7 @@ mode_guard() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -2_c_int32_t"
-  EXPECT="$PF_EXPECT"; REJECT="$COMMON_REJECT"; CHECK_TICKS=0; POST_BUILD=guard_cr2
+  EXPECT="$PF_EXPECT"; REJECT="$COMMON_REJECT"; fault_build; POST_BUILD=guard_cr2
 }
 guard_cr2() {
   local b cr2
@@ -162,8 +214,8 @@ mode_wp() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -4_c_int32_t"
-  EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000003 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
-  REJECT="$COMMON_REJECT"; CHECK_TICKS=0; POST_BUILD=wp_cr2
+  EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000003 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
+  REJECT="$COMMON_REJECT"; fault_build; POST_BUILD=wp_cr2
 }
 wp_cr2() {
   local t
@@ -180,7 +232,7 @@ mode_idmap() {
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -3_c_int32_t"
   EXPECT="$PF_EXPECT"$'\n'"CR2     = 0x0000000000100000"
-  REJECT="$COMMON_REJECT"; CHECK_TICKS=0
+  REJECT="$COMMON_REJECT"; fault_build
 }
 
 # Both gates, because they see different things: the static one reads the
@@ -198,7 +250,8 @@ run_case() {
   # A case whose expectation depends on an address only the fresh image knows.
   [ -n "${POST_BUILD:-}" ] && "$POST_BUILD"
   FK_EXPECT_SERIAL="$EXPECT" FK_REJECT_SERIAL="$REJECT" FK_CHECK_HW=1 \
-    FK_CHECK_TICKS="$CHECK_TICKS" tools/qemu-boot-test.sh >"$OUT/$name.log" 2>&1
+    FK_CHECK_TICKS="$CHECK_TICKS" FK_CHECK_SCHED="$CHECK_SCHED" \
+    FK_FB_EXPECT="$FB_EXPECT" tools/qemu-boot-test.sh >"$OUT/$name.log" 2>&1
   local rc=$? line
   # The CAUSE, not the gate's echo of what it was looking for: the header lines
   # quote every expected string, so a grep for those matches on every run.
@@ -435,8 +488,7 @@ case_M29() {
 # No EOI. The 8259 goes on holding its in-service bit, so exactly ONE interrupt
 # is ever delivered -- which is why the proof loop waits for three.
 case_M30() {
-  subst src/cpu/fk_idt.f90 $'    call pic_eoi(line)\n  end subroutine irq_handler' \
-                           $'    continue\n  end subroutine irq_handler'
+  subst src/cpu/fk_idt.f90 '    call pic_eoi(line)' '    continue'
   run_case M30-no-eoi
 }
 # The line is never opened. Everything else is correct and nothing arrives.
@@ -462,14 +514,70 @@ case_M33() {
   run_case M33-pit-never-programmed
 }
 
+
+# --- roadmap 2.2: the framebuffer's memory type ------------------------------
+# Drop PWT from the framebuffer's flags. The mapping still works and every
+# pixel still lands; it is merely WRITE-BACK, so each glyph becomes a
+# read-modify-write of a cache line nothing ever reads. Nothing on screen looks
+# different, which is why the PTE is decoded and printed rather than trusted.
+case_M34() {
+  subst src/mm/fk_vmm.f90 "ior(FK_PTE_PWT, FK_PTE_NX))" \
+                          "ior(0_c_int64_t, FK_PTE_NX))"
+  run_case M34-framebuffer-write-back
+}
+# Stop punching the aperture out of the linear map. The framebuffer is then
+# reachable BOTH ways -- write-combining at FK_VMM_MMIO and write-back through
+# the physmap -- which is undefined behaviour (SDM Vol.3 11.12.4) and which
+# nothing on screen, on COM1 or in a pixel dump would otherwise reveal.
+case_M35() {
+  subst src/mm/fk_vmm.f90 "       if (.not. hits_hole(p)) then" \
+                          "       if (.true.) then"
+  run_case M35-framebuffer-aliased
+}
+
+# --- roadmap 3.6: the heap ---------------------------------------------------
+# Backward coalescing removed. Forward coalescing alone passes every other heap
+# verdict -- alignment, non-overlap, patterns, the guards -- and leaves the heap
+# in a fragment per free that no later allocation can merge.
+case_M36() {
+  subst src/mm/fk_heap.f90 $'    call coalesce_fwd(a)\n    call coalesce_back(a)' \
+                           $'    call coalesce_fwd(a)'
+  run_case M36-heap-no-backward-coalesce
+}
+
+# --- roadmap 3.7: tasks ------------------------------------------------------
+# A spawned task's RFLAGS with IF CLEAR. It runs, and it is never preempted
+# again: the round robin stops on the first task it switches to and the boot
+# thread -- the one that prints every verdict -- never runs again.
+case_M37() {
+  subst src/cpu/fk_sched.f90 "RFLAGS_IF = int(z'202', c_int64_t)" \
+                             "RFLAGS_IF = int(z'2', c_int64_t)"
+  run_case M37-task-starts-with-IF-clear
+}
+# THE SWITCH ITSELF. Ignore the RSP irq_handler returned and pop the frame that
+# was pushed. Every task is created, the scheduler picks them in turn and
+# increments its own counters, and not one instruction of either thread ever
+# executes -- which is exactly why fk_task_runs is incremented by the THREAD.
+case_M38() {
+  subst boot/interrupts.S "$(printf '\tmovq\t%%rax, %%rsp')" "$(printf '\tnop')"
+  run_case M38-irq-ignores-returned-rsp
+}
+# The scheduler is never armed. Identical to M38 from every serial line's point
+# of view, and it is a one-word difference in the source.
+case_M39() {
+  subst src/boot/fk_kmain.f90 $'    call sched_start()\n' ''
+  run_case M39-preemption-never-armed
+}
+
 ALL="baseline_none baseline_df baseline_de baseline_oom baseline_guard \
      baseline_idmap baseline_wp M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 \
      M12 M13 M14 M15 M16 M17 M18 M19 M20 M21 M22 M23 M24 M25 M26 M27 \
-     M28 M29 M30 M31 M32 M33"
+     M28 M29 M30 M31 M32 M33 M34 M35 M36 M37 M38 M39"
 for c in $ALL; do
   want_case "$c" || continue
   echo "=== $c ==="
-  EXPECT="$NONE_EXPECT"; REJECT="$NONE_REJECT"; CHECK_TICKS=1; POST_BUILD=""
+  EXPECT="$NONE_EXPECT"; REJECT="$NONE_REJECT"; POST_BUILD=""
+  CHECK_TICKS=1; CHECK_SCHED=1; FB_EXPECT=console
   restore
   "case_$c"
   restore

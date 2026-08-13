@@ -71,6 +71,18 @@ LDFLAGS_KERNEL := -nostdlib -z max-page-size=0x1000 -T linker.ld
 # 3.1/3.2, fk_pmm for 3.4, fk_pit for 3.2b, and the next module to appear here
 # has to clear it too.
 #
+# The video stack arrives at roadmap 2.2/2.4 and clears the same bar:
+# kernel_main CALLS all four, so they are boot path. Their order is forced
+# three ways -- fk_fbinfo USEs fk_pmm_m for the identity-window bound,
+# fk_gop_renderer USEs fk_font_8x16_m for the glyphs and fk_string_m for the
+# scroll's memmove, and fk_console USEs the renderer. fk_string.f90 MOVED ahead
+# of them for that third reason and the move is semantic, not tidying.
+#
+# fk_idt is NOT in that dependency chain even though the panic handler now
+# prints to the screen: it reaches console_write through a bind(c) interface
+# block rather than USE association, precisely so that a panic path does not
+# order the whole video stack ahead of the IDT.
+#
 # fk_pic and fk_pit MOVED AHEAD of fk_idt at roadmap 3.2b and the move is the
 # semantic kind: fk_idt_m's IRQ router now USEs both -- fk_pic_m to acknowledge
 # the chip and fk_pit_m to service line 0 -- so their .mod files have to exist
@@ -83,8 +95,14 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/cpu/fk_idt.f90 \
                src/mm/fk_pmm.f90 \
                src/lib/fk_string.f90 \
+               src/drivers/video/fk_fbinfo.f90 \
+               src/drivers/video/fk_font_8x16.f90 \
+               src/drivers/video/fk_gop_renderer.f90 \
+               src/drivers/video/fk_console.f90 \
                src/lib/fk_string_abi.f90 \
                src/mm/fk_vmm.f90 \
+               src/mm/fk_heap.f90 \
+               src/cpu/fk_sched.f90 \
                src/boot/fk_kmain.f90
 
 # Assembly sources. NAMED ONE BY ONE, deliberately not $(wildcard boot/*.S):
