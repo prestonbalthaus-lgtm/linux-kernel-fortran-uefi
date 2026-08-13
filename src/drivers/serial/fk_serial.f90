@@ -3,11 +3,11 @@
 ! The port-I/O primitives it is built on, fk_outb and fk_inb, are in boot/io.S.
 ! No Fortran I/O statement may appear here: it would pull in libgfortran.
 module fk_serial_m
-  use, intrinsic :: iso_c_binding, only: c_int32_t, c_char
+  use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t, c_char
   implicit none
   private
   public :: FK_SERIAL_COM1, serial_init, serial_print_byte, &
-            serial_print_char, serial_print_string
+            serial_print_char, serial_print_string, serial_print_hex
 
   integer(c_int32_t), parameter :: FK_SERIAL_COM1 = int(z'3F8', c_int32_t)
 
@@ -176,6 +176,27 @@ contains
     ! iachar is ASCII by definition and yields 0..255, never a negative.
     call serial_print_byte(iachar(c, c_int32_t))
   end subroutine serial_print_char
+
+  ! The low `nibbles` hex digits of v, most significant first, no 0x prefix.
+  ! Lives here rather than in each caller because the panic dump (fk_idt_m) and
+  ! the PMM's region table (fk_kmain_m) must agree digit for digit: a boot gate
+  ! greps those lines, so two formatters would be two things to keep in step.
+  subroutine serial_print_hex(v, nibbles) bind(c, name="serial_print_hex")
+    implicit none
+    integer(c_int64_t), intent(in), value :: v
+    integer(c_int32_t), intent(in), value :: nibbles
+    integer(c_int32_t) :: i, d
+
+    ! 48 = '0', 55 = 'A' - 10.  Bytes, not characters: see serial_print_byte.
+    do i = nibbles - 1_c_int32_t, 0_c_int32_t, -1_c_int32_t
+       d = int(iand(ishft(v, -4 * i), 15_c_int64_t), c_int32_t)
+       if (d < 10_c_int32_t) then
+          call serial_print_byte(48 + d)
+       else
+          call serial_print_byte(55 + d)
+       end if
+    end do
+  end subroutine serial_print_hex
 
   ! Write a NUL-terminated C string.  s(*) and not s(:): an assumed-shape dummy
   ! expects a descriptor where C passes a bare pointer.

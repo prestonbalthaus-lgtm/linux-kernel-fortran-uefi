@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0
 #
 # Drives the mutation table in docs/HARNESS-VALIDATION-PHASE3.md: injects one
-# defect at a time into the roadmap 3.1/3.2/3.2.5 code, rebuilds from clean,
+# defect at a time into the roadmap 3.1/3.2/3.2.5/3.4 code, rebuilds from clean,
 # boots it and restores the tree.  The baselines must PASS; a MUTATION that
 # passes is an ESCAPE, because the gate accepted a kernel with a known defect.
 #
@@ -19,9 +19,9 @@ echo "logs: $OUT"
 
 # Every file any mutation below touches.  A short restore list is how a defect
 # survives into the NEXT case and gets attributed to it.
-FILES="boot/interrupts.S boot/gdt_flush.S boot/faultgen.S \
+FILES="boot/interrupts.S boot/gdt_flush.S boot/faultgen.S boot/ksyms.S \
        src/cpu/fk_gdt.f90 src/cpu/fk_idt.f90 src/cpu/fk_tss.f90 \
-       src/drivers/pic/fk_pic.f90 src/boot/fk_kmain.f90"
+       src/drivers/pic/fk_pic.f90 src/mm/fk_pmm.f90 src/boot/fk_kmain.f90"
 
 restore() { git checkout -- $FILES 2>/dev/null; }
 
@@ -45,9 +45,19 @@ fi
 
 # The #DE build reaches the ISR_NOERR half of boot/interrupts.S; the #DF build
 # reaches ISR_ERR and the IST1 stack switch.  Neither is a superset.
-DE_EXPECT="EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error"
-DF_EXPECT=$'EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault\n*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***'
-COMMON_REJECT=$'Fortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.'
+#
+# roadmap 3.4's six verdicts ride on EVERY case, not just the PMM ones. A
+# mutation is only attributable if everything it did not touch still holds, and
+# these lines are printed before the deliberate fault on every build.
+PMM_EXPECT=$'Fortran Kernel: PMM reserved and ACPI frames are all marked used.\nFortran Kernel: PMM locked the kernel image and the loader map out.\nFortran Kernel: PMM allocated 5 contiguous frames.\nFortran Kernel: PMM freed and reclaimed the same 5 frames.\nFortran Kernel: PMM refused a double, unaligned and locked free.\nFortran Kernel: PMM rewound its scan cursor to a freed frame.'
+PMM_REJECT=$'Fortran Kernel: PMM init FAILED, status 0x\nFortran Kernel: PMM reserved or ACPI frames are STILL FREE.\nFortran Kernel: PMM did NOT lock the kernel image out.\nFortran Kernel: PMM allocation is NOT contiguous.\nFortran Kernel: PMM reclaim FAILED.\nFortran Kernel: PMM guard FAILED.\nFortran Kernel: PMM cursor rewind FAILED.'
+
+DE_EXPECT="EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error"$'\n'"$PMM_EXPECT"
+DF_EXPECT=$'EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault\n*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***\n'"$PMM_EXPECT"
+# The OOM build's proof is three facts: the allocator refused, it said so, and
+# the panic that followed came from the CPU with a full register dump.
+OOM_EXPECT=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"
+COMMON_REJECT=$'Fortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.\n'"$PMM_REJECT"
 DF_REJECT="*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***"$'\n'"$COMMON_REJECT"
 
 EXPECT="$DF_EXPECT"; REJECT="$DF_REJECT"
@@ -72,6 +82,14 @@ mode_de() {
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = 0_c_int32_t"
   EXPECT="$DE_EXPECT"; REJECT="$COMMON_REJECT"
+}
+
+# ...or as roadmap 3.4's out-of-memory panic: drain the PMM, then INT3.
+mode_oom() {
+  subst src/boot/fk_kmain.f90 \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t" \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = -1_c_int32_t"
+  EXPECT="$OOM_EXPECT"; REJECT="$COMMON_REJECT"
 }
 
 # Both gates, because they see different things: the static one reads the
@@ -101,8 +119,9 @@ run_case() {
 SELECT="$*"
 want_case() { [ -z "$SELECT" ] && return 0; case " $SELECT " in *" $1 "*) return 0;; esac; return 1; }
 
-case_baseline_df() { run_case baseline-df; }
-case_baseline_de() { mode_de; run_case baseline-de; }
+case_baseline_df()  { run_case baseline-df; }
+case_baseline_de()  { mode_de;  run_case baseline-de; }
+case_baseline_oom() { mode_oom; run_case baseline-oom; }
 
 # --- the #DE build: roadmap 3.2's frame normalisation ------------------------
 case_M1() {
@@ -179,7 +198,57 @@ case_M13() {
   run_case M13-tss-c-padding
 }
 
-ALL="baseline_df baseline_de M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 M12 M13"
+# --- roadmap 3.4: the PMM ----------------------------------------------------
+# Every one of these is ALREADY caught by the host suite (H1..HG in
+# docs/HARNESS-VALIDATION-PHASE3.md). They are re-run on a real machine because
+# the host suite feeds the parser a memory map this file wrote, and the boot
+# gate feeds it one GRUB wrote -- and the two disagree about where things are.
+case_M14() {
+  subst src/boot/fk_kmain.f90 "    status = pmm_init(mbi)" \
+                              "    status = pmm_init(0_c_int64_t)"
+  run_case M14-mbi-pointer-lost
+}
+case_M15() {
+  subst src/mm/fk_pmm.f90 $'    if (span_outward(kern_lo, kern_hi - kern_lo, first, last)) &\n         free_count = free_count - bits_set(first, last)\n\n    ! The loader\'s own structure.' \
+                          $'    ! The loader\'s own structure.'
+  run_case M15-kernel-image-allocatable
+}
+case_M16() {
+  # The anchor MUST reach as far as `cursor`: pmm_init's cleanup path carries a
+  # byte-identical fill loop and the same first five resets, appears earlier in
+  # the file, and would be the one substituted -- which mutates a path this gate
+  # never exercises and reports a spurious escape.  It did, once.
+  subst src/mm/fk_pmm.f90 $'    do w = 1_c_int32_t, FK_PMM_WORDS\n       bitmap(w) = FK_PMM_WORD_FULL\n    end do\n    ready      = .false.\n    reg_count  = 0_c_int32_t\n    ram_pages  = 0_c_int64_t\n    free_count = 0_c_int64_t\n    ignored    = 0_c_int64_t\n    cursor     = 1_c_int32_t' \
+                          $'    ready      = .false.\n    reg_count  = 0_c_int32_t\n    ram_pages  = 0_c_int64_t\n    free_count = 0_c_int64_t\n    ignored    = 0_c_int64_t\n    cursor     = 1_c_int32_t'
+  run_case M16-bitmap-never-filled
+}
+case_M17() {
+  subst src/mm/fk_pmm.f90 $'       b = trailz(not(bitmap(w)))\n       bitmap(w) = ibset(bitmap(w), b)' \
+                          $'       b = trailz(not(bitmap(w)))'
+  run_case M17-alloc-never-marks
+}
+case_M18() {
+  subst src/mm/fk_pmm.f90 "    if (w < cursor) cursor = w" "    continue"
+  run_case M18-free-never-rewinds
+}
+case_M19() {
+  subst src/mm/fk_pmm.f90 $'    if (in_span(phys, kern_lo, kern_hi) .or. in_span(phys, mbi_lo, mbi_hi)) then\n       status = FK_PMM_E_LOCKED\n       return\n    end if' \
+                          "    continue"
+  run_case M19-free-ignores-locked
+}
+# The one that only a linked image can catch: boot/ksyms.S hands Fortran the
+# value of an absolute linker symbol, and a wrong constant marks the wrong
+# frames used while every console verdict still prints PASS.
+case_M20() {
+  # $'...' and not "...": the assembler's $ immediate would otherwise be read by
+  # bash as a variable expansion, and the run dies on `unbound variable`.
+  subst boot/ksyms.S $'\tmovabsq\t$__kernel_phys_start, %rax' \
+                     $'\tmovabsq\t$0x0, %rax'
+  run_case M20-ksyms-wrong-constant
+}
+
+ALL="baseline_df baseline_de baseline_oom M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 \
+     M12 M13 M14 M15 M16 M17 M18 M19 M20"
 for c in $ALL; do
   want_case "$c" || continue
   echo "=== $c ==="
