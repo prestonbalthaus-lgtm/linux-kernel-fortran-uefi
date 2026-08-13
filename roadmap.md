@@ -608,15 +608,20 @@ The most critical mathematical and structural phase. Setting up the brain of the
             Fortran Kernel: 8259 IMR now 0x0000FFFE, IRQ0 is the only line open.
             Fortran Kernel: RFLAGS.IF is set, the CPU is interruptible, RFLAGS = 0x0000000000000282
             Fortran Kernel: IRQ0 ticks before/after/spurious 0x00000000/0x00000003/0x00000000.
-            Fortran Kernel: the first tick interrupted kernel .text with IF set, RIP/RFLAGS 0xFFFFFFFF80104976/0x0000000000000202.
+            Fortran Kernel: the first tick interrupted kernel .text with IF set, RIP/RFLAGS 0xFFFFFFFF80104976/0x0000000000000206.
             Fortran Kernel: interrupts are live and the kernel is still running (roadmap 3.2b).
 
         READ THE RIP. 0xFFFFFFFF80104976 is not approximately inside kernel_main:
         it is the exact address of the `cmpq fk_tick_count(%rip)` that the wait
         loop executes, disassembled out of the image that printed it. The timer
         interrupted the loop on its own compare, a Fortran handler ran, IRETQ put
-        the CPU back on that instruction, and the loop went round again. RFLAGS
-        0x202 is the CPU's own copy of IF at the moment it took the interrupt.
+        the CPU back on that instruction, and the loop went round again.
+
+        ONLY BIT 9 OF THAT RFLAGS IS THE ASSERTION. 0x206 and 0x202 are both
+        observed across runs and both are correct: the low bits are the arithmetic
+        flags the interrupted CMP happened to leave, and they depend on where in
+        the loop the timer landed. The kernel tests bit 9 and prints the whole
+        register, so what it asserted and what it saw are both on the line.
 
         AND THE COUNT IS THREE, NOT ONE, which is a separate fact. An 8259 that is
         never acknowledged delivers exactly one interrupt and then holds its

@@ -808,7 +808,7 @@ here.
 
 ### 2. The RIP, which is not approximately right
 
-    Fortran Kernel: the first tick interrupted kernel .text with IF set, RIP/RFLAGS 0xFFFFFFFF80104976/0x0000000000000202.
+    Fortran Kernel: the first tick interrupted kernel .text with IF set, RIP/RFLAGS 0xFFFFFFFF80104976/0x0000000000000206.
 
 That address is the `cmpq fk_tick_count(%rip)` at the top of the wait loop:
 
@@ -818,8 +818,14 @@ That address is the `cmpq fk_tick_count(%rip)` at the top of the wait loop:
 
 The timer interrupted the loop on its own compare instruction, `irq_handler`
 ran, IRETQ put the CPU back on that instruction and the loop went round again.
-`0x202` is the CPU's own copy of RFLAGS at the moment it took the interrupt, so
-IF was genuinely set -- not merely requested by an STI somebody called.
+That RFLAGS is the CPU's own copy at the moment it took the interrupt, so IF was
+genuinely set -- not merely requested by an STI somebody called.
+
+Only bit 9 of it is the assertion. `0x206` and `0x202` are both observed across
+runs and both are correct: the rest are the arithmetic flags the interrupted CMP
+left, and which of them are set depends on where in the loop the timer landed.
+The gate matches this line by prefix for the same reason -- the address is stable
+under a rebuild of the same sources and the flags are not.
 
 The kernel asserts the weaker, relayout-proof half of this itself (the RIP is
 inside `[__text_start, __text_end)` and the saved IF bit is set) and prints the
