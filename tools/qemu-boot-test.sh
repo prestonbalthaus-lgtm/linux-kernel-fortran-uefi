@@ -3,9 +3,10 @@
 #
 # Boots build/boot/fortran-kernel.iso in a headless QEMU and asserts what the
 # running guest did: the four-word handoff record in guest physical memory
-# (read over QMP), every string COM1 must carry, no string it must not, and --
-# on request -- the state of the task register and the two 8259s as the DEVICE
-# MODELS report it rather than as the kernel claims it.
+# (read over QMP), every string COM1 must carry, no string it must not, the
+# timer tick counter read TWICE while the guest runs, and -- on request -- the
+# state of the task register and the two 8259s as the DEVICE MODELS report it
+# rather than as the kernel claims it.
 #
 # Usage:
 #   tools/qemu-boot-test.sh              boot the ISO and assert
@@ -23,6 +24,10 @@
 #   FK_EXPECT_SERIAL  strings COM1 must carry, ONE PER LINE -- all must appear
 #   FK_REJECT_SERIAL  strings COM1 must NOT carry, one per line -- any is fatal
 #   FK_CHECK_HW       non-empty: also assert TR and the 8259s over QMP
+#   FK_CHECK_TICKS    0 to skip the "still ticking" assertion (default: on).
+#                     Set it to 0 for a build that ends in a deliberate panic:
+#                     the CPU is halted with IF clear, so the counter is frozen
+#                     and frozen is the CORRECT answer there.
 #   FK_ACCEL          force 'kvm' or 'tcg'
 #   FK_SMP / FK_MEM   override the mandated 6 vCPU / 24 GB allocation
 set -uo pipefail
@@ -90,12 +95,39 @@ Fortran Kernel: PML4[0] is STILL MAPPED.
 Fortran Kernel: VMM high-frame mapping FAILED.
 RWX'
 
+# roadmap 3.2b, and the last two lines are the milestone. Two of these carry a
+# value in full rather than a prefix, deliberately:
+#
+#   "hz/divisor 0x00000064/0x00002E9C" is 1193182 rounded over 100, computed by
+#   the kernel from the crystal rate. A PIT left at the firmware's divisor still
+#   ticks -- at 18.2 Hz -- so a prefix match would accept a chip nobody
+#   programmed.
+#
+#   "8259 IMR now 0x0000FFFE" is read back off both chips. An unmask that wrote
+#   to the wrong port, or to the slave, leaves this at 0xFFFF while every other
+#   line in the boot still passes.
+#
+# The rest are prefixes because they carry an address or a live count.
+FK_IRQ_PASS_LINES=$'Fortran Kernel: PIT channel 0 hz/divisor 0x00000064/0x00002E9C.
+Fortran Kernel: 8259 IMR now 0x0000FFFE, IRQ0 is the only line open.
+Fortran Kernel: RFLAGS.IF is set, the CPU is interruptible, RFLAGS = 0x
+Fortran Kernel: IRQ0 ticks before/after/spurious 0x
+Fortran Kernel: the first tick interrupted kernel .text with IF set, RIP/RFLAGS 0x
+Fortran Kernel: interrupts are live and the kernel is still running (roadmap 3.2b).'
+FK_IRQ_FAIL_LINES=$'Fortran Kernel: PIT divisor is 0, so channel 0 was NOT programmed.
+Fortran Kernel: IRQ0 is STILL MASKED after the unmask.
+Fortran Kernel: RFLAGS.IF is CLEAR after STI.
+Fortran Kernel: IRQ0 never reached the tick target; the timer interrupt did not arrive.
+Fortran Kernel: the first tick\'s saved frame is NOT kernel .text with IF set.'
+
 EXPECT_SERIAL="${FK_EXPECT_SERIAL:-Fortran Kernel: UART Serial Initialized.
 $FK_PMM_PASS_LINES
-$FK_VMM_PASS_LINES}"
+$FK_VMM_PASS_LINES
+$FK_IRQ_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
-$FK_VMM_FAIL_LINES}"
+$FK_VMM_FAIL_LINES
+$FK_IRQ_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a
@@ -129,7 +161,7 @@ say()  { printf '%s\n' "$*"; }
 [[ -r "$SENTINEL" ]] || { say "FAIL: missing $SENTINEL -- the assertion lives there"; exit 1; }
 
 rule
-say "PROJECT FORTRAN-KERNEL :: BOOT GATE (roadmap 1.2 + 1.2b + 2.1 + 3.4 + 3.5)"
+say "PROJECT FORTRAN-KERNEL :: BOOT GATE (1.2 + 1.2b + 2.1 + 3.2b + 3.4 + 3.5)"
 rule
 
 if [[ "$MODE" == gate ]]; then
@@ -159,6 +191,8 @@ fi
 for pat in "${EXPECTS[@]}"; do say "must carry : \"$pat\""; done
 for pat in "${REJECTS[@]}"; do say "must not   : \"$pat\""; done
 [[ -n "${FK_CHECK_HW:-}" ]] && say "hw check   : task register and both 8259s, over QMP"
+CHECK_TICKS="${FK_CHECK_TICKS:-1}"
+[[ "$CHECK_TICKS" != 0 ]] && say "tick check : fk_tick_count read twice from the running guest"
 
 if [[ -n "${FK_ACCEL:-}" ]]; then ACCEL="$FK_ACCEL"
 elif [[ -r /dev/kvm && -w /dev/kvm ]]; then ACCEL=kvm
@@ -345,6 +379,12 @@ assertion_summary() {
       else                        say "  hardware state   : FAIL  see the monitor output above"
       fi
     fi
+    if [[ "$CHECK_TICKS" != 0 ]]; then
+      if   (( TICK_OK == 1 )); then say "  tick advance     : PASS  fk_tick_count grew between two reads"
+      elif (( TICK_RAN == 0 )); then say "  tick advance     : FAIL  the guest died before it could be asked"
+      else                         say "  tick advance     : FAIL  see the counts above"
+      fi
+    fi
   fi
 }
 
@@ -436,6 +476,25 @@ if [[ -n "${FK_CHECK_HW:-}" && "$MODE" == gate ]]; then
   fi
 fi
 
+# roadmap 3.2b. Deliberately NOT folded into the hwstate block: that one reads
+# state the guest set up once, and this one reads state the guest is producing
+# right now. A build whose kernel_main ends in a panic satisfies the first and
+# must fail the second, which is why it has its own switch.
+TICK_RAN=0; TICK_OK=0
+if [[ "$CHECK_TICKS" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    TICK_RAN=1
+    rule
+    say "--- timer ticks, read out of guest memory twice while it runs ---"
+    if python3 "$SENTINEL" ticks --qmp "$SOCK" --elf "$KERNEL" --timeout 10; then
+      TICK_OK=1
+    fi
+  else
+    say ""
+    say "tick advance NOT asserted: the guest was already gone."
+  fi
+fi
+
 if qemu_alive; then
   python3 "$SENTINEL" quit --qmp "$SOCK" --timeout 5 >/dev/null 2>&1 || true
 fi
@@ -492,9 +551,11 @@ if serial_has_failure; then SELFTEST_BAD=1; fi
 rule
 HW_BAD=0
 if [[ -n "${FK_CHECK_HW:-}" && "$MODE" == gate ]] && (( HW_OK == 0 )); then HW_BAD=1; fi
+TICK_BAD=0
+if [[ "$CHECK_TICKS" != 0 && "$MODE" == gate ]] && (( TICK_OK == 0 )); then TICK_BAD=1; fi
 
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
-   && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )); then
+   && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule
@@ -512,6 +573,13 @@ if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
     say "          The task register and both 8259s were then read back out of"
     say "          the device models, so those are the machine's answers and"
     say "          not the kernel's."
+  fi
+  if [[ "$CHECK_TICKS" != 0 ]]; then
+    say "          And fk_tick_count was read out of guest memory TWICE, a"
+    say "          quarter of a second apart, and had grown -- so the machine"
+    say "          was still taking timer interrupts and RETURNING from them"
+    say "          while that was being asked, which is the one thing no line"
+    say "          the kernel prints about itself could establish."
   fi
   rule
   exit 0
@@ -556,6 +624,21 @@ elif (( SENTINEL_OK == 0 )); then
   say "The guest is alive and its memory is readable, so the machine did NOT"
   say "triple-fault: execution reached somewhere and stopped. If every word is"
   say "still 0x11111111, kernel_main was never called."
+elif (( TICK_BAD == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
+     && (( HW_BAD == 0 )); then
+  say "THE GUEST IS NOT TICKING ANY MORE -- ${ELAPSED}s."
+  say ""
+  say "  COM1 said an interrupt was taken and returned from, and the counter"
+  say "  read from outside says it is not happening now. The kernel got that"
+  say "  far and then stopped. Usual causes:"
+  say "    * kernel_main ended in fk_cpu_halt rather than fk_cpu_idle -- CLI"
+  say "      then HLT, so the timer fires and the CPU never sees it"
+  say "    * a build with a deliberate FK_FAULT_MODE: the panic handler halts"
+  say "      with IF clear and the counter is correctly frozen. Pass"
+  say "      FK_CHECK_TICKS=0 for those"
+  say "    * the EOI stopped happening after the first few interrupts, so the"
+  say "      8259 is holding an in-service bit and delivering nothing"
+  show_serial_log
 elif (( HW_BAD == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )); then
   say "THE HARDWARE STATE IS NOT WHAT THE KERNEL SAID IT WAS -- ${ELAPSED}s."
   say ""
