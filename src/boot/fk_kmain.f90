@@ -3,8 +3,14 @@
 ! kernel_main once the CPU is in 64-bit long mode; it records the loader handoff
 ! in fk_boot_sentinel, brings COM1 up, installs the GDT, TSS and IDT, pacifies
 ! the legacy 8259s, brings the PMM up against the loader's memory map and puts
-! it through pmm_verify below, and then faults on purpose so the catcher has
-! something to catch.
+! it through pmm_verify below, hands off to the higher half, opens IRQ0 and
+! sets IF -- and then, in the shipped image, keeps running.
+!
+! FK_FAULT_MODE decides how the boot ENDS, and as of roadmap 3.2b its default
+! is not a fault at all: the CPU parks in fk_cpu_idle with interrupts on and
+! goes on servicing the timer.  Every other value raises one deliberate
+! exception so the catcher has something to catch, which is what every boot
+! this project has taken did before 3.2b.
 ! tools/qemu-boot-test.sh reads the sentinel back over QMP and greps the
 ! captured COM1 log.
 module fk_kmain_m
@@ -14,8 +20,10 @@ module fk_kmain_m
                          serial_print_hex
   use fk_gdt_m,    only: gdt_init
   use fk_tss_m,    only: tss_init
-  use fk_idt_m,    only: idt_init
-  use fk_pic_m,    only: pic_remap
+  use fk_idt_m,    only: idt_init, fk_irq_spurious
+  use fk_pic_m,    only: pic_remap, pic_unmask, pic_imr
+  use fk_pit_m,    only: FK_PIT_HZ, FK_PIT_IRQ, pit_init, fk_tick_count, &
+                         fk_first_rip, fk_first_rflags
   use fk_pmm_m,    only: FK_PMM_PAGE_SIZE, FK_PMM_OK, FK_PMM_E_UNALIGNED, &
                          FK_PMM_E_LOCKED, FK_PMM_E_DOUBLE_FREE, &
                          pmm_init, pmm_alloc_page, pmm_free_page, &
@@ -206,6 +214,47 @@ module fk_kmain_m
        "Fortran Kernel: writing to .text, which only CR0.WP refuses " // &
        "(roadmap 3.5)." // FK_CRLF // c_null_char
 
+  ! roadmap 3.2b.  Six properties, six FAIL twins, and not one of them is a
+  ! restatement of another: the chip was programmed, the line was opened, the
+  ! CPU became interruptible, the handler ran more than once, it ran on top of
+  ! kernel code, and the kernel outlived it.
+  ! "." CR LF: the tail of every line above that ends in a hex field.
+  character(kind=c_char, len=*), parameter :: FK_DOT_NL = &
+       "." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PIT_READY = &
+       "Fortran Kernel: PIT channel 0 hz/divisor 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PIT_FAILED = &
+       "Fortran Kernel: PIT divisor is 0, so channel 0 was NOT programmed." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IRQ_OPEN = &
+       "Fortran Kernel: 8259 IMR now 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IRQ_OPEN_TAIL = &
+       ", IRQ0 is the only line open." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IRQ_OPEN_BAD = &
+       "Fortran Kernel: IRQ0 is STILL MASKED after the unmask." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IF_ON = &
+       "Fortran Kernel: RFLAGS.IF is set, the CPU is interruptible, RFLAGS = 0x" &
+       // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IF_OFF = &
+       "Fortran Kernel: RFLAGS.IF is CLEAR after STI." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TICKS_OK = &
+       "Fortran Kernel: IRQ0 ticks before/after/spurious 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TICKS_NONE = &
+       "Fortran Kernel: IRQ0 never reached the tick target; the timer " // &
+       "interrupt did not arrive." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TICK_RIP = &
+       "Fortran Kernel: the first tick interrupted kernel .text with IF set, " // &
+       "RIP/RFLAGS 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TICK_RIP_BAD = &
+       "Fortran Kernel: the first tick's saved frame is NOT kernel .text with " // &
+       "IF set." // FK_CRLF // c_null_char
+  ! The headline, and the line no boot in this tree's history could have
+  ! printed: reaching it means an interrupt was taken and RETURNED FROM.
+  character(kind=c_char, len=*), parameter :: FK_IRQ_ALIVE = &
+       "Fortran Kernel: interrupts are live and the kernel is still running " // &
+       "(roadmap 3.2b)." // FK_CRLF // c_null_char
+
   ! Same order as fk_vmm_m's section table, which is the order linker.ld lays
   ! them down.  A mismatch here mislabels a row and nothing else, which is
   ! exactly why the row carries the addresses too.
@@ -265,7 +314,7 @@ module fk_kmain_m
   ! the only way to watch the out-of-memory panic actually fire.  A PARAMETER,
   ! so the branches not taken are folded away rather than shipped;
   ! tools/mutate-phase3.sh seds this line and rebuilds to run the other gates.
-  integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t
   integer(c_int32_t), parameter :: FK_FAULT_PMM_OOM = -1_c_int32_t
   ! roadmap 3.5's two.  Both are page faults, and they are NOT one test twice:
   ! the guard page proves an address INSIDE the image resolves to nothing, and
@@ -283,6 +332,25 @@ module fk_kmain_m
   ! needed a fault of its own. ERR 0x3 is the whole assertion: bit 0 present,
   ! bit 1 write, i.e. a PROTECTION violation and not a missing page.
   integer(c_int32_t), parameter :: FK_FAULT_WP = -4_c_int32_t
+  ! roadmap 3.2b's, and the SHIPPED one: raise nothing, park in fk_cpu_idle with
+  ! IF set and go on servicing the timer.  It is the only value of this
+  ! parameter under which kernel_main does not end in a register dump, which is
+  ! the entire content of the milestone.
+  integer(c_int32_t), parameter :: FK_FAULT_NONE = -5_c_int32_t
+
+  ! How many ticks past the starting count the proof loop waits for.  ONE would
+  ! be satisfied by a kernel that never sends an EOI: the 8259 delivers a first
+  ! interrupt and then holds its in-service bit forever, so "it ticked once" and
+  ! "the interrupt controller is wedged" are the same observation.
+  integer(c_int64_t), parameter :: FK_TICK_TARGET = 3_c_int64_t
+
+  ! And a bound on the wait, so a kernel that never ticks says so instead of
+  ! hanging.  At 100 Hz the target is 30 ms; this is several seconds of spinning
+  ! under KVM, i.e. two orders of magnitude of slack.
+  integer(c_int64_t), parameter :: FK_TICK_SPIN_LIMIT = 2000000000_c_int64_t
+
+  ! RFLAGS bit 9.
+  integer(c_int64_t), parameter :: FK_RFLAGS_IF = 512_c_int64_t
 
   ! BOTH operands are volatile, and that is not belt and braces: with a literal
   ! numerator gcc rewrites 1/x into a compare against +-1 and emits no DIV at
@@ -338,6 +406,29 @@ module fk_kmain_m
       implicit none
       integer(c_int64_t) :: a
     end function fk_text_start
+
+    function fk_text_end() result(a) bind(c, name="fk_text_end")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t) :: a
+    end function fk_text_end
+
+    ! STI, and RFLAGS read back afterwards rather than assumed.  boot/interrupts.S.
+    subroutine fk_irq_enable() bind(c, name="fk_irq_enable")
+      implicit none
+    end subroutine fk_irq_enable
+
+    function fk_read_rflags() result(v) bind(c, name="fk_read_rflags")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t) :: v
+    end function fk_read_rflags
+
+    ! fk_cpu_halt's opposite: parks the CPU with IF SET, so the timer goes on
+    ! firing and a reader outside the guest can watch fk_tick_count advance.
+    subroutine fk_cpu_idle() bind(c, name="fk_cpu_idle")
+      implicit none
+    end subroutine fk_cpu_idle
   end interface
 
 contains
@@ -675,6 +766,112 @@ contains
     end if
   end subroutine vmm_handoff
 
+  ! roadmap 3.2b.  Everything above this point ran with IF clear, because until
+  ! now nothing could survive an interrupt: there were 32 trampolines, all of
+  ! them ending in a panic, and no IRETQ anywhere in the tree.
+  !
+  ! The order below is the only safe one.  Program the chip that will generate
+  ! the interrupt, open the line on the chip that will deliver it, and set IF
+  ! last -- and all three strictly after vmm_handoff, which rewrites CR3 and
+  ! reloads the IDTR.  An interrupt taken in the middle of that would be
+  ! delivered through whichever of the two tables the CPU had got to.
+  !
+  ! Returns 0 only if all four properties held.  kernel_main's headline is
+  ! conditional on that, because "interrupts are live and the kernel is still
+  ! running" is a VERDICT and not an announcement: printed unconditionally it
+  ! appeared underneath this routine's own three FAIL lines in mutation M31,
+  ! which is a kernel contradicting itself in the same log.
+  function irq_bringup() result(status)
+    implicit none
+    integer(c_int32_t) :: status
+    integer(c_int32_t) :: divisor, imr
+    integer(c_int64_t) :: t0, t1, spins, rflags, rip, saved
+
+    status = 0_c_int32_t
+
+    divisor = pit_init(FK_PIT_HZ)
+    if (divisor == 0_c_int32_t) then
+       call serial_print_string(FK_PIT_FAILED)
+       status = 1_c_int32_t
+    else
+       call serial_print_string(FK_PIT_READY)
+       call serial_print_hex(int(FK_PIT_HZ, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(int(divisor, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_DOT_NL)
+    end if
+
+    ! The IMR is READ BACK, not assumed: masking works whatever else is wrong,
+    ! so an unmask that went to the wrong port looks identical from here unless
+    ! the chip is asked.  Slave in bits 15:8, master in 7:0.
+    call pic_unmask(FK_PIT_IRQ)
+    imr = pic_imr()
+    if (btest(imr, FK_PIT_IRQ)) then
+       call serial_print_string(FK_IRQ_OPEN_BAD)
+       status = 1_c_int32_t
+    else
+       call serial_print_string(FK_IRQ_OPEN)
+       call serial_print_hex(int(imr, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_IRQ_OPEN_TAIL)
+    end if
+
+    call fk_irq_enable()
+    rflags = fk_read_rflags()
+    if (iand(rflags, FK_RFLAGS_IF) == 0_c_int64_t) then
+       call serial_print_string(FK_IF_OFF)
+       status = 1_c_int32_t
+    else
+       call serial_print_string(FK_IF_ON)
+       call serial_print_hex(rflags, 16_c_int32_t)
+       call serial_print_string(FK_NL)
+    end if
+
+    ! THE WAIT.  fk_tick_count is read DIRECTLY and never through an accessor:
+    ! it is VOLATILE in fk_pit_m and the attribute travels through use
+    ! association, so every turn of this loop reloads it from memory.  Written
+    ! as a call to a getter in another module it does not -- gfortran 16.1.1
+    ! deleted this entire loop and reused one result for both reads, which is
+    ! the same class of fold that cost roadmap 3.2 a boot.  Disassembled, not
+    ! assumed: there must be a `cmpq ..., fk_tick_count(%rip)` INSIDE the loop.
+    t0    = fk_tick_count
+    spins = 0_c_int64_t
+    do while (fk_tick_count < t0 + FK_TICK_TARGET .and. spins < FK_TICK_SPIN_LIMIT)
+       spins = spins + 1_c_int64_t
+    end do
+    t1 = fk_tick_count
+
+    if (t1 < t0 + FK_TICK_TARGET) then
+       call serial_print_string(FK_TICKS_NONE)
+       status = 1_c_int32_t
+    else
+       call serial_print_string(FK_TICKS_OK)
+       call serial_print_hex(t0, 8_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(t1, 8_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(fk_irq_spurious, 8_c_int32_t)
+       call serial_print_string(FK_DOT_NL)
+    end if
+
+    ! WHERE it was interrupted, out of the frame the CPU pushed.  A tick count
+    ! says a handler ran; this says the machine was executing this kernel's own
+    ! instructions with interrupts on when it did, which is the half that says
+    ! IRETQ had a real place to go back to.
+    rip   = fk_first_rip
+    saved = fk_first_rflags
+    if (rip >= fk_text_start() .and. rip < fk_text_end() .and. &
+        iand(saved, FK_RFLAGS_IF) /= 0_c_int64_t) then
+       call serial_print_string(FK_TICK_RIP)
+       call serial_print_hex(rip, 16_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(saved, 16_c_int32_t)
+       call serial_print_string(FK_DOT_NL)
+    else
+       call serial_print_string(FK_TICK_RIP_BAD)
+       status = 1_c_int32_t
+    end if
+  end function irq_bringup
+
   ! Entry point called by boot/boot.S once the CPU is in 64-bit long mode.
   ! Does not return.  magic and mbi arrive by value per the SysV AMD64 C ABI,
   ! in EDI and RSI.
@@ -753,8 +950,21 @@ contains
        call fk_cpu_halt()
     end if
 
-    ! The deliberate fault.  Raised by the CPU, never simulated by a call.
-    if (FK_FAULT_MODE == FK_FAULT_PMM_OOM) then
+    ! roadmap 3.2b.  After the handoff, and before the deliberate fault: every
+    ! FK_FAULT_MODE build runs with interrupts live from here on, so the tick
+    ! proof rides on all of them the way 3.4's and 3.5's verdicts do.
+    status = irq_bringup()
+
+    ! How the boot ends.  The default raises nothing at all; every other value
+    ! raises one fault, from the CPU and never simulated by a call.
+    if (FK_FAULT_MODE == FK_FAULT_NONE) then
+       ! Earned, not announced: irq_bringup has already printed a FAIL line for
+       ! whichever property did not hold, and this one must not appear under it.
+       if (status == 0_c_int32_t) call serial_print_string(FK_IRQ_ALIVE)
+       ! Parks with IF SET, so the timer goes on firing and fk_tick_count can be
+       ! watched advancing from outside the guest.  Never returns.
+       call fk_cpu_idle()
+    else if (FK_FAULT_MODE == FK_FAULT_PMM_OOM) then
        call pmm_drain_to_oom()
     else if (FK_FAULT_MODE == FK_FAULT_GUARD) then
        call serial_print_string(FK_TRIGGER_GUARD)

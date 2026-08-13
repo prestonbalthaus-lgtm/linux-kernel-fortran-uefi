@@ -62,12 +62,20 @@ for f in $(find "$SRCDIR" -name 'fk_*.f90' | sort); do
   pubs=$(grep -hE '^[[:space:]]*public[[:space:]]*::' "$code" \
          | sed 's/^[^:]*:://' | tr ',&' '\n\n' | sed 's/[[:blank:]]//g' | grep -v '^$')
   # A public PARAMETER is exempt: a named constant produces no symbol and has
-  # nothing to name across an ABI. A public module VARIABLE does, and is not.
+  # nothing to name across an ABI. A public module VARIABLE does, and is not --
+  # it satisfies this rule the same way a procedure does, by carrying
+  # bind(c, name=...) on its own declaration. roadmap 3.2b exports four of
+  # those, and it exports them as variables rather than through accessor
+  # functions for a codegen reason src/drivers/pit/fk_pit.f90's header states:
+  # a cross-module getter whose body is a volatile load is treated as
+  # side-effect-free by its caller.
   missing=""
   for p in $pubs; do
     grep -qE "(function|subroutine)[[:space:]]+${p}[[:space:]]*\(.*bind[[:space:]]*\([[:space:]]*c" "$code" \
       && continue
     grep -qiE "^[[:space:]]*[^!]*,[[:space:]]*parameter[[:space:]]*::.*(^|[^A-Za-z0-9_])${p}([^A-Za-z0-9_]|$)" "$code" \
+      && continue
+    grep -qE "bind[[:space:]]*\([[:space:]]*c[^)]*\)[[:space:]]*::[^!]*(^|[^A-Za-z0-9_])${p}([^A-Za-z0-9_]|$)" "$code" \
       && continue
     missing="$missing $p"
   done
