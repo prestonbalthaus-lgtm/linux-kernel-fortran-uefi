@@ -31,6 +31,10 @@ module fk_kmain_m
                          pmm_region_count, pmm_region_base, pmm_region_len, &
                          pmm_region_type, pmm_verify_reserved, &
                          pmm_verify_kernel_locked, pmm_alloc_page_from
+  use fk_fbinfo_m, only: FK_FB_OK, FK_FB_BASE, FK_FB_PITCH, FK_FB_WIDTH, &
+                         FK_FB_HEIGHT, FK_FB_BPP, FK_FB_MASKS, FK_FB_BYTES, &
+                         fk_fb_info, fb_probe, fb_pixel_pack, fb_note_mapping
+  use fk_gop_renderer_m, only: vga_init_framebuffer, vga_fill_rect
   use fk_vmm_m,    only: FK_VMM_OK, FK_VMM_SECTIONS, FK_VMM_SCRATCH, &
                          FK_PTE_P, FK_PTE_RW, FK_PTE_NX, &
                          vmm_init, vmm_activate, vmm_drop_identity, &
@@ -38,7 +42,9 @@ module fk_kmain_m
                          vmm_pml4_phys, vmm_table_frames, vmm_physmap_top, &
                          vmm_nx_enabled, vmm_verify_image, vmm_read_cr3, &
                          vmm_section_start, vmm_section_end, vmm_section_flags, &
-                         vmm_guard_page, vmm_phys_to_virt
+                         vmm_guard_page, vmm_phys_to_virt, &
+                         FK_VMM_MMIO, FK_VMM_WC, vmm_reserve_mmio, &
+                         vmm_map_mmio, vmm_pat_arm, vmm_read_pat
   implicit none
   private
   public :: kernel_main
@@ -254,6 +260,46 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_IRQ_ALIVE = &
        "Fortran Kernel: interrupts are live and the kernel is still running " // &
        "(roadmap 3.2b)." // FK_CRLF // c_null_char
+
+  ! roadmap 2.2 and 2.4.  The framebuffer geometry is printed as the LOADER
+  ! reported it, not as boot.S asked for it: GRUB answers with the mode it
+  ! could set, and a kernel that printed its own request would describe a
+  ! screen it is not drawing on.
+  character(kind=c_char, len=*), parameter :: FK_FB_START = &
+       "Fortran Kernel: GOP probing the Multiboot2 framebuffer tag (roadmap 2.2)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_PROBE_BAD = &
+       "Fortran Kernel: GOP framebuffer tag REJECTED, status 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_GEOM = &
+       "Fortran Kernel: GOP framebuffer base/pitch/w/h/bpp 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_CHAN = &
+       "Fortran Kernel: GOP channel r/g/b pos:size packed 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_PAT_OK = &
+       "Fortran Kernel: GOP IA32_PAT is 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_PAT_TAIL = &
+       ", PAT index 1 is write-combining." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_PAT_BAD = &
+       "Fortran Kernel: GOP could NOT program the PAT; the framebuffer is " // &
+       "not write-combining." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_MAP_BAD = &
+       "Fortran Kernel: GOP framebuffer mapping FAILED, status 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_ALIAS_OK = &
+       "Fortran Kernel: GOP framebuffer has no write-back alias in the " // &
+       "linear map." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_ALIAS_BAD = &
+       "Fortran Kernel: GOP framebuffer is ALIASED write-back in the linear map." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_PTE = &
+       "Fortran Kernel: GOP framebuffer virt/phys/PTE 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_ARMED = &
+       "Fortran Kernel: GOP renderer armed on the mapped framebuffer (roadmap 2.4)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_ARM_BAD = &
+       "Fortran Kernel: GOP renderer REFUSED the framebuffer, status 0x" // c_null_char
+
+  ! The virtual address the framebuffer is mapped at, and the width of the
+  ! test bar the harness looks for in a pmemsave of the framebuffer.
+  integer(c_int32_t), parameter :: FK_FB_BAR_H = 16_c_int32_t
 
   ! Same order as fk_vmm_m's section table, which is the order linker.ld lays
   ! them down.  A mismatch here mislabels a row and nothing else, which is
@@ -781,6 +827,104 @@ contains
   ! running" is a VERDICT and not an announcement: printed unconditionally it
   ! appeared underneath this routine's own three FAIL lines in mutation M31,
   ! which is a kernel contradicting itself in the same log.
+  ! roadmap 2.2 + 2.4.  Runs AFTER the higher-half handoff, because everything
+  ! it does needs the VMM's hierarchy: the PAT write, the write-combining
+  ! mapping and the alias check are all statements about tables the boot stub
+  ! never built.  fb_probe already ran, before the identity window closed.
+  !
+  ! Returns 0 only if the renderer is armed on a real mapping.
+  function fb_bringup() result(status)
+    implicit none
+    integer(c_int32_t) :: status
+    integer(c_int64_t) :: base, bytes, entry
+    integer(c_int32_t) :: st
+
+    status = -1_c_int32_t
+    if (fk_fb_info(FK_FB_BASE) == 0_c_int64_t) return
+
+    base  = fk_fb_info(FK_FB_BASE)
+    bytes = fk_fb_info(FK_FB_BYTES)
+
+    if (vmm_pat_arm() == 0_c_int32_t) then
+       call serial_print_string(FK_FB_PAT_OK)
+       call serial_print_hex(vmm_read_pat(), 16_c_int32_t)
+       call serial_print_string(FK_FB_PAT_TAIL)
+    else
+       call serial_print_string(FK_FB_PAT_BAD)
+    end if
+
+    st = vmm_map_mmio(FK_VMM_MMIO, base, bytes, FK_VMM_WC)
+    if (st /= FK_VMM_OK) then
+       call serial_print_string(FK_FB_MAP_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+    call fb_note_mapping(FK_VMM_MMIO)
+
+    ! Read back the LIVE entry rather than the flags that were asked for: PWT
+    ! is what selects write-combining, and a mapping that lost it is a
+    ! framebuffer nobody would notice was slow.
+    entry = vmm_translate(FK_VMM_MMIO)
+    call serial_print_string(FK_FB_PTE)
+    call serial_print_hex(FK_VMM_MMIO, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(vmm_phys_of(FK_VMM_MMIO), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(entry, 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! The aperture must be reachable ONE way.  A linear-map entry over the same
+    ! frames would be write-back, and two memory types for one physical page is
+    ! undefined behaviour, not a slow path.
+    if (vmm_translate(vmm_phys_to_virt(base)) == 0_c_int64_t) then
+       call serial_print_string(FK_FB_ALIAS_OK)
+    else
+       call serial_print_string(FK_FB_ALIAS_BAD)
+    end if
+
+    st = vga_init_framebuffer(FK_VMM_MMIO, &
+                              int(fk_fb_info(FK_FB_WIDTH),  c_int32_t), &
+                              int(fk_fb_info(FK_FB_HEIGHT), c_int32_t), &
+                              int(fk_fb_info(FK_FB_PITCH),  c_int32_t))
+    if (st /= 0_c_int32_t) then
+       call serial_print_string(FK_FB_ARM_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+    call fb_test_bar()
+    call serial_print_string(FK_FB_ARMED)
+    status = 0_c_int32_t
+  end function fb_bringup
+
+  ! The status bar, and the only thing on screen whose exact pixel values are
+  ! known before a single glyph is drawn.  Four primaries rather than one
+  ! colour: a renderer that reached memory but packed the channels wrong writes
+  ! four DIFFERENT wrong words, and tools/qmp-sentinel.py recomputes all four
+  ! from the masks the loader reported and compares them against a pmemsave.
+  !
+  ! Rows 0..FK_FB_BAR_H-1 belong to this bar for the life of the boot; the
+  ! console (roadmap 2.4) starts below it and never scrolls through it.
+  subroutine fb_test_bar()
+    implicit none
+    integer(c_int32_t) :: w, i
+    integer(c_int32_t), parameter :: BLK = 64_c_int32_t
+
+    w = int(fk_fb_info(FK_FB_WIDTH), c_int32_t)
+    call vga_fill_rect(0_c_int32_t, 0_c_int32_t, w, FK_FB_BAR_H, &
+                       fb_pixel_pack(0_c_int32_t, 0_c_int32_t, 0_c_int32_t))
+    i = 255_c_int32_t
+    call vga_fill_rect(0_c_int32_t,       0_c_int32_t, BLK, FK_FB_BAR_H, &
+                       fb_pixel_pack(i, 0_c_int32_t, 0_c_int32_t))
+    call vga_fill_rect(BLK,               0_c_int32_t, BLK, FK_FB_BAR_H, &
+                       fb_pixel_pack(0_c_int32_t, i, 0_c_int32_t))
+    call vga_fill_rect(2_c_int32_t * BLK, 0_c_int32_t, BLK, FK_FB_BAR_H, &
+                       fb_pixel_pack(0_c_int32_t, 0_c_int32_t, i))
+    call vga_fill_rect(3_c_int32_t * BLK, 0_c_int32_t, BLK, FK_FB_BAR_H, &
+                       fb_pixel_pack(i, i, i))
+  end subroutine fb_test_bar
+
   function irq_bringup() result(status)
     implicit none
     integer(c_int32_t) :: status
@@ -932,6 +1076,34 @@ contains
        call serial_print_string(FK_NL)
     end if
 
+    ! roadmap 2.2, and it must run HERE: fb_probe dereferences the loader's
+    ! structure at a physical address, which only the identity window makes
+    ! readable, and its answer decides which 2 MiB pages the linear map below
+    ! must leave out.  Nothing is mapped or drawn yet.
+    call serial_print_string(FK_FB_START)
+    status = fb_probe(mbi)
+    if (status == FK_FB_OK) then
+       call serial_print_string(FK_FB_GEOM)
+       call serial_print_hex(fk_fb_info(FK_FB_BASE), 16_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(fk_fb_info(FK_FB_PITCH), 8_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(fk_fb_info(FK_FB_WIDTH), 8_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(fk_fb_info(FK_FB_HEIGHT), 8_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(fk_fb_info(FK_FB_BPP), 2_c_int32_t)
+       call serial_print_string(FK_NL)
+       call serial_print_string(FK_FB_CHAN)
+       call serial_print_hex(fk_fb_info(FK_FB_MASKS), 16_c_int32_t)
+       call serial_print_string(FK_NL)
+       call vmm_reserve_mmio(fk_fb_info(FK_FB_BASE), fk_fb_info(FK_FB_BYTES))
+    else
+       call serial_print_string(FK_FB_PROBE_BAD)
+       call serial_print_hex(int(status, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+    end if
+
     ! The VMM (roadmap 3.5) and the higher-half handoff (roadmap 1.2b).  AFTER
     ! the PMM, which dereferences the loader's structure through the identity
     ! window this step takes away, and after pmm_verify, which hands the
@@ -949,6 +1121,10 @@ contains
        ! mapping this kernel no longer knows anything about.
        call fk_cpu_halt()
     end if
+
+    ! roadmap 2.2 + 2.4, after the handoff: the PAT write, the write-combining
+    ! mapping and the first pixels all belong to the VMM's hierarchy.
+    status = fb_bringup()
 
     ! roadmap 3.2b.  After the handoff, and before the deliberate fault: every
     ! FK_FAULT_MODE build runs with interrupts live from here on, so the tick

@@ -36,6 +36,8 @@ module fk_vmm_m
             FK_VMM_E_NOT_READY, FK_VMM_E_UNREACHABLE, FK_VMM_E_NO_NX, &
             FK_VMM_PHYSMAP, FK_VMM_SCRATCH, &
             FK_PTE_P, FK_PTE_RW, FK_PTE_PS, FK_PTE_NX, FK_PTE_ADDR, &
+            FK_PTE_PWT, FK_PTE_PCD, FK_VMM_MMIO, FK_VMM_WC, &
+            vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, vmm_read_pat, &
             vmm_init, vmm_activate, vmm_drop_identity, vmm_map_page, &
             vmm_translate, vmm_phys_of, vmm_pml4_phys, vmm_table_frames, &
             vmm_physmap_top, vmm_nx_enabled, vmm_verify_image, &
@@ -55,6 +57,16 @@ module fk_vmm_m
   integer(c_int64_t), parameter :: FK_PTE_NX   = ishft(1_c_int64_t, 63)
   integer(c_int64_t), parameter :: FK_PTE_ADDR = int(z'000FFFFFFFFFF000', c_int64_t)
 
+  ! PWT and PCD are the low two bits of the PAT index.  boot/mmu.S puts
+  ! write-combining at index 1, so PWT alone selects it and the third selector
+  ! bit -- which moves between PTE bit 7 and bit 12 with the page size -- is
+  ! never needed.  A PWT mapping is UNCACHED-WRITE-THROUGH, not WC, on a CPU
+  ! where fk_pat_arm found no PAT: slow and correct rather than wrong.
+  integer(c_int64_t), parameter :: FK_PTE_PWT  = 8_c_int64_t
+  integer(c_int64_t), parameter :: FK_PTE_PCD  = 16_c_int64_t
+  integer(c_int64_t), parameter :: FK_VMM_WC   = ior(ior(FK_PTE_P, FK_PTE_RW), &
+                                                     ior(FK_PTE_PWT, FK_PTE_NX))
+
   ! PML4[256].  The canonical hole starts at bit 47, so this is the lowest
   ! address in the upper half and leaves the whole top 2 GiB to the kernel.
   integer(c_int64_t), parameter :: FK_VMM_PHYSMAP = int(z'FFFF800000000000', c_int64_t)
@@ -62,6 +74,12 @@ module fk_vmm_m
   ! A virtual address inside no section, for probing a mapping without
   ! disturbing one.  Top 1 GiB: PML4[511], PDPT[511], above every kernel symbol.
   integer(c_int64_t), parameter :: FK_VMM_SCRATCH = int(z'FFFFFFFFC0000000', c_int64_t)
+
+  ! PML4[257], the slot after the linear map.  Device apertures go here and not
+  ! in the linear map, because the linear map is write-back and an MMIO range
+  ! reachable at two virtual addresses with two memory types is architecturally
+  ! undefined (SDM Vol.3 11.12.4), not merely slow.
+  integer(c_int64_t), parameter :: FK_VMM_MMIO = int(z'FFFF808000000000', c_int64_t)
 
   integer(c_int32_t), parameter :: FK_VMM_OK           = 0_c_int32_t
   integer(c_int32_t), parameter :: FK_VMM_E_NOMEM      = 1_c_int32_t
@@ -81,6 +99,10 @@ module fk_vmm_m
   integer(c_int64_t), save :: sec_end(FK_VMM_SECTIONS)   = 0_c_int64_t
   integer(c_int64_t), save :: sec_flags(FK_VMM_SECTIONS) = 0_c_int64_t
   integer(c_int64_t), save :: guard_page = 0_c_int64_t
+
+  ! The physical span map_physmap must NOT cover.  See FK_VMM_MMIO.
+  integer(c_int64_t), save :: hole_base  = 0_c_int64_t
+  integer(c_int64_t), save :: hole_bytes = 0_c_int64_t
 
   integer(c_int64_t), save :: pml4_phys   = 0_c_int64_t
   integer(c_int64_t), save :: kernel_vma  = 0_c_int64_t
@@ -113,6 +135,18 @@ module fk_vmm_m
       implicit none
       integer(c_int32_t) :: s
     end function fk_mmu_arm
+
+    function fk_pat_arm() result(s) bind(c, name="fk_pat_arm")
+      import :: c_int32_t
+      implicit none
+      integer(c_int32_t) :: s
+    end function fk_pat_arm
+
+    function fk_read_pat() result(v) bind(c, name="fk_read_pat")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t) :: v
+    end function fk_read_pat
 
     ! linker.ld's absolute symbols; see boot/ksyms.S for why they cannot be
     ! named directly from Fortran.
@@ -669,11 +703,78 @@ contains
     status = FK_VMM_OK
     p = 0_c_int64_t
     do while (p < top)
-       status = vmm_map_2m(FK_VMM_PHYSMAP + p, p, perm(.true., .false.))
-       if (status /= FK_VMM_OK) return
+       ! A 2 MiB page that overlaps a device aperture is LEFT UNMAPPED, not
+       ! mapped and later fixed: the aperture gets its own write-combining
+       ! mapping at FK_VMM_MMIO, and a write-back alias of the same frames is
+       ! undefined behaviour rather than a performance question.  The cost is
+       ! a hole in the linear map over memory that was never RAM.
+       if (.not. hits_hole(p)) then
+          status = vmm_map_2m(FK_VMM_PHYSMAP + p, p, perm(.true., .false.))
+          if (status /= FK_VMM_OK) return
+       end if
        p = p + FK_VMM_SIZE_2M
     end do
   end function map_physmap
+
+  pure function hits_hole(p) result(hit)
+    implicit none
+    integer(c_int64_t), intent(in) :: p
+    logical :: hit
+
+    hit = hole_bytes > 0_c_int64_t .and. &
+          p < hole_base + hole_bytes .and. p + FK_VMM_SIZE_2M > hole_base
+  end function hits_hole
+
+  !> Declare a physical span the linear map must not cover.  MUST be called
+  !! before vmm_init; afterwards the tables already exist.
+  subroutine vmm_reserve_mmio(phys, bytes) bind(c, name="vmm_reserve_mmio")
+    implicit none
+    integer(c_int64_t), intent(in), value :: phys, bytes
+
+    if (bytes <= 0_c_int64_t) return
+    hole_base  = round_down(phys, FK_VMM_SIZE_2M)
+    hole_bytes = round_up(phys + bytes, FK_VMM_SIZE_2M) - hole_base
+  end subroutine vmm_reserve_mmio
+
+  !> Map BYTES of physical device memory at VIRT, 4 KiB at a time.  Page
+  !! granularity rather than 2 MiB: an aperture is rarely a whole number of
+  !! large pages, and rounding one up would map whatever sits behind it.
+  function vmm_map_mmio(virt, phys, bytes, flags) result(status) &
+       bind(c, name="vmm_map_mmio")
+    implicit none
+    integer(c_int64_t), intent(in), value :: virt, phys, bytes, flags
+    integer(c_int32_t) :: status
+    integer(c_int64_t) :: off, last
+
+    status = FK_VMM_OK
+    if (bytes <= 0_c_int64_t) return
+    last = round_up(bytes, FK_VMM_PAGE_SIZE)
+    off  = 0_c_int64_t
+    do while (off < last)
+       status = vmm_map_page(virt + off, phys + off, flags)
+       if (status /= FK_VMM_OK) return
+       off = off + FK_VMM_PAGE_SIZE
+    end do
+  end function vmm_map_mmio
+
+  !> IA32_PAT, so that FK_PTE_PWT means write-combining.  Returns 0 on success.
+  function vmm_pat_arm() result(s) bind(c, name="vmm_pat_arm")
+    implicit none
+    integer(c_int32_t) :: s
+
+    s = fk_pat_arm()
+    ! Retire every TLB entry cached under the old meaning of PAT index 1.  No
+    ! mapping selects PWT yet, so this is cheap insurance rather than the SDM's
+    ! full cache-disable ritual; see boot/mmu.S.
+    if (s == 0_c_int32_t .and. pml4_phys /= 0_c_int64_t) call fk_write_cr3(pml4_phys)
+  end function vmm_pat_arm
+
+  function vmm_read_pat() result(v) bind(c, name="vmm_read_pat")
+    implicit none
+    integer(c_int64_t) :: v
+
+    v = fk_read_pat()
+  end function vmm_read_pat
 
   ! The identity window, rebuilt in the NEW hierarchy and thrown away by
   ! vmm_drop_identity.  It exists for exactly as long as the handoff: the

@@ -94,6 +94,16 @@ TICK_BYTES = 8
 MASTER_IMR = 0xFE
 SLAVE_IMR = 0xFF
 
+# roadmap 2.2/2.4. bind(c) in src/drivers/video/fk_fbinfo.f90: ten u64 words
+# describing the framebuffer the LOADER reported and the mapping the VMM built.
+FB_SYMBOL = "fk_fb_info"
+FB_WORDS = 10
+FB_BYTES = FB_WORDS * 8
+FB_MAGIC = 0x46425F49               # "FB_I", written only on a clean probe
+FB_VIRT_WANT = 0xFFFF808000000000   # FK_VMM_MMIO in src/mm/fk_vmm.f90
+FB_BAR_H = 16                       # FK_FB_BAR_H in src/boot/fk_kmain.f90
+FB_BLOCK = 64                       # the width of one primary in the bar
+
 
 class QmpError(Exception):
     """Anything that went wrong on the QMP wire or in the guest monitor."""
@@ -488,6 +498,116 @@ def report_hwstate(results, quiet=False):
 
 
 # --- subcommands -----------------------------------------------------------
+# --- roadmap 2.2/2.4: the framebuffer, read out of the guest ---------------
+
+def fb_decode(data):
+    if len(data) != FB_BYTES:
+        raise SystemExit(f"fb_info dump is {len(data)} bytes, expected {FB_BYTES}")
+    w = list(struct.unpack("<10Q", data))
+    masks = w[7]
+    return {
+        "tag": w[0], "base": w[1], "pitch": w[2], "width": w[3],
+        "height": w[4], "bpp": w[5], "type": w[6], "virt": w[8], "bytes": w[9],
+        "r_pos": masks & 0xFF, "r_size": (masks >> 8) & 0xFF,
+        "g_pos": (masks >> 16) & 0xFF, "g_size": (masks >> 24) & 0xFF,
+        "b_pos": (masks >> 32) & 0xFF, "b_size": (masks >> 40) & 0xFF,
+    }
+
+
+def fb_pack(info, r, g, b):
+    """The host's own model of fb_pixel_pack(), from the masks the LOADER gave.
+
+    Deliberately not a constant: the point of the assertion is that the kernel
+    packed the channels the way the firmware asked for, and a hardcoded
+    0x00FF0000 would agree with a kernel that ignored the masks and got lucky
+    on this machine.
+    """
+    def chan(v, pos, siz):
+        if siz <= 0:
+            return 0
+        return ((v & 0xFF) >> (8 - siz)) << pos
+    return (chan(r, info["r_pos"], info["r_size"])
+            | chan(g, info["g_pos"], info["g_size"])
+            | chan(b, info["b_pos"], info["b_size"])) & 0xFFFFFFFF
+
+
+FB_BAR = [("red", (255, 0, 0)), ("green", (0, 255, 0)),
+          ("blue", (0, 0, 255)), ("white", (255, 255, 255))]
+
+
+def check_framebuffer(info, scanline):
+    """Return a list of (ok, description) -- the whole framebuffer contract."""
+    out = []
+    out.append((info["tag"] == FB_MAGIC,
+                f"fb_info magic is 0x{info['tag']:08X} "
+                f"(want 0x{FB_MAGIC:08X}: the tag-8 probe completed)"))
+    out.append((info["type"] == 1 and info["bpp"] == 32,
+                f"framebuffer is RGB/32bpp (type {info['type']}, "
+                f"bpp {info['bpp']})"))
+    out.append((info["width"] > 0 and info["height"] > 0
+                and info["pitch"] >= info["width"] * 4,
+                f"geometry {info['width']}x{info['height']} pitch "
+                f"{info['pitch']} is self-consistent"))
+    out.append((info["virt"] == FB_VIRT_WANT,
+                f"the VMM mapped it at 0x{info['virt']:016X} "
+                f"(want 0x{FB_VIRT_WANT:016X})"))
+    out.append((info["base"] != 0 and info["base"] % 4096 == 0,
+                f"the loader's base 0x{info['base']:X} is page-aligned"))
+
+    if scanline is None:
+        out.append((False, "no pixels were read back from the framebuffer"))
+        return out
+    if len(scanline) < 4 * (3 * FB_BLOCK + 1):
+        out.append((False, f"the pixel dump is {len(scanline)} bytes, too "
+                           "short to hold the bar"))
+        return out
+
+    # Every primary, not just one: a renderer that reached memory but packed
+    # the channels wrong writes four DIFFERENT wrong words, and a single-colour
+    # check passes on any of them that happens to collide.
+    for i, (name, rgb) in enumerate(FB_BAR):
+        off = (i * FB_BLOCK) * 4
+        got, = struct.unpack_from("<I", scanline, off)
+        want = fb_pack(info, *rgb)
+        out.append((got == want,
+                    f"pixel ({i * FB_BLOCK},0) is 0x{got:08X} "
+                    f"(want 0x{want:08X}, {name} packed r@{info['r_pos']} "
+                    f"g@{info['g_pos']} b@{info['b_pos']})"))
+    return out
+
+
+def do_framebuffer(sock_path, elf, timeout, quiet):
+    _vaddr, info_paddr = symbol_phys_addr(elf, FB_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-fb.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    try:
+        client.handshake()
+        client.pmemsave(info_paddr, FB_BYTES, tmp.name)
+        info = fb_decode(open(tmp.name, "rb").read())
+        scanline = None
+        # The framebuffer's PHYSICAL address comes from the guest's own handoff
+        # block, so nothing here hardcodes where a PCI BAR landed.
+        if info["base"] and info["pitch"]:
+            try:
+                client.pmemsave(info["base"], min(info["pitch"], 1 << 16),
+                                tmp.name)
+                scanline = open(tmp.name, "rb").read()
+            except QmpError:
+                scanline = None
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+    results = check_framebuffer(info, scanline)
+    if not report_hwstate(results, quiet):
+        print(f"        {FB_SYMBOL} at guest physical 0x{info_paddr:X}, "
+              f"framebuffer at 0x{info['base']:X}")
+        return 1
+    return 0
+
+
 def do_dump(sock_path, elf, out_path, timeout, send_quit):
     _vaddr, paddr = symbol_phys_addr(elf, SENTINEL_SYMBOL)
     client = QmpClient(sock_path, time.monotonic() + timeout)
@@ -775,6 +895,56 @@ def do_selftest():
                  "min_delta 2")
     expect_ticks(False, 41, 12, "a counter that went BACKWARDS is rejected")
 
+    # --- roadmap 2.2/2.4 -----------------------------------------------------
+    # BGRX8888 as GRUB reports it on this hardware: blue at bit 0, red at 16.
+    FB_INFO_OK = dict(tag=FB_MAGIC, base=0xFD000000, pitch=4096, width=1024,
+                      height=768, bpp=32, type=1, virt=FB_VIRT_WANT,
+                      bytes=4096 * 768, r_pos=16, r_size=8, g_pos=8, g_size=8,
+                      b_pos=0, b_size=8)
+
+    def fb_scanline(info, colours=None, pitch=4096):
+        """A synthetic scanline carrying the bar the kernel is supposed to draw."""
+        buf = bytearray(pitch)
+        for i, (_name, rgb) in enumerate(colours or FB_BAR):
+            word = fb_pack(info, *rgb)
+            for x in range(i * FB_BLOCK, (i + 1) * FB_BLOCK):
+                struct.pack_into("<I", buf, x * 4, word)
+        return bytes(buf)
+
+    def expect_fb(ok_wanted, info, scanline, what):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_framebuffer(info, scanline))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} -- assertion said "
+                  f"{'accept' if got else 'reject'}")
+            fail_n += 1
+
+    print("=== framebuffer assertion self-test (no QEMU, no kernel) ===")
+    expect_fb(True, FB_INFO_OK, fb_scanline(FB_INFO_OK),
+              "the four-primary bar packed per the loader's masks is accepted")
+    expect_fb(False, dict(FB_INFO_OK, tag=0), fb_scanline(FB_INFO_OK),
+              "an fb_info block the probe never completed is rejected")
+    expect_fb(False, dict(FB_INFO_OK, virt=0), fb_scanline(FB_INFO_OK),
+              "a framebuffer the VMM never mapped is rejected")
+    expect_fb(False, FB_INFO_OK, bytes(4096),
+              "a framebuffer that is still all black is rejected")
+    expect_fb(False, FB_INFO_OK, None,
+              "a framebuffer that could not be read back at all is rejected")
+    # THE ONE THIS EXISTS FOR. A renderer that ignores the reported masks and
+    # hardcodes RGB draws every block with red and blue exchanged. Both are
+    # non-black, both are 'a bar', and only the per-channel comparison sees it.
+    RGB = dict(FB_INFO_OK, r_pos=0, b_pos=16)
+    expect_fb(False, FB_INFO_OK, fb_scanline(RGB),
+              "a bar packed RGB where the loader asked for BGR is rejected")
+    expect_fb(False, FB_INFO_OK,
+              fb_scanline(FB_INFO_OK, colours=[("red", (255, 0, 0))] * 4),
+              "four blocks of the SAME colour are rejected")
+    expect_fb(False, FB_INFO_OK, fb_scanline(FB_INFO_OK)[:64],
+              "a truncated pixel dump is rejected rather than ignored")
+
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
 
@@ -815,6 +985,12 @@ def main(argv=None):
     w.add_argument("--slave-imr", type=lambda v: int(v, 0), default=SLAVE_IMR)
     w.add_argument("--quiet", action="store_true")
 
+    f = sub.add_parser("fb", help="assert the framebuffer over QMP")
+    f.add_argument("--qmp", required=True)
+    f.add_argument("--elf", required=True)
+    f.add_argument("--timeout", type=float, default=10.0)
+    f.add_argument("--quiet", action="store_true")
+
     t = sub.add_parser("ticks", help="assert the guest is still ticking")
     t.add_argument("--qmp", required=True)
     t.add_argument("--elf", required=True)
@@ -842,6 +1018,8 @@ def main(argv=None):
                               gdt_limit=args.gdt_limit, master=args.master,
                               slave=args.slave, master_imr=args.master_imr,
                               slave_imr=args.slave_imr)
+        if args.cmd == "fb":
+            return do_framebuffer(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "ticks":
             return do_ticks(args.qmp, args.elf, args.timeout, args.quiet,
                             interval=args.interval, min_delta=args.min_delta)
