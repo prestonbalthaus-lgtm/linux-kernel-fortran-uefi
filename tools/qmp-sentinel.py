@@ -139,6 +139,8 @@ SCHED_MAGIC = 0x5343484544000001
 HEAP_SYMBOL = "fk_heap_stat"
 HEAP_WORDS = 10
 HEAP_MAGIC = 0x4B48454150000001
+STACKS_SYMBOL = "fk_task_stacks"
+SCHED_STACK_QWORDS = 2048            # FK_SCHED_STACK_QWORDS in fk_sched.f90
 # The panic colours, from src/cpu/fk_idt.f90 by way of idt_set_panic_colors.
 PANIC_FG_RGB = (255, 255, 255)
 PANIC_BG_RGB = (170, 0, 0)
@@ -770,7 +772,16 @@ def do_framebuffer(sock_path, elf, timeout, quiet, expect="console"):
 
 # --- roadmap 4.0: the scheduler and the heap, read out of the guest --------
 
-def check_sched(first, second, heap):
+def sched_stack_top(stacks_vaddr, task):
+    """The RSP0 sched_spawn programs for TASK (1-based), from the ELF's own
+    symbol.  Mirrors the arithmetic in sched_spawn exactly: Fortran lays the
+    2-D array out column-major, the top is rounded DOWN to 16, and one quadword
+    below it holds the fake return address, which is where RSP starts."""
+    base = stacks_vaddr + (task - 1) * SCHED_STACK_QWORDS * 8
+    return ((base + SCHED_STACK_QWORDS * 8) & ~0xF) - 8
+
+
+def check_sched(first, second, heap, tss=None, stacks_vaddr=None, tasks=0):
     """Return a list of (ok, description).
 
     FIRST and SECOND are (state, runs) pairs read a moment apart while the
@@ -804,6 +815,23 @@ def check_sched(first, second, heap):
     out.append((live >= 2,
                 f"{live} spawned threads have executed (want >= 2)"))
 
+    # roadmap 4.0's TSS half.  RSP0 is the stack a ring-3 -> ring-0 transition
+    # lands on, and it is per-TASK: a scheduler that never updates it delivers
+    # the next trap from user mode onto a stack another thread is using.
+    # Nothing runs in ring 3 yet, so this assertion is the ONLY thing that
+    # would notice tss_set_rsp0 never being called.
+    if tss is not None and stacks_vaddr is not None:
+        if len(tss) < 12:
+            out.append((False, "the TSS could not be read back"))
+        else:
+            rsp0, = struct.unpack_from("<Q", tss, 4)
+            wanted = {sched_stack_top(stacks_vaddr, t): t
+                      for t in range(2, max(tasks, 1) + 1)}
+            out.append((rsp0 in wanted,
+                        f"TSS RSP0 is 0x{rsp0:016X}, the top of spawned task "
+                        f"{wanted.get(rsp0, '?')}'s stack "
+                        f"(candidates {', '.join(f'0x{a:X}' for a in wanted)})"))
+
     if heap is not None:
         out.append((heap[0] == HEAP_MAGIC,
                     f"fk_heap_stat magic is 0x{heap[0]:016X} "
@@ -823,6 +851,8 @@ def do_sched(sock_path, elf, timeout, quiet, interval=0.25):
     _v, st_paddr = symbol_phys_addr(elf, SCHED_SYMBOL)
     _v, runs_paddr = symbol_phys_addr(elf, RUNS_SYMBOL)
     _v, heap_paddr = symbol_phys_addr(elf, HEAP_SYMBOL)
+    _v, tss_paddr = symbol_phys_addr(elf, TSS_SYMBOL)
+    stacks_vaddr, _ = symbol_phys_addr(elf, STACKS_SYMBOL)
     tmp = tempfile.NamedTemporaryFile(prefix="fk-sched.", suffix=".bin",
                                       delete=False)
     tmp.close()
@@ -841,13 +871,16 @@ def do_sched(sock_path, elf, timeout, quiet, interval=0.25):
         first = (read_words(client, st_paddr, SCHED_WORDS),
                  read_words(client, runs_paddr, RUNS_TASKS))
         heap = read_words(client, heap_paddr, HEAP_WORDS)
+        client.pmemsave(tss_paddr, TSS_LIMIT + 1, tmp.name)
+        tss = open(tmp.name, "rb").read()
         time.sleep(interval)
         second = (read_words(client, st_paddr, SCHED_WORDS),
                   read_words(client, runs_paddr, RUNS_TASKS))
     finally:
         client.close()
         os.unlink(tmp.name)
-    results = check_sched(first, second, heap)
+    results = check_sched(first, second, heap, tss=tss,
+                          stacks_vaddr=stacks_vaddr, tasks=int(second[0][1]))
     if not report_hwstate(results, quiet):
         print(f"        {SCHED_SYMBOL} at 0x{st_paddr:X}, {RUNS_SYMBOL} at "
               f"0x{runs_paddr:X}, {HEAP_SYMBOL} at 0x{heap_paddr:X}")
@@ -1301,10 +1334,35 @@ def do_selftest():
     SCHED_OK = ([SCHED_MAGIC, 3, 2, 17], [0, 9, 8, 0])
     SCHED_ON = ([SCHED_MAGIC, 3, 3, 31], [0, 11, 10, 0])
     HEAP_OK = [HEAP_MAGIC, 0x42000, 0, 0x42000, 1, 41, 41, 0x42000, 0, 3]
+    SCHED_OK_, SCHED_ON_, HEAP_OK_ = SCHED_OK, SCHED_ON, HEAP_OK
 
     def expect_sched(ok_wanted, first, second, heap, what):
         nonlocal pass_n, fail_n
         got = all(ok for ok, _ in check_sched(first, second, heap))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} -- assertion said "
+                  f"{'accept' if got else 'reject'}")
+            fail_n += 1
+
+    # A stack block at a plausible kernel address, and the RSP0 sched_spawn
+    # would program for task 2 out of it.
+    STACKS_VA = 0xFFFFFFFF80120000
+    RSP0_T2 = sched_stack_top(STACKS_VA, 2)
+    RSP0_T3 = sched_stack_top(STACKS_VA, 3)
+
+    def tss_with(rsp0):
+        b = bytearray(TSS_LIMIT + 1)
+        struct.pack_into("<Q", b, 4, rsp0)
+        return bytes(b)
+
+    def expect_rsp0(ok_wanted, tss, what):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_sched(SCHED_OK_, SCHED_ON_, HEAP_OK_,
+                                              tss=tss, stacks_vaddr=STACKS_VA,
+                                              tasks=3))
         if got == ok_wanted:
             print(f"  \033[32mPASS\033[0m  {what}")
             pass_n += 1
@@ -1342,6 +1400,21 @@ def do_selftest():
     expect_sched(False, SCHED_OK, SCHED_ON,
                  [HEAP_MAGIC, 0x42000, 0, 0x42000, 1, 41, 41, 0x42000, 0, 0],
                  "a heap that ACCEPTED the three bad frees is rejected")
+
+    expect_rsp0(True, tss_with(RSP0_T2),
+                "TSS RSP0 at the top of task 2's stack is accepted")
+    expect_rsp0(True, tss_with(RSP0_T3),
+                "and task 3's, since either may be the one running")
+    # THE ONE THIS EXISTS FOR: tss_set_rsp0 never called. Nothing in ring 0
+    # reads RSP0, so every other verdict in the boot is unaffected.
+    expect_rsp0(False, tss_with(0),
+                "an RSP0 the scheduler never wrote is rejected")
+    # The boot stack: right for task 1, wrong once a spawned task is running.
+    expect_rsp0(False, tss_with(0xFFFFFFFF8010BDA0),
+                "an RSP0 still pointing at the BOOT stack is rejected")
+    expect_rsp0(False, tss_with(RSP0_T2 + 8),
+                "an RSP0 one quadword above the frame -- the top rather than "
+                "the fake return address -- is rejected")
 
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0

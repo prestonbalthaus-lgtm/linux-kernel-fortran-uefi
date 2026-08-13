@@ -89,7 +89,10 @@ DF_REJECT="*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***"$'\n'"$COM
 NONE_EXPECT="$IRQ_EXPECT"$'\nFortran Kernel: interrupts are live and the kernel is still running (roadmap 3.2b).\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"
 NONE_REJECT=$'*** FORTRAN KERNEL PANIC ***\n'"$COMMON_REJECT"
 
-EXPECT="$NONE_EXPECT"; REJECT="$NONE_REJECT"; CHECK_TICKS=1
+# The shipped build's settings, and the per-case defaults reset before every
+# mutation. A case that forgets to call fault_build gets these.
+EXPECT="$NONE_EXPECT"; REJECT="$NONE_REJECT"
+CHECK_TICKS=1; CHECK_SCHED=1; FB_EXPECT=console
 
 # subst <file> <old> <new> -- and ABORT the run if the text was not there.
 # A sed that quietly matches nothing rebuilds the pristine kernel, the gate
@@ -109,13 +112,31 @@ PY
 # so every one of them also turns the tick assertion OFF: the panic handler
 # halts with IF clear, and a frozen counter is the CORRECT answer there.
 #
+# roadmap 4.0 added two more assertions that are wrong for a halted CPU, and
+# they are switched together with the tick one by fault_build() below:
+#
+#   FK_CHECK_SCHED reads fk_task_runs TWICE while the guest runs. With the CPU
+#   parked in a panic no thread is running, both reads are equal, and the gate
+#   would report a scheduling failure for every panic build -- a false alarm
+#   that would make the whole mutation table unreadable.
+#
+#   FK_FB_EXPECT goes from console to panic. The console band is repainted
+#   white on red by the handler, so demanding the console palette there would
+#   fail on a kernel whose panic screen works, and demanding nothing would stop
+#   asserting the panic reached the screen at all.
+#
 # Rebuild kernel_main's deliberate fault as the #DF that was the default until
 # roadmap 3.2b -- the only build that exercises the IST1 stack switch.
+# What every fault build shares: a halted CPU, and a screen the panic owns.
+fault_build() {
+  CHECK_TICKS=0; CHECK_SCHED=0; FB_EXPECT=panic
+}
+
 mode_df() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t"
-  EXPECT="$DF_EXPECT"; REJECT="$DF_REJECT"; CHECK_TICKS=0
+  EXPECT="$DF_EXPECT"; REJECT="$DF_REJECT"; fault_build
 }
 
 # ...or as a #DE instead.
@@ -123,7 +144,7 @@ mode_de() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = 0_c_int32_t"
-  EXPECT="$DE_EXPECT"; REJECT="$COMMON_REJECT"; CHECK_TICKS=0
+  EXPECT="$DE_EXPECT"; REJECT="$COMMON_REJECT"; fault_build
 }
 
 # ...or as roadmap 3.4's out-of-memory panic: drain the PMM, then INT3.
@@ -131,7 +152,7 @@ mode_oom() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -1_c_int32_t"
-  EXPECT="$OOM_EXPECT"; REJECT="$COMMON_REJECT"; CHECK_TICKS=0
+  EXPECT="$OOM_EXPECT"; REJECT="$COMMON_REJECT"; fault_build
 }
 
 # The guard page, whose address is READ OUT OF THE IMAGE that was just built
@@ -143,7 +164,7 @@ mode_guard() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -2_c_int32_t"
-  EXPECT="$PF_EXPECT"; REJECT="$COMMON_REJECT"; CHECK_TICKS=0; POST_BUILD=guard_cr2
+  EXPECT="$PF_EXPECT"; REJECT="$COMMON_REJECT"; fault_build; POST_BUILD=guard_cr2
 }
 guard_cr2() {
   local b cr2
@@ -163,7 +184,7 @@ mode_wp() {
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -4_c_int32_t"
   EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000003 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
-  REJECT="$COMMON_REJECT"; CHECK_TICKS=0; POST_BUILD=wp_cr2
+  REJECT="$COMMON_REJECT"; fault_build; POST_BUILD=wp_cr2
 }
 wp_cr2() {
   local t
@@ -180,7 +201,7 @@ mode_idmap() {
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -3_c_int32_t"
   EXPECT="$PF_EXPECT"$'\n'"CR2     = 0x0000000000100000"
-  REJECT="$COMMON_REJECT"; CHECK_TICKS=0
+  REJECT="$COMMON_REJECT"; fault_build
 }
 
 # Both gates, because they see different things: the static one reads the
@@ -198,7 +219,8 @@ run_case() {
   # A case whose expectation depends on an address only the fresh image knows.
   [ -n "${POST_BUILD:-}" ] && "$POST_BUILD"
   FK_EXPECT_SERIAL="$EXPECT" FK_REJECT_SERIAL="$REJECT" FK_CHECK_HW=1 \
-    FK_CHECK_TICKS="$CHECK_TICKS" tools/qemu-boot-test.sh >"$OUT/$name.log" 2>&1
+    FK_CHECK_TICKS="$CHECK_TICKS" FK_CHECK_SCHED="$CHECK_SCHED" \
+    FK_FB_EXPECT="$FB_EXPECT" tools/qemu-boot-test.sh >"$OUT/$name.log" 2>&1
   local rc=$? line
   # The CAUSE, not the gate's echo of what it was looking for: the header lines
   # quote every expected string, so a grep for those matches on every run.
@@ -469,7 +491,8 @@ ALL="baseline_none baseline_df baseline_de baseline_oom baseline_guard \
 for c in $ALL; do
   want_case "$c" || continue
   echo "=== $c ==="
-  EXPECT="$NONE_EXPECT"; REJECT="$NONE_REJECT"; CHECK_TICKS=1; POST_BUILD=""
+  EXPECT="$NONE_EXPECT"; REJECT="$NONE_REJECT"; POST_BUILD=""
+  CHECK_TICKS=1; CHECK_SCHED=1; FB_EXPECT=console
   restore
   "case_$c"
   restore

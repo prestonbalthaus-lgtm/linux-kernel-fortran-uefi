@@ -15,10 +15,12 @@ That grep now answers differently, which is the whole of the milestone:
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 2.2 + 2.4 | framebuffer, and the first pixels | the milestone 3.5 explicitly unblocked; 2.4 is verified to 248853 checks and has never drawn a pixel | PAT / write-combining, which `fk_vmm_m` has no flags for yet |
-| 3.6 | kernel heap | 4.1, 4.2, 6.1 and 6.4 each otherwise grow a fixed array with a ceiling | nothing |
 | 3.3 | the Local APIC | 3.2b made an interrupt survivable, and this is the controller everything after Phase 4 actually uses | an IST slot for NMI, and a mapping for 0xFEE00000 -- NOT the MADT, see that box |
 | 0.3 | OVMF / the UEFI path | the target hardware is UEFI and NOTHING here has ever booted that way | a decision -- the PMM parses Multiboot2 tags only and needs a second front end |
+| 1.4 | the panic handler's own box | the handler exists and now prints to both consoles; the box is still open on what a panic should DO besides halt | nothing |
+
+2.2, 2.4, 3.6 and the new 3.7 came off this list in one pass; the screen, the
+heap and preemptive multitasking all landed together.
 
 **The one I want a decision on rather than a preference: 0.3.** It is the largest
 unknown in the project, and the cost is not just a second entry stub -- see the
@@ -36,6 +38,18 @@ stated here and are no longer true: 1.1's string debt is now half paid; 1.4's
 validation text is already satisfied; 2.2's above-4-GiB hazard was removed by 3.5
 and replaced by a narrower one; 3.3's "needs the MADT to find the APIC base" is
 wrong for the BSP's own LAPIC.
+
+**Corrections made when 2.2/2.4/3.6/3.7 landed.** 2.2's box said the Multiboot2
+header "deliberately does NOT request a framebuffer" and that the item was
+"STILL HALF DONE" -- the tag is there now and the box was rewritten around what
+the loader actually answers with. 2.4's said the renderer "has never drawn a
+pixel"; it has. The narrower above-4-GiB hazard 3.5 left behind is gone in turn:
+`vmm_map_mmio` maps an arbitrary physical range wherever the kernel wants it, so
+a BAR above the linear map's top needs no new code. And the header's numbering
+should be read literally: the Lead Architect's directive calls the framebuffer
+work "Phase 3.3" and the heap/scheduler work "Phase 4.0"; in THIS file those are
+2.2 + 2.4 and 3.6 + 3.7. The roadmap's own 3.3 is the Local APIC and is
+untouched.
 
 ---
 
@@ -312,38 +326,53 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
         the old sed caught. It now REFUSES source it cannot analyse instead of guessing,
         with a fixture in `tools/gate-selftest.sh` (27 checks, up from 24).
 
-  *  [ ] 2.2 UEFI GOP Framebuffer Mapping
+  *  [x] 2.2 UEFI GOP Framebuffer Mapping
 
         Validation: Multiboot2 header successfully requests the framebuffer; Fortran pointer maps to the physical video memory address.
 
-        STILL HALF DONE. The Fortran side is finished and tested (`vga_init_framebuffer`
-        maps the pointer via c_f_pointer and validates the geometry). The Multiboot2
-        header now EXISTS (1.2) but deliberately does NOT request a framebuffer: tag
-        type 5 switches GRUB into a graphics mode, and the address it then reports is
-        routinely outside the 1 GiB the boot stub identity-maps. boot/boot.S carries the
-        exact tag to add and the mapping work that must land with it.
+        DONE. `boot/boot.S` carries the framebuffer tag (type 5, 1024x768x32)
+        and `src/drivers/video/fk_fbinfo.f90` reads back the tag 8 the loader
+        answers with -- through the identity window, before 1.2b's handoff
+        closes it, because the reply decides which pages the linear map must
+        leave out. The boot prints what it parsed:
 
-        HAZARD FOR WHOEVER DID 1.2, AND IT IS NOW SUPERSEDED: the GOP framebuffer is a
-        PCI BAR that on modern hardware sits ABOVE 4 GiB, while a bootloader identity map
-        usually covers only the low 1-4 GiB. Passing the firmware's reported address
-        straight to `vga_init_framebuffer` used to page-fault with no IDT (3.2) installed
-        -> double -> triple fault -> silent reboot, which reads as "the kernel crashed"
-        but is purely an unmapped address.
+            GOP framebuffer base/pitch/w/h/bpp 0xFD000000/0x1000/0x400/0x300/0x20
+            GOP channel r/g/b pos:size packed 0x0000080008080810
+            GOP IA32_PAT is 0x0007010600070106, PAT index 1 is write-combining.
+            GOP framebuffer virt/phys/PTE 0xFFFF808000000000/0xFD000000/0x80000000FD00000B
 
-        3.5 REMOVED THAT BLOCKER AND REPLACED IT WITH A NARROWER ONE. `vmm_map_page` will
-        map an arbitrary physical address anywhere in the canonical space, so a BAR above
-        4 GiB is no longer special. But the VMM's LINEAR MAP stops at the top of the RAM
-        the loader reported, so a BAR above that is in NO window and reaching for it
-        through `FK_VMM_PHYSMAP + phys` is the new version of the same silent fault. The
-        framebuffer must be mapped explicitly with `vmm_map_page`, at a virtual address
-        this kernel chooses, and never assumed to be in the linear map.
+        THREE THINGS IN THERE ARE NOT THE TEXTBOOK VERSION.
 
-        AND THE ATTRIBUTES ARE NOT OPTIONAL. A framebuffer mapped write-back is correct
-        but unusably slow -- every glyph is a read-modify-write of a cache line that is
-        never read. This wants write-combining, which means PAT rather than the
-        PCD/PWT pair alone, and `fk_vmm_m` currently defines neither: FK_PTE_PWT and
-        FK_PTE_PCD are not among its exported flags and nothing programs the PAT MSR.
-        That is the real work item hiding inside this box.
+        The colour-info OFFSET. `multiboot2.h` ends the framebuffer tag's
+        common header with a `u16 reserved`; the specification's PROSE says
+        `u8`. Reading it the prose's way shifts every channel byte one position
+        and produces a red channel at bit 0 of nothing. The packed masks above
+        -- red at 16, green at 8, blue at 0, all 8 bits wide, i.e. BGRX -- are
+        the header's version confirmed against a real GRUB.
+
+        PAT, not the PCD/PWT pair. `boot/mmu.S` programs IA32_PAT with
+        write-combining at index 1, so PWT ALONE selects it; the third selector
+        bit is PTE bit 7 on a 4 KiB page and bit 12 on a 2 MiB one, and staying
+        below index 4 means the VMM cannot select the wrong memory type by
+        mapping at the wrong granularity. The MSR is READ BACK off the CPU and
+        printed, because a wrmsr that never executed is otherwise
+        indistinguishable from one that did -- the reset value differs from the
+        wanted one in exactly the byte that decides this.
+
+        THE APERTURE IS UNMAPPED FROM THE LINEAR MAP BEFORE IT IS MAPPED
+        WRITE-COMBINING. `vmm_reserve_mmio` punches the 2 MiB pages covering the
+        BAR out of the physmap. Two memory types for one physical page is
+        undefined behaviour (SDM Vol.3 11.12.4), not a slow path, and on this
+        machine the BAR is at 0xFD000000 -- inside the linear map by default,
+        because 3.5's physmap covers everything below top-of-RAM. The boot
+        asserts the hole:
+
+            GOP framebuffer has no write-back alias in the linear map.
+
+        The above-4-GiB hazard this box used to describe is gone rather than
+        avoided: `vmm_map_mmio` maps an arbitrary physical range at a virtual
+        address the kernel chooses, so a BAR above 4 GiB needs no new code.
+        FK_VMM_MMIO is PML4[257], the slot after the linear map.
 
   *  [x] 2.3 Bitmap Font System
 
@@ -363,15 +392,57 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
         (re-running it yields a zero diff), and all 4096 bytes are diffed against the
         compiled `font_vga_8x16` oracle by the test suite. A single flipped bit is caught.
 
-  *  [ ] 2.4 The Software Renderer
+  *  [x] 2.4 The Software Renderer
 
         Validation: vga_print_string() successfully iterates over the font array and plots individual colored pixels to the screen.
 
-        CODE COMPLETE, not ticked: `vga_print_string`/`vga_print_char`/`vga_plot_pixel` are
-        written and verified byte-exact against a reference model on a simulated
-        framebuffer with pitch > width (248,853 checks, 0 mismatches, holds under the real
-        kernel flag set). But "to the screen" has never happened -- no boot path exists.
-        Tick this after QEMU (0.3) shows the pixels.
+        DONE, and "to the screen" finally happened. The renderer was already
+        verified byte-exact against a reference model on a simulated
+        framebuffer with pitch > width (248,853 checks); what 2.2 added was a
+        real one. `fb_test_bar` draws four primaries and a signature string,
+        `tools/qmp-sentinel.py` pmemsaves the framebuffer at the physical
+        address the GUEST's own handoff block names, and compares.
+
+        THE COMPARISON IS AGAINST COLOURS THE HOST PACKED FROM THE LOADER'S
+        MASKS, not against constants. A renderer that ignores the reported
+        channel positions and hardcodes RGB draws a bar that is non-black,
+        correct-looking and rejected. The signature goes further and is
+        compared GLYPH FOR GLYPH against the kernel's own font table, read out
+        of guest memory:
+
+            all 267 lit pixels of "FK-GOP 2.4" in the status bar match the
+            kernel's own font table, glyph for glyph
+
+        Both directions -- a lit font bit must be foreground AND a clear one
+        must not be -- so a cell that was filled rather than rendered fails.
+
+        AND A TERMINAL ON TOP OF IT. `src/drivers/video/fk_console.f90` is cell
+        geometry and a cursor: wrap, tab stops, backspace, CR/LF, and scrolling
+        via `fk_memmove`, ONE call per scanline because the stride is wider than
+        the visible width and a single call would copy the off-screen slack that
+        `vga_init_framebuffer` deliberately leaves outside the mapped extent. A
+        full-screen scroll on write-combining memory costs under one PIT tick,
+        measured and printed rather than assumed. `tests/drivers/video/test_console.c`
+        drives it against a C reference model of both the character grid and the
+        expected pixels: 937,980 checks, 0 mismatches.
+
+        The panic handler (1.4) now writes to BOTH consoles, reaching
+        `console_write` through a bind(c) interface rather than USE association
+        so that a call which must work whether or not there is a screen does not
+        order the whole video stack ahead of the IDT. The gate asserts the panic
+        screen by its PALETTE: `FK_FB_EXPECT=panic` requires the last text rows
+        to be white on red, so a register dump that reached only COM1 is caught.
+
+        A DEFECT THE HOST TEST FOUND AND THE BOOT DID NOT, recorded because it
+        is the fourth instance of a trap this tree already tracks.
+        `call vga_print_char(achar(code, c_char), ...)` passes a FUNCTION-RESULT
+        expression to a bind(c) character dummy with VALUE; gfortran 16.1.1
+        materialises a temporary and passes its ADDRESS while the callee reads
+        the low byte of RDI. Every glyph on screen became the same CP437 symbol
+        -- the low byte of a stack address, constant per call site -- while
+        cursor motion, wrapping and scrolling stayed perfectly correct. The
+        boot passed. Assigning to a local first fixes it; the glyph-identity
+        check above is what would now catch it from outside the guest.
 
 ## 🧠 Phase 3: Core CPU & Memory Management
 
@@ -1072,32 +1143,130 @@ The most critical mathematical and structural phase. Setting up the brain of the
         maps [0, top) rather than the AVAILABLE regions; nothing dereferences
         those addresses today, and the day something does, it wants PCD/PWT.
 
-  *  [ ] 3.6 The Kernel Heap
+  *  [x] 3.6 The Kernel Heap
 
         Validation: a Fortran allocator hands out arbitrary-sized blocks of kernel
         memory and takes them back, on top of the PMM's frames and the VMM's
         mappings.
 
-        NOT PREVIOUSLY A BOX, and its absence is the gap between what Phase 3
-        built and what Phase 4 needs. 3.4 hands out 4 KiB FRAMES. 3.5 hands out
-        MAPPINGS. Nothing in this tree hands out forty bytes.
+        DONE. `src/mm/fk_heap.f90` is an implicit list with BOUNDARY TAGS: every
+        block carries its own size and its PREDECESSOR's, so kfree finds the
+        block below it in constant time and coalesces both ways. Without the
+        back tag, freeing in ascending address order leaves the heap in N
+        fragments no later allocation can merge -- and a fragmented kernel heap
+        fails long after the code that caused it has returned.
 
-        WHO NEEDS IT: 4.1 (an ACPI table set whose size is whatever the firmware
-        says), 4.2 (a device list whose length is whatever the bus scan finds),
-        6.1 (a VFS tree), 6.4 (an ELF's segment list). Without it each of those
-        grows its own fixed-size array with a ceiling and a "too many" error --
-        which is exactly what 3.4 already had to do with FK_PMM_MAX_REGIONS = 128
-        and the FK_PMM_MAX_PHYS bound, and those were justified by having nothing
-        underneath them. After 3.5 that justification is gone.
+        A FREE LIST WOULD BE FASTER TO SEARCH and is deliberately absent: a list
+        threads pointers through free blocks, so a use-after-free corrupts the
+        allocator's own structure and the failure lands in an unrelated kmalloc.
+        The implicit walk keeps every pointer inside the header, which is what
+        lets `heap_check()` verify the whole heap TILES ITS WINDOW EXACTLY --
+        and it runs on every boot, not only in the test.
 
-        AND IT IS NOT THE SAME PROBLEM AS DMA MEMORY, which 5.1 and 5.3 need and
-        which should not be smuggled into this box. An xHCI ring and an NVMe
-        submission queue must be PHYSICALLY CONTIGUOUS, aligned, and known by
-        their physical address to a device that does not use the CPU's page
-        tables. A general heap gives none of those three. What 3.5 did make easy
-        is the conversion -- the linear map means virtual-to-physical for any
-        heap address is a subtraction -- so the DMA allocator is a thin thing over
+        WHERE THE PAGES COME FROM IS NOT THE ALLOCATOR'S DECISION. It calls
+        `heap_sbrk(bytes)`, which must map that many bytes immediately above the
+        window it already has and return the address, or 0. The kernel
+        implements it out of PMM frames and VMM mappings at FK_VMM_HEAP
+        (PML4[258]); a host test implements it out of one large allocation.
+        That boundary is what makes a block allocator testable at all.
+
+        AND IT STAGES EVERY FRAME BEFORE MAPPING ANY OF THEM, because there is
+        no `vmm_unmap`: a growth that failed halfway would otherwise leave pages
+        mapped that the heap never learns about and frames the PMM has handed
+        out that nothing can return, while still reporting failure. The staging
+        array is also the cap -- 512 pages, so 2 MiB is the largest single
+        kmalloc this kernel serves, stated rather than discovered.
+
+        The boot exercises eight sizes straddling every boundary, checks
+        alignment and non-overlap against the size the ALLOCATOR reports (not
+        the size that was asked for), writes a per-block pattern and reads every
+        block back after all of them are written, frees in an order that is not
+        the allocation order, and requires:
+
+            heap tiles its window exactly, blocks/used/free 0x00000001/0x00000000/0x00042000
+            heap coalesced every freed block back into one, largest free 0x0000000000042000
+
+        That "blocks 0x00000001" is the line worth reading twice. Every other
+        heap verdict -- alignment, non-overlap, patterns, the guards -- passes
+        on an allocator that never merges anything.
+
+        NOT PREEMPTION-SAFE, and 3.7 runs after it for that reason. Nothing here
+        takes a lock, so kmalloc from an interrupt handler or from two threads
+        at once will corrupt the block list. Today the rule is that only the
+        boot thread allocates and it stops before `sched_start`; a real lock is
+        4.1's problem, when something other than the boot path allocates.
+
+        NOT THE SAME PROBLEM AS DMA MEMORY, which 5.1 and 5.3 need and which is
+        still not smuggled into this box. An xHCI ring and an NVMe submission
+        queue must be PHYSICALLY CONTIGUOUS, aligned, and known by their
+        physical address to a device that does not use the CPU's page tables. A
+        general heap gives none of those three. What 3.5 made easy is the
+        conversion -- the linear map means virtual-to-physical for any heap
+        address is a subtraction -- so the DMA allocator is a thin thing over
         `pmm_alloc_page`, not a second heap.
+
+  *  [x] 3.7 Tasks, context switching and a round-robin scheduler
+
+        Validation: two kernel threads run alternately, switched by the 8254
+        timer, and both are observed running from outside the guest.
+
+        NOT PREVIOUSLY A BOX. The Lead Architect's directive numbers this "4.0";
+        it is filed in Phase 3 because it is CPU state management and has
+        nothing to do with Phase 4's buses. The roadmap's own 3.3 remains the
+        Local APIC and was not touched.
+
+        THE CONTEXT SWITCH IS ONE INSTRUCTION. `irq_handler` now RETURNS an RSP
+        and `irq_common` loads it before POP_GPRS. A task's registers are
+        already saved -- PUSH_GPRS put them on that task's own stack before the
+        handler ran -- so switching is answering the interrupt with a DIFFERENT
+        frame address. There is no save routine, no restore routine and no
+        second code path: a switch is the ordinary path with a different answer.
+
+        WHICH MEANS A NEW TASK NEEDS A FRAME IT NEVER PUSHED. `sched_spawn`
+        builds one by hand at the top of a static per-task stack, byte-identical
+        in layout to what the stub pushes. Three fields are load-bearing and all
+        three are silent when wrong:
+
+          RFLAGS = 0x202. Bit 9 is IF; a task started with it clear takes no
+          timer interrupt, is never preempted, and the round robin stops on it
+          -- the machine looks hung with every other verdict still passing.
+          Bit 1 is architecturally always 1.
+
+          RSP is one quadword BELOW the top, and that quadword holds the address
+          of `fk_cpu_halt`. SysV wants rsp % 16 == 8 at function entry because a
+          CALL has just pushed a return address -- but nothing called a task,
+          IRETQ jumped to it. A real return address there fixes the alignment
+          AND catches a task body that returns.
+
+          CS/SS are the kernel selectors. IRETQ reloads both; a zero SS is a #GP
+          on the first interrupt that tries to push onto this stack.
+
+        STACKS ARE STATIC, NOT kmalloc'd, and that is a testing decision: a
+        scheduler proof that fails when the allocator is wrong tells you neither
+        of the two things you wanted to know.
+
+        THE TSS IS THE OTHER HALF. `tss_set_rsp0` is called on every switch,
+        because RSP0 is per-TASK: a stale one delivers the next trap from user
+        mode onto a stack another thread is using. Nothing runs in ring 3 yet,
+        so this is the mechanism being put in place rather than one being used
+        -- and it is therefore the one thing here that is silent when broken,
+        which is why the gate reads RSP0 back out of the TSS over QMP and
+        requires it to equal the top of a SPAWNED task's stack, computed from
+        the `fk_task_stacks` symbol in the ELF.
+
+        RING 3 ITSELF IS NOT DONE and is not claimed. There are no user
+        segment descriptors in the GDT and nothing to run there; adding them
+        without a userspace would be untestable code.
+
+        THE PROOF IS NOT THE CONSOLE OUTPUT. Two threads print alternating
+        characters to the GOP renderer, but the assertion is two counters that
+        only the THREADS increment, read TWICE while the guest runs:
+
+            task 2 ran 49 -> 53 times (its own loop counter, not the scheduler's)
+            task 3 ran 48 -> 53 times
+
+        A scheduler that switches away once and then sticks produces non-zero
+        counters, prints every serial verdict in this box, and fails that.
 
 ## 🔌 Phase 4: The Bus & Subsystems
 

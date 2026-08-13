@@ -1014,8 +1014,12 @@ contains
        ! The counter is bumped by the THREAD, so it is evidence the thread's
        ! own instructions executed and not that the scheduler chose it.
        fk_task_runs(slot + 1_c_int32_t) = fk_task_runs(slot + 1_c_int32_t) + 1_c_int64_t
+       ! THE CONSOLE AND NOT COM1, and that is not a preference.  console_write
+       ! runs with IF clear, so two threads cannot interleave inside it; the
+       ! serial driver has no such bracket, and the boot thread is using it.
+       ! A thread byte landing in the middle of a line the boot gate greps for
+       ! would be a flake nobody could reproduce.
        call console_write(mark, 2_c_int32_t)
-       call serial_print_string(mark)
     end do
   end subroutine thread_body
 
@@ -1574,6 +1578,9 @@ contains
     integer(c_int32_t), intent(in), value :: magic
     integer(c_int64_t), intent(in), value :: mbi
     integer(c_int32_t) :: status
+    ! SEPARATE from `status`, which every bring-up after 3.2b overwrites.  The
+    ! headline below is irq_bringup's verdict and nobody else's.
+    integer(c_int32_t) :: irq_status
 
     ! Scalar stores, not an array assignment: gfortran may lower that to a
     ! memset call, which is an undefined symbol in a kernel with no libc.
@@ -1679,7 +1686,7 @@ contains
     ! roadmap 3.2b.  After the handoff, and before the deliberate fault: every
     ! FK_FAULT_MODE build runs with interrupts live from here on, so the tick
     ! proof rides on all of them the way 3.4's and 3.5's verdicts do.
-    status = irq_bringup()
+    irq_status = irq_bringup()
 
     ! Needs a running clock, so it comes after the timer is live.
     call console_scroll_probe()
@@ -1687,6 +1694,11 @@ contains
     ! roadmap 4.0.  After the VMM (it maps pages) and after the PMM (it takes
     ! frames), and with interrupts already live so the allocator is exercised
     ! on a machine that is being interrupted rather than a quiet one.
+    ! NOT PREEMPTION-SAFE, and it runs before the scheduler for that reason.
+    ! Nothing in fk_heap_m takes a lock, so kmalloc from an interrupt handler
+    ! or from two threads at once will corrupt the block list.  Roadmap 4.1's
+    ! problem; today the rule is that only this thread allocates, and it stops
+    ! allocating before sched_start.
     heap_next = FK_VMM_HEAP
     status = heap_bringup()
 
@@ -1700,7 +1712,7 @@ contains
     if (FK_FAULT_MODE == FK_FAULT_NONE) then
        ! Earned, not announced: irq_bringup has already printed a FAIL line for
        ! whichever property did not hold, and this one must not appear under it.
-       if (status == 0_c_int32_t) call serial_print_string(FK_IRQ_ALIVE)
+       if (irq_status == 0_c_int32_t) call serial_print_string(FK_IRQ_ALIVE)
        ! Parks with IF SET, so the timer goes on firing and fk_tick_count can be
        ! watched advancing from outside the guest.  Never returns.
        call fk_cpu_idle()
