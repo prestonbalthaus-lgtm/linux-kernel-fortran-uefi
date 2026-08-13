@@ -71,7 +71,9 @@ LDFLAGS_KERNEL := -nostdlib -z max-page-size=0x1000 -T linker.ld
 # 3.1/3.2, and the next module to appear here has to clear it too.
 FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/cpu/fk_gdt.f90 \
+               src/cpu/fk_tss.f90 \
                src/cpu/fk_idt.f90 \
+               src/drivers/pic/fk_pic.f90 \
                src/boot/fk_kmain.f90
 
 # Assembly sources. NAMED ONE BY ONE, deliberately not $(wildcard boot/*.S):
@@ -93,7 +95,8 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
 ASRC_KERNEL := boot/boot.S \
                boot/io.S \
                boot/gdt_flush.S \
-               boot/interrupts.S
+               boot/interrupts.S \
+               boot/faultgen.S
 
 AOBJ := $(patsubst boot/%.S,$(BUILD)/%.o,$(ASRC_KERNEL))
 FOBJ := $(foreach s,$(FSRC_KERNEL),$(BUILD)/$(basename $(notdir $(s))).o)
@@ -251,8 +254,19 @@ $(ISO): $(KERNEL)
 	  '    multiboot2 /boot/kernel.elf' \
 	  '    boot' \
 	  '}' > $(ISODIR)/boot/grub/grub.cfg
-	grub2-mkrescue -o $@ $(ISODIR) 2>&1 | sed 's/^/  /'
-	@test -s $@ || { echo "  FAIL  grub2-mkrescue produced an empty $@"; exit 1; }
+# NOT `grub2-mkrescue ... | sed`: make takes a pipeline's status from its LAST
+# command, so sed's zero would mask a mkrescue that died -- and mkrescue that
+# dies before it opens the output leaves the PREVIOUS run's ISO in place, which
+# `test -s` then accepts because it is a non-emptiness test and not a freshness
+# one. The gate downstream compounds it: tools/qemu-boot-test.sh boots the ISO
+# but derives every address it asserts from kernel.elf, so a constant-only
+# defect moves no symbol and the whole boot passes against a kernel that is no
+# longer on disk. `rm -f` first is what turns `test -s` into a freshness test.
+	@rm -f $@
+	@grub2-mkrescue -o $@ $(ISODIR) > $(BUILD)/mkrescue.log 2>&1; rc=$$?; \
+	 sed 's/^/  /' $(BUILD)/mkrescue.log; \
+	 [ $$rc -eq 0 ] || { echo "  FAIL  grub2-mkrescue exited $$rc"; exit 1; }
+	@test -s $@ || { echo "  FAIL  grub2-mkrescue wrote no $@"; exit 1; }
 	@echo "  OK    $@ (`wc -c < $@` bytes)"
 
 # --- housekeeping ------------------------------------------------------------

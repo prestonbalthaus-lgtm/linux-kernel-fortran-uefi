@@ -1,8 +1,9 @@
 ! SPDX-License-Identifier: GPL-2.0
 ! Fortran entry point for the Multiboot2 boot path.  boot/boot.S calls
 ! kernel_main once the CPU is in 64-bit long mode; it records the loader handoff
-! in fk_boot_sentinel, brings COM1 up, installs the GDT and IDT, and then faults
-! on purpose so roadmap 3.2's catcher has something to catch.
+! in fk_boot_sentinel, brings COM1 up, installs the GDT, TSS and IDT, pacifies
+! the legacy 8259s, and then faults on purpose so the catcher has something to
+! catch.
 ! tools/qemu-boot-test.sh reads the sentinel back over QMP and greps the
 ! captured COM1 log.
 module fk_kmain_m
@@ -10,7 +11,9 @@ module fk_kmain_m
                                          c_null_char
   use fk_serial_m, only: FK_SERIAL_COM1, serial_init, serial_print_string
   use fk_gdt_m,    only: gdt_init
+  use fk_tss_m,    only: tss_init
   use fk_idt_m,    only: idt_init
+  use fk_pic_m,    only: pic_remap
   implicit none
   private
   public :: kernel_main
@@ -46,13 +49,32 @@ module fk_kmain_m
 
   character(kind=c_char, len=*), parameter :: FK_GDT_READY = &
        "Fortran Kernel: GDT loaded, flat 64-bit model." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TSS_READY = &
+       "Fortran Kernel: TSS loaded, IST1 armed for #DF." // FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_IDT_READY = &
        "Fortran Kernel: IDT loaded, 32 CPU exceptions armed." // FK_CRLF // c_null_char
-  character(kind=c_char, len=*), parameter :: FK_TRIGGER = &
+  character(kind=c_char, len=*), parameter :: FK_PIC_READY = &
+       "Fortran Kernel: 8259 PIC remapped to 0x20/0x28, all IRQs masked." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PIC_FAILED = &
+       "Fortran Kernel: 8259 PIC mask readback FAILED." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TRIGGER_DE = &
        "Fortran Kernel: dividing by zero on purpose (roadmap 3.2)." // &
        FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TRIGGER_DF = &
+       "Fortran Kernel: smashing RSP to force a #DF (roadmap 3.2.5)." // &
+       FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_NO_FAULT = &
-       "Fortran Kernel: the divide by zero did NOT trap." // FK_CRLF // c_null_char
+       "Fortran Kernel: the deliberate fault did NOT trap." // FK_CRLF // c_null_char
+
+  ! WHICH fault kernel_main raises once the tables are up.  8 = #DF, which is
+  ! the milestone: it is the only way to exercise the IST1 stack switch.  0 =
+  ! #DE, which is NOT redundant -- #DF arrives with a CPU error code and so
+  ! only reaches the ISR_ERR half of boot/interrupts.S, leaving the dummy-push
+  ! half that roadmap 3.2's M1 mutation targets unexercised.  A PARAMETER, so
+  ! the branch not taken is folded away rather than shipped; tools/mutate-
+  ! phase3.sh seds this line and rebuilds to run the other gate.
+  integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t
 
   ! BOTH operands are volatile, and that is not belt and braces: with a literal
   ! numerator gcc rewrites 1/x into a compare against +-1 and emits no DIV at
@@ -68,6 +90,12 @@ module fk_kmain_m
     subroutine fk_cpu_halt() bind(c, name="fk_cpu_halt")
       implicit none
     end subroutine fk_cpu_halt
+
+    ! Points RSP at nothing and pushes.  boot/faultgen.S.  Never returns: the
+    ! next thing to execute is the #DF gate.
+    subroutine fk_smash_stack() bind(c, name="fk_smash_stack")
+      implicit none
+    end subroutine fk_smash_stack
   end interface
 
 contains
@@ -103,17 +131,33 @@ contains
 
     call gdt_init()
     call serial_print_string(FK_GDT_READY)
+
+    ! Before the IDT: idt_init points vector 8 at an IST slot, and a #DF taken
+    ! before LTR has run finds a null task register and triple-faults.
+    call tss_init()
+    call serial_print_string(FK_TSS_READY)
+
     call idt_init()
     call serial_print_string(FK_IDT_READY)
 
-    ! Roadmap 3.2's validation: a real #DE, raised by the CPU rather than
-    ! simulated by a call.
-    call serial_print_string(FK_TRIGGER)
-    fk_dividend = 1_c_int32_t
-    fk_divisor  = 0_c_int32_t
-    fk_quotient = fk_dividend / fk_divisor
+    if (pic_remap() == 0_c_int32_t) then
+       call serial_print_string(FK_PIC_READY)
+    else
+       call serial_print_string(FK_PIC_FAILED)
+    end if
 
-    ! Reached only if vector 0 returned, which no gate installed here does.
+    ! The deliberate fault.  Raised by the CPU, never simulated by a call.
+    if (FK_FAULT_MODE == 8_c_int32_t) then
+       call serial_print_string(FK_TRIGGER_DF)
+       call fk_smash_stack()
+    else
+       call serial_print_string(FK_TRIGGER_DE)
+       fk_dividend = 1_c_int32_t
+       fk_divisor  = 0_c_int32_t
+       fk_quotient = fk_dividend / fk_divisor
+    end if
+
+    ! Reached only if the fault returned, which no gate installed here does.
     call serial_print_string(FK_NO_FAULT)
     call fk_cpu_halt()
   end subroutine kernel_main
