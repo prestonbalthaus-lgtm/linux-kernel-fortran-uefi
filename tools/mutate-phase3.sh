@@ -70,23 +70,46 @@ VMM_REJECT=$'Fortran Kernel: VMM init FAILED, status 0x\nFortran Kernel: VMM cou
 IRQ_EXPECT=$'Fortran Kernel: PIT channel 0 hz/divisor 0x00000064/0x00002E9C.\nFortran Kernel: 8259 IMR now 0x0000FFFE, IRQ0 is the only line open.\nFortran Kernel: RFLAGS.IF is set, the CPU is interruptible, RFLAGS = 0x\nFortran Kernel: IRQ0 ticks before/after/spurious 0x\nFortran Kernel: the first tick interrupted kernel .text with IF set, RIP/RFLAGS 0x'
 IRQ_REJECT=$'Fortran Kernel: PIT divisor is 0, so channel 0 was NOT programmed.\nFortran Kernel: IRQ0 is STILL MASKED after the unmask.\nFortran Kernel: RFLAGS.IF is CLEAR after STI.\nFortran Kernel: IRQ0 never reached the tick target; the timer interrupt did not arrive.\nFortran Kernel: the first tick\'s saved frame is NOT kernel .text with IF set.'
 
-DE_EXPECT="EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error"$'\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
-DF_EXPECT=$'EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault\n*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
+# roadmap 2.2/2.4 and 3.6 ride on every case for the reason 3.4's and 3.5's do:
+# all of it runs before the deliberate fault in every build, so a mutation is
+# only attributable if everything it did not touch still holds.
+#
+# The two lines that carry the milestone are the PAT one and the alias one. A
+# framebuffer mapped write-back renders IDENTICALLY -- no picture, no pixel
+# dump and no console line would differ -- and a framebuffer aliased in the
+# linear map has no symptom at all until the day the two memory types disagree.
+# Both are decoded from the LIVE page-table entry.
+GOP_EXPECT=$'Fortran Kernel: GOP IA32_PAT is 0x0007010600070106, PAT index 1 is write-combining.\nFortran Kernel: GOP framebuffer PTE selects PAT index 1, write-combining.\nFortran Kernel: GOP framebuffer has no write-back alias in the linear map.\nFortran Kernel: GOP renderer armed on the mapped framebuffer (roadmap 2.4).\nFortran Kernel: console is live on the framebuffer, cols/rows 0x00000080/0x0000002F'
+GOP_REJECT=$'Fortran Kernel: GOP framebuffer tag REJECTED, status 0x\nFortran Kernel: GOP could NOT program the PAT; the framebuffer is not write-combining.\nFortran Kernel: GOP framebuffer PTE is NOT write-combining.\nFortran Kernel: GOP framebuffer mapping FAILED, status 0x\nFortran Kernel: GOP framebuffer is ALIASED write-back in the linear map.\nFortran Kernel: GOP renderer REFUSED the framebuffer, status 0x\nFortran Kernel: console REFUSED the framebuffer geometry, status 0x'
+
+# roadmap 3.6. "blocks 0x00000001" after everything is freed is the only one of
+# these a heap that never coalesces fails; the rest pass on a fragmented one.
+HEAP_EXPECT=$'Fortran Kernel: heap returned 16-byte aligned, non-overlapping blocks.\nFortran Kernel: kzalloc returned memory that was already zero.\nFortran Kernel: heap refused a double free, a stray pointer and a wrapped size.\nFortran Kernel: heap tiles its window exactly, blocks/used/free 0x00000001/0x00000000/\nFortran Kernel: heap coalesced every freed block back into one, largest free 0x'
+HEAP_REJECT=$'Fortran Kernel: heap could not get memory from the PMM/VMM.\nFortran Kernel: heap blocks are misaligned or OVERLAP.\nFortran Kernel: heap blocks OVERWROTE each other.\nFortran Kernel: kzalloc returned DIRTY memory.\nFortran Kernel: heap ACCEPTED a free it should have refused.\nFortran Kernel: heap did NOT coalesce; it is fragmented, blocks 0x\nFortran Kernel: heap FAILED its own consistency walk, faults 0x'
+
+# roadmap 3.7. NOT on the fault builds: kernel_main raises its deliberate fault
+# before sched_bringup on none of them -- it raises it after -- so these do ride
+# on every case, and a panic build that halts simply stops the threads later.
+SCHED_EXPECT=$'Fortran Kernel: scheduler tasks/current 0x00000003/0x00000001\nFortran Kernel: preemption is on; the timer now switches tasks.\nFortran Kernel: both threads ran, switches/A/B 0x'
+SCHED_REJECT=$'Fortran Kernel: scheduler could NOT spawn a thread, status 0x\nFortran Kernel: a spawned thread NEVER ran; the switch did not happen.'
+
+DE_EXPECT="EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error"$'\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
+DF_EXPECT=$'EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault\n*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
 # The OOM build's proof is three facts: the allocator refused, it said so, and
 # the panic that followed came from the CPU with a full register dump.
-OOM_EXPECT=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
-COMMON_REJECT=$'Fortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.\n'"$PMM_REJECT"$'\n'"$VMM_REJECT"$'\n'"$IRQ_REJECT"
+OOM_EXPECT=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
+COMMON_REJECT=$'Fortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.\n'"$PMM_REJECT"$'\n'"$VMM_REJECT"$'\n'"$IRQ_REJECT"$'\n'"$GOP_REJECT"$'\n'"$HEAP_REJECT"$'\n'"$SCHED_REJECT"
 
 # roadmap 3.5's two page-fault builds. The CR2 line is the whole assertion: both
 # faults are vector 14 with error code 0, so without it the two cases are
 # indistinguishable and either would satisfy the other's expectation.
-PF_EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000000 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
+PF_EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000000 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
 DF_REJECT="*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***"$'\n'"$COMMON_REJECT"
 
 # roadmap 3.2b's build is the DEFAULT now, because it is what ships. It is the
 # only one whose kernel_main does not end in a register dump, so it is also the
 # only one where the tick counter must still be moving when the gate reads it.
-NONE_EXPECT="$IRQ_EXPECT"$'\nFortran Kernel: interrupts are live and the kernel is still running (roadmap 3.2b).\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"
+NONE_EXPECT="$IRQ_EXPECT"$'\nFortran Kernel: interrupts are live and the kernel is still running (roadmap 3.2b).\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
 NONE_REJECT=$'*** FORTRAN KERNEL PANIC ***\n'"$COMMON_REJECT"
 
 # The shipped build's settings, and the per-case defaults reset before every
@@ -183,7 +206,7 @@ mode_wp() {
   subst src/boot/fk_kmain.f90 \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -5_c_int32_t" \
     "integer(c_int32_t), parameter :: FK_FAULT_MODE = -4_c_int32_t"
-  EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000003 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"
+  EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000003 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"$'\n'"$IRQ_EXPECT"$'\n'"$GOP_EXPECT"$'\n'"$HEAP_EXPECT"$'\n'"$SCHED_EXPECT"
   REJECT="$COMMON_REJECT"; fault_build; POST_BUILD=wp_cr2
 }
 wp_cr2() {
