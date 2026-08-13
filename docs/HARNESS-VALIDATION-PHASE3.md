@@ -623,10 +623,20 @@ long.
     FK_EXPECT_SERIAL=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint' \
       tools/qemu-boot-test.sh                     # after sedding FK_FAULT_MODE to -1
 
-    tools/mutate-phase3.sh                        # the whole table, ~31 boots
+    tools/qmp-sentinel.py selftest                # 30 assertion checks, no VM
+    FK_CHECK_HW=1 tools/qemu-boot-test.sh         # 3.2b: the shipped no-fault build
+
+    tools/mutate-phase3.sh                        # the whole table, 40 boots
     tools/mutate-phase3.sh M10 M13                # or just these
     tools/mutate-phase3.sh baseline_guard         # roadmap 3.5's two #PF builds
     tools/mutate-phase3.sh baseline_idmap
+    tools/mutate-phase3.sh baseline_none M28 M29 M30 M31 M32 M33   # roadmap 3.2b
+
+Since 3.2b the SHIPPED build raises no fault at all, so the invocations above
+that expect a panic are `FK_FAULT_MODE` builds `tools/mutate-phase3.sh` seds IN
+rather than the default it seds out. Anything driving the gate by hand against a
+panic build also wants `FK_CHECK_TICKS=0`: the handler halts with IF clear, and
+a frozen tick counter is the correct answer there rather than a failure.
 
 `tools/mutate-phase3.sh` edits the tree in place and restores it with
 `git checkout`, so it REFUSES to run when any file it mutates is untracked or has
@@ -770,3 +780,187 @@ That leaves the escape recorded rather than closed. Catching it on a running CPU
 would need the deliberate read placed immediately after the unmap with nothing
 between, and even then it would be asserting a behaviour the architecture permits
 but does not require.
+
+## Roadmap 3.2b: interrupts that return
+
+Every milestone before this one was validated by making the kernel die on
+purpose and reading the corpse. This one cannot be: the property under test is
+that the kernel does NOT die, and "it kept running" is exactly what a kernel
+that never took the interrupt at all also looks like from outside.
+
+So the evidence is built in four layers, and each answers something the one
+above it cannot.
+
+### 1. The count is three, not one
+
+    Fortran Kernel: IRQ0 ticks before/after/spurious 0x00000000/0x00000003/0x00000000.
+
+One tick proves an interrupt was delivered and a handler ran. It proves nothing
+about the return path and nothing about the 8259, because an interrupt
+controller that is never acknowledged delivers exactly one interrupt and then
+holds its in-service bit forever. "It ticked once" and "the PIC is wedged" are
+the same observation.
+
+`FK_TICK_TARGET` is 3 for that reason, and `FK_TICK_SPIN_LIMIT` bounds the wait
+at two billion turns so a kernel that never ticks prints its own FAIL line
+instead of hanging until the gate's deadline. M30 deletes the EOI and is caught
+here.
+
+### 2. The RIP, which is not approximately right
+
+    Fortran Kernel: the first tick interrupted kernel .text with IF set, RIP/RFLAGS 0xFFFFFFFF80104976/0x0000000000000206.
+
+That address is the `cmpq fk_tick_count(%rip)` at the top of the wait loop:
+
+    $ objdump -d --disassemble=kernel_main build/boot/kernel.elf
+    ffffffff80104976:  48 3b 15 2b 37 00 00   cmp 0x372b(%rip),%rdx  # fk_tick_count
+    ffffffff8010497d:  7f f1                  jg  ffffffff80104970
+
+The timer interrupted the loop on its own compare instruction, `irq_handler`
+ran, IRETQ put the CPU back on that instruction and the loop went round again.
+That RFLAGS is the CPU's own copy at the moment it took the interrupt, so IF was
+genuinely set -- not merely requested by an STI somebody called.
+
+Only bit 9 of it is the assertion. `0x206` and `0x202` are both observed across
+runs and both are correct: the rest are the arithmetic flags the interrupted CMP
+left, and which of them are set depends on where in the loop the timer landed.
+The gate matches this line by prefix for the same reason -- the address is stable
+under a rebuild of the same sources and the flags are not.
+
+The kernel asserts the weaker, relayout-proof half of this itself (the RIP is
+inside `[__text_start, __text_end)` and the saved IF bit is set) and prints the
+address so the exact form can be checked by hand.
+
+### 3. The IMR, read off the chip
+
+    Fortran Kernel: 8259 IMR now 0x0000FFFE, IRQ0 is the only line open.
+
+Read back through the data ports, not remembered. And asserted a second time
+from the DEVICE MODEL, where the kernel's opinion does not reach:
+
+    pic0: irr=00 imr=fe isr=00 hprio=0 irq_base=20 rr_sel=0 elcr=00 fnm=0
+    pic1: irr=00 imr=ff isr=00 hprio=0 irq_base=28 rr_sel=0 elcr=0c fnm=0
+
+That `imr=fe` is the 3.2.5 assertion inverted. Until this milestone the correct
+state was `0xFF` on both chips and `tools/qmp-sentinel.py` demanded it; a gate
+that still demanded it would now pass a kernel whose timer interrupt can never
+be delivered. The self-test carries both directions -- a master left fully
+masked is rejected, and so is a slave with a line open, because nothing in this
+machine drives one.
+
+### 4. The one the kernel cannot say about itself
+
+Everything above is a line the kernel printed, and every one of them stays true
+in the log after the kernel wedges. So `fk_tick_count` is a `bind(c)` volatile
+module variable, and the gate pmemsaves it out of the running guest TWICE, a
+quarter of a second apart:
+
+    tools/qmp-sentinel.py ticks --qmp <sock> --elf build/boot/kernel.elf
+
+    PASS  the guest had taken N timer interrupts when it was first read
+    PASS  it took M more between the two reads (want >= 2) -- the CPU is
+          still returning from them
+
+The CPU is parked in `fk_cpu_idle` -- `sti; hlt; jmp` -- while that is asked, so
+a growing counter can only be produced by an interrupt waking the CPU, a handler
+running, and IRETQ putting it back to sleep. Nothing the kernel prints can
+establish that, because by then the kernel has stopped printing.
+
+`FK_CHECK_TICKS=0` turns it off, and the builds that need it off are every
+`FK_FAULT_MODE` build that ends in a panic: the handler halts with IF clear and
+a frozen counter is the CORRECT answer there.
+
+### The trap that cost this milestone a build
+
+The wait loop was first written the obvious way, through an accessor:
+
+    do while (pit_ticks() < t0 + FK_TICK_TARGET .and. spins < FK_TICK_SPIN_LIMIT)
+
+Compiled, there was no loop at all, and the "before" and "after" counts were
+printed out of the same register. The tell was this, sitting where the loop
+should have been:
+
+    movabs $0x7ffffffffffffffc,%rax
+    cmp    %rax,%rbx
+
+which is gcc reasoning about whether `t0 + 3` overflows -- a question that only
+arises if `t1` IS `t0`.
+
+Measured with a throwaway before choosing a fix, both ways round:
+
+| shape | one translation unit | two |
+|---|---|---|
+| `get_fn()` returning a volatile module variable | loop kept, reloads each turn | **loop deleted, one call reused** |
+| the volatile variable read directly by use association | loop kept | loop kept, reloads each turn |
+
+Inside one translation unit the getter is inlined and the volatility is visible.
+Across two it is a plain `call`, the caller has only the `.mod`, and the volatile
+is inside a body it cannot see.
+
+The rule this tree now follows: **state an interrupt handler writes is exported
+as a VOLATILE module VARIABLE and read by use association, never returned by an
+accessor.** `fk_tick_count`, `fk_first_rip`, `fk_first_rflags` and
+`fk_irq_spurious` are exported that way, all `bind(c, name=...)`.
+
+`tools/compliance.sh` rule 3 had to grow with it. It required every public
+export to be `bind(c, name=...)` and could only recognise that on a procedure,
+so the four new variables read as unbound. It now accepts a public module
+variable that names itself the same way -- which is the rule it always meant,
+applied to the kind of entity the tree had not exported before.
+
+### Boot mutations
+
+One baseline and six defects, run with `tools/mutate-phase3.sh`. The baseline is
+the SHIPPED build, which is now the only `FK_FAULT_MODE` value that does not end
+in a register dump.
+
+| # | defect | result |
+|---|--------|--------|
+| baseline-no-fault | `FK_FAULT_MODE = -5`, the image that ships | **passes** — all six 3.2b lines, and `fk_tick_count` grew between two reads of guest memory |
+| M28 | the IRQ tail ends in `jmp fk_cpu_halt` instead of IRETQ — i.e. the tree exactly as it was before this milestone | **caught** — COM1 stops dead after the `RFLAGS.IF is set` line. The first timer interrupt is the last thing the CPU does |
+| M29 | `addq $16, %rsp` dropped before IRETQ | **caught** — `EXCEPTION 0x0D ERR 0x0000000000000000 -- #GP`. IRETQ read the line number the stub pushed as the return RIP |
+| M30 | the EOI deleted | **caught, and it is the case `FK_TICK_TARGET = 3` exists for** — `IRQ0 never reached the tick target`, a line the gate forbids. One interrupt was delivered and the chip then went quiet |
+| M31 | IRQ0 never unmasked | **caught three ways** — `8259 master IMR is 0xFF (want 0xFE)` from the device model, 0 ticks from guest memory, and the kernel's own `IRQ0 is STILL MASKED after the unmask.` |
+| M32 | vectors 32-47 left not-present | **caught** — `EXCEPTION 0x0D ERR 0x0000000000000103 -- #GP`. Error code `0x103` is `(32 << 3) | 0b011`: the CPU naming vector 32, in the IDT, from an external interrupt. It is 3.2's "an unhandled vector must fault rather than jump to a zeroed offset" arriving from the other side |
+| M33 | the three OUTs in `pit_init` deleted | **ESCAPE** — see below |
+
+#### M33: the divisor nobody can read back
+
+`pit_init` computes the divisor and prints it, then writes it to the chip. Delete
+the writes and the computation — and therefore the console line — is unchanged,
+the 8254 keeps whatever reload value the firmware left, and channel 0 goes on
+ticking at 18.2 Hz. The boot passed with `ticks before/after 0x0/0x3` and every
+other assertion green.
+
+The 8253/8254 has no command that reads the reload register back, so the
+readback discipline the rest of this milestone uses — ask the chip, do not
+believe the driver — has nothing to ask. Closing it needs a *rate* assertion:
+count ticks against an independent clock over a known interval and check the
+frequency, which needs a second time source this kernel does not have. The
+`ticks` subcommand could do it from the host, since it already takes two reads a
+known wall-clock interval apart, and that is the obvious next move — but a rate
+gate that fires on a loaded CI host is worse than no gate, so it is recorded
+rather than guessed at.
+
+What it is NOT is a hole in the return path. Every property this milestone is
+about — the interrupt is delivered, a Fortran handler runs, the chip is
+acknowledged, IRETQ resumes the interrupted instruction — holds in the M33 build
+and is asserted there. What escapes is only the rate.
+
+#### A defect this milestone's own mutation found
+
+M31 was caught on the first run, and the log showed this:
+
+    Fortran Kernel: IRQ0 is STILL MASKED after the unmask.
+    Fortran Kernel: IRQ0 never reached the tick target; the timer interrupt did not arrive.
+    Fortran Kernel: the first tick's saved frame is NOT kernel .text with IF set.
+    Fortran Kernel: interrupts are live and the kernel is still running (roadmap 3.2b).
+
+The last line was printed unconditionally by `kernel_main`, three lines under the
+kernel's own evidence that it was false. The gate still failed the build — the
+three FAIL lines are all rejected — so nothing was wrongly accepted. It was
+wrongly *said*, which in a tree whose whole method is quoting what the kernel
+printed is the same class of problem.
+
+`irq_bringup` is now a function returning 0 only when all four properties held,
+and the headline is conditional on it. A verdict has to be earned.

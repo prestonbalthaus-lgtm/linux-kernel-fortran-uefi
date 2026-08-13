@@ -1,40 +1,37 @@
 
 # PROPOSED NEXT MILESTONE -- AWAITING LEAD ARCHITECT APPROVAL
 
-Written 2026-08-13, after 1.3 / 3.5 / 1.2b landed (PR #7). Nothing below has been
-started. This block is a proposal to be argued with, not a plan of record; delete
-it once the decision is made.
+Updated 2026-08-13. **3.2b was approved and has LANDED** -- its row is gone from
+the table below and its box is ticked. What remains is the rest of that proposal,
+unchanged, plus the one item that still needs a decision rather than a
+preference.
 
-**Recommendation: 3.2b, "interrupts that return", before anything else.**
+That grep now answers differently, which is the whole of the milestone:
 
-The reason is one grep:
+    $ grep -rn "iretq" boot/
+    boot/interrupts.S:  iretq
 
-    $ grep -rn "iretq\|iret" boot/ src/
-    NO iretq ANYWHERE IN THE TREE
-
-Every boot this project has ever taken ends in a deliberate panic, and the IDT has
-never been asked to do the other thing. It is the smallest item on the list and the
-only one everything in Phases 4 through 7 stands on. 3.2.5 already remapped and
-masked the 8259s, so the PIT is one IMR write away. Full reasoning in the 3.2b box.
-
-**Then, in order, with what each is really waiting on:**
+**Next, in order, with what each is really waiting on:**
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 3.2b | interrupts that return | nothing can be built on a kernel whose only end state is halted | nothing -- 3.2.5 did the setup |
 | 2.2 + 2.4 | framebuffer, and the first pixels | the milestone 3.5 explicitly unblocked; 2.4 is verified to 248853 checks and has never drawn a pixel | PAT / write-combining, which `fk_vmm_m` has no flags for yet |
 | 3.6 | kernel heap | 4.1, 4.2, 6.1 and 6.4 each otherwise grow a fixed array with a ceiling | nothing |
+| 3.3 | the Local APIC | 3.2b made an interrupt survivable, and this is the controller everything after Phase 4 actually uses | an IST slot for NMI, and a mapping for 0xFEE00000 -- NOT the MADT, see that box |
 | 0.3 | OVMF / the UEFI path | the target hardware is UEFI and NOTHING here has ever booted that way | a decision -- the PMM parses Multiboot2 tags only and needs a second front end |
-
-3.2b and 2.2 touch almost disjoint files -- `boot/interrupts.S` + `fk_idt.f90` + a
-PIT driver, versus `boot/boot.S`'s header tag + `fk_vmm_m`'s flags + the existing
-renderer -- so they parallelise the way 1.3 and 3.5 did.
 
 **The one I want a decision on rather than a preference: 0.3.** It is the largest
 unknown in the project, and the cost is not just a second entry stub -- see the
 note added to that box.
 
-**Corrections made to this file in the same pass**, all of them things that were
+**One thing 3.2b changed that is not in its own box.** The shipped image no
+longer ends in a deliberate panic: `FK_FAULT_MODE` defaults to `-5`, kernel_main
+parks in `fk_cpu_idle` with IF set, and every fault build is now something
+`tools/mutate-phase3.sh` seds in rather than the default it seds out. Anything
+that assumed a register dump on every boot -- and the boot gate did -- had to be
+told which build it was looking at.
+
+**Corrections made to this file in an earlier pass**, all of them things that were
 stated here and are no longer true: 1.1's string debt is now half paid; 1.4's
 validation text is already satisfied; 2.2's above-4-GiB hazard was removed by 3.5
 and replaced by a narrower one; 3.3's "needs the MADT to find the APIC base" is
@@ -598,66 +595,140 @@ The most critical mathematical and structural phase. Setting up the brain of the
         dummy-push half that 3.2's M1 mutation targets unexercised. Both gates are
         driven from `tools/mutate-phase3.sh`, which rebuilds for each.
 
-  *  [ ] 3.2b Interrupts that RETURN (the deferred half of 3.2)
+  *  [x] 3.2b Interrupts that RETURN (the deferred half of 3.2)
 
         Validation: the CPU takes a hardware interrupt, a Fortran handler runs, and
         execution RESUMES at the instruction that was interrupted. A tick counter
         advances while the kernel keeps running.
 
-        NOT STARTED, and it is not a refinement -- it is a hole. Found by reading
-        the tree rather than by a gate, 2026-08-13:
+        DONE. On COM1, from the shipped image, and these five lines are the whole
+        milestone:
 
-            $ grep -rn "iretq\|iret" boot/ src/
-            NO iretq ANYWHERE IN THE TREE
+            Fortran Kernel: PIT channel 0 hz/divisor 0x00000064/0x00002E9C.
+            Fortran Kernel: 8259 IMR now 0x0000FFFE, IRQ0 is the only line open.
+            Fortran Kernel: RFLAGS.IF is set, the CPU is interruptible, RFLAGS = 0x0000000000000282
+            Fortran Kernel: IRQ0 ticks before/after/spurious 0x00000000/0x00000003/0x00000000.
+            Fortran Kernel: the first tick interrupted kernel .text with IF set, RIP/RFLAGS 0xFFFFFFFF80104976/0x0000000000000206.
+            Fortran Kernel: interrupts are live and the kernel is still running (roadmap 3.2b).
 
-        `boot/interrupts.S` ends its common trampoline with `jmp fk_cpu_halt` and
-        `isr_handler` ends with `call fk_cpu_halt()`. THIS KERNEL HAS NEVER
-        EXECUTED AN INTERRUPT RETURN. The IDT is a one-way door: it catches a
-        fault, prints it accurately, and dies. There are also only 32 trampolines
-        -- isr0..isr31 -- and 3.2 installs vectors 32-255 with the present bit
-        deliberately CLEAR, so there is no hardware-interrupt path at all.
+        READ THE RIP. 0xFFFFFFFF80104976 is not approximately inside kernel_main:
+        it is the exact address of the `cmpq fk_tick_count(%rip)` that the wait
+        loop executes, disassembled out of the image that printed it. The timer
+        interrupted the loop on its own compare, a Fortran handler ran, IRETQ put
+        the CPU back on that instruction, and the loop went round again.
 
-        Every green gate in Phase 3 is consistent with that, because every one of
-        them ends in a deliberate panic. The kernel's only reachable end state
-        today is halted.
+        ONLY BIT 9 OF THAT RFLAGS IS THE ASSERTION. 0x206 and 0x202 are both
+        observed across runs and both are correct: the low bits are the arithmetic
+        flags the interrupted CMP happened to leave, and they depend on where in
+        the loop the timer landed. The kernel tests bit 9 and prints the whole
+        register, so what it asserted and what it saw are both on the line.
 
-        WHY IT COMES BEFORE THE REST OF PHASE 3 AND 4. A keyboard that generates
-        interrupts (5.2), an APIC that delivers them (3.3), a syscall that returns
-        a value (6.3) and any scheduler at all are each built on the assumption
-        that an interrupt can be taken and survived. None of that assumption is
-        currently tested by anything.
+        AND THE COUNT IS THREE, NOT ONE, which is a separate fact. An 8259 that is
+        never acknowledged delivers exactly one interrupt and then holds its
+        in-service bit forever -- so "it ticked" and "the interrupt controller is
+        wedged" are the same observation. Waiting for three is what tells them
+        apart, and it is why M30 (EOI deleted) is caught.
 
-        WHAT THE WORK IS, and it is small because 3.2.5 already did the setup. The
-        8259s are remapped clear of the exception range and fully masked -- the
-        PIT is sitting behind one IMR write. So: trampolines for vectors 32-47, a
-        SECOND tail that restores the frame and executes IRETQ instead of halting,
-        an EOI, a vector-32 handler that increments a counter, and one IMR bit
-        cleared.
+        THE PROOF THAT IS NOT ON THE CONSOLE AT ALL. `fk_tick_count` is a bind(c)
+        volatile module variable, so `tools/qmp-sentinel.py ticks` pmemsaves it out
+        of the running guest TWICE, a quarter of a second apart, and asserts it
+        grew. Every line above is something the kernel says about itself and stops
+        being true the moment the kernel wedges; that one is asked of guest memory
+        while the CPU is parked in `sti; hlt` and can only be answered by a machine
+        that is still taking interrupts and returning from them right now.
 
-        THE PROOF IS THE THING THIS PROJECT HAS NEVER PRINTED: a tick count that
-        is larger the second time it is read, and a boot that reaches the end of
-        `kernel_main` WITHOUT faulting. Every boot in this tree's history has
-        ended in a panic; this would be the first that does not.
+        WHAT WAS BUILT.
 
-        FOUR HAZARDS TO PLAN FOR, since none of them has ever been exercised here:
+        `boot/interrupts.S` -- a SECOND TAIL. `isr_common` is unchanged and still
+        ends in `jmp fk_cpu_halt`; the new `irq_common` restores the 15 registers,
+        drops the two quadwords the stub pushed and executes IRETQ. The two are
+        deliberately not one routine with a flag: resuming from a #GP is not
+        something this kernel knows how to do, and which tail a vector gets is
+        decided by the IDT and nowhere else. The 15 pushes and the 15 pops are
+        macros because they are one decision written twice, and a tree where they
+        can drift is a tree where an IRQ returns with rbx and rbp exchanged --
+        which corrupts the interrupted code, not the handler.
 
-          * the panic tail and the IRQ tail must be genuinely separate. The
-            current `isr_common` hard-codes `jmp fk_cpu_halt` for all 32 vectors,
-            and an exception must keep going there -- resuming from a #GP is not
-            this milestone.
-          * EOI ordering: before the IRETQ, and slave-then-master for IRQ >= 8.
-            An 8259 that is never acknowledged delivers exactly one interrupt and
-            then goes quiet, which presents as "interrupts do not work" rather
-            than as a missing OUT.
-          * spurious IRQ7 and IRQ15. The 8259 raises them under load and the ISR
-            must read the in-service register rather than EOI blindly.
-          * AND THE BIG ONE: unmasking the PIT is the first time this kernel ever
-            runs with IF set. Everything that has been safe because interrupts
-            were masked stops being -- the UART driver's LSR spin loop, the PMM's
-            walk over 262144 bitmap words, and every module variable that is
-            written without any notion of re-entrancy. That is not a reason to
-            defer it; it is a reason to do it while the kernel is still small
-            enough to reason about.
+        The stubs push the 8259 LINE NUMBER, 0-15, and not the vector. The vector
+        is FK_PIC1_VECTOR + line and `fk_pic_m` is the only place that decides what
+        FK_PIC1_VECTOR is, so an assembler constant here would be a second copy of
+        that decision with nothing keeping the two equal -- the same rule 3.1
+        applied to the GDT selectors.
+
+        `src/drivers/pic/fk_pic.f90` -- EOI, mask, unmask, and both readbacks.
+        `pic_eoi` sends the slave's first and the master's second, and only the
+        master's for a line below 8. `pic_unmask` on a slave line also clears the
+        master's IRQ2, because a slave line behind a masked cascade is still
+        silent. `pic_isr` reads the in-service register through OCW3, which is the
+        one thing that distinguishes a spurious IRQ7 or IRQ15 from a real one --
+        the chip never set the bit, so a handler that EOIs on the vector alone
+        cancels whatever IS in service.
+
+        `src/drivers/pit/fk_pit.f90` -- channel 0, mode 3, binary, 100 Hz. The
+        divisor is COMPUTED from the 1193182 Hz crystal rate and printed, so the
+        console line carries a number the kernel derived rather than a claim it
+        made.
+
+        `src/cpu/fk_idt.f90` -- vectors FK_PIC1_VECTOR..+15 installed present, and
+        the router. The install loop now clears all 256 gates FIRST and fills in
+        the two blocks after, so "every vector this kernel does not handle raises
+        #GP" is true by construction rather than by a range test somebody has to
+        keep correct.
+
+        WHAT IT COST, and it is the fifth entry in this tree's list of gfortran
+        traps -- the first four are in 3.2, 3.2.5 and 3.4:
+
+            A PUBLIC MODULE FUNCTION WHOSE BODY IS A VOLATILE LOAD IS TREATED AS
+            SIDE-EFFECT-FREE BY A CALLER IN ANOTHER TRANSLATION UNIT.
+
+        The wait loop was first written as `do while (pit_ticks() < t0 + 3 ...)`.
+        Compiled, there was no loop: gcc had deleted it and printed the "before"
+        and "after" counts out of the same register. Measured both ways round with
+        a throwaway -- inside ONE translation unit the getter is inlined, the
+        volatility is visible and the code is correct; across two it is a plain
+        call, the caller has only the .mod, and the volatile is inside the body it
+        cannot see. The tell in the disassembly was `cmp $0x7ffffffffffffffc,%rbx`,
+        which is gcc asking whether `t0 + 3` overflows -- only a question if t1 IS
+        t0.
+
+        The rule this tree now follows: state an interrupt handler writes is
+        exported as a VOLATILE module VARIABLE and read by use association, never
+        returned by an accessor. The attribute does travel through the .mod and the
+        load is then emitted in the reader. `fk_tick_count`, `fk_first_rip`,
+        `fk_first_rflags` and `fk_irq_spurious` are all exported that way, all
+        bind(c), and `tools/compliance.sh` rule 3 was extended to accept a public
+        module variable that names itself -- before this milestone the tree had no
+        such export and the rule could only be satisfied by a procedure.
+
+        THE SHIPPED IMAGE NO LONGER PANICS. `FK_FAULT_MODE` gained `-5`, which
+        raises nothing and parks in `fk_cpu_idle` (`sti; hlt; jmp`), and that is
+        now the default. Every fault build -- #DF, #DE, the PMM's out-of-memory
+        INT3, and 3.5's three page faults -- is something `tools/mutate-phase3.sh`
+        seds IN. The tick assertion is off for all of them, because a panic handler
+        halts with IF clear and a frozen counter is the correct answer there.
+
+        WHAT THIS DOES NOT PROVE, stated rather than implied:
+
+          * Only line 0 has ever fired. The slave path, the cascade EOI and the
+            spurious-IRQ15 branch are written and reviewed and have never been
+            executed -- nothing in this machine drives a slave line yet.
+          * The spurious counter has only ever read zero. That is the correct
+            value on this hardware; it is not evidence the check works.
+          * Nothing NESTS. Every gate is an interrupt gate, so IF is clear inside
+            the handler and the non-specific EOI can only be clearing the line
+            being serviced. The moment a trap gate or an explicit STI appears in a
+            handler, that reasoning expires.
+          * The PIT's reload value cannot be read back -- the 8253 has no such
+            command -- so `M33-pit-never-programmed` ESCAPES: delete the three OUTs
+            and the chip keeps the firmware's divisor and still ticks, at 18.2 Hz,
+            with every console line still passing. Closing it needs a timing
+            assertion nobody has written. Recorded in
+            `docs/HARNESS-VALIDATION-PHASE3.md` rather than quietly left out.
+          * IRQ0 is now unmasked for the whole life of the kernel, so every module
+            variable written outside a handler is written with an interrupt able to
+            arrive between any two instructions. Nothing shares state with the tick
+            handler today. That is a fact about how small this kernel is, not a
+            property anything enforces.
 
   *  [ ] 3.3 Advanced Programmable Interrupt Controller (APIC)
 

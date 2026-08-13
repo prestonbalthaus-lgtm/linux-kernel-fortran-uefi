@@ -1,17 +1,26 @@
 ! SPDX-License-Identifier: GPL-2.0
-! IDT and the kernel panic handler (roadmap 3.2).  The 32 CPU exception vectors
-! are routed through the trampolines in boot/interrupts.S to isr_handler below,
-! which dumps the captured machine state over COM1 and parks the CPU.
+! IDT, the kernel panic handler (roadmap 3.2) and the IRQ router (roadmap 3.2b).
+!
+! Two kinds of vector, two handlers, and the difference is the whole point.  The
+! 32 CPU exception vectors reach isr_handler, which dumps the captured machine
+! state over COM1 and parks the CPU -- an exception here is a bug and resuming
+! from one is not something this kernel can do.  The 16 legacy IRQ vectors reach
+! irq_handler, which services the line, acknowledges the 8259 and RETURNS, and
+! boot/interrupts.S then executes the IRETQ that puts the interrupted code back
+! where it was.
 module fk_idt_m
   use, intrinsic :: iso_c_binding, only: c_int8_t, c_int16_t, c_int32_t, &
                                          c_int64_t, c_char, c_null_char, c_loc
   use fk_gdt_m,    only: FK_GDT_SEL_CODE
   use fk_tss_m,    only: FK_TSS_IST_DF, tss_on_df_stack
+  use fk_pic_m,    only: FK_PIC1_VECTOR, FK_PIC_LINES, FK_PIC_CASCADE, &
+                         pic_eoi, pic_isr
+  use fk_pit_m,    only: FK_PIT_IRQ, pit_tick
   use fk_serial_m, only: serial_print_byte, serial_print_string, &
                          serial_print_hex
   implicit none
   private
-  public :: idt_init, idt_reload, isr_handler
+  public :: idt_init, idt_reload, isr_handler, irq_handler, fk_irq_spurious
 
   ! What boot/interrupts.S leaves on the stack, lowest address first.  Every
   ! field is a quadword, so the type needs no padding and the assembly needs no
@@ -50,6 +59,21 @@ module fk_idt_m
   ! the one exception that must not be delivered on it.  fk_tss_m owns which
   ! IST slot that is; this is only the vector that asks for it.
   integer(c_int32_t), parameter :: FK_VEC_DF = 8_c_int32_t
+
+  ! The two lines an 8259 raises when a request withdraws before the CPU
+  ! acknowledges it: the master's 7, and the slave's 7 -- which is line 15.
+  integer(c_int32_t), parameter :: FK_IRQ_SPURIOUS_MASTER = 7_c_int32_t
+  integer(c_int32_t), parameter :: FK_IRQ_SPURIOUS_SLAVE  = 15_c_int32_t
+
+  ! Counted rather than ignored.  A spurious interrupt is normal and harmless;
+  ! a spurious interrupt this handler never noticed is an EOI sent for a line
+  ! that was never in service, which cancels the NEXT real one.
+  !
+  ! VOLATILE and exported as a variable for the reason fk_pit_m's header sets
+  ! out: an interrupt handler writes it, and a cross-module accessor function
+  ! that returned it would be treated as side-effect-free by the reader.
+  integer(c_int64_t), volatile, bind(c, name="fk_irq_spurious") :: &
+       fk_irq_spurious = 0_c_int64_t
 
   type(fk_idt_entry_t), target, save :: idt(0:FK_IDT_ENTRIES - 1)
 
@@ -127,6 +151,15 @@ module fk_idt_m
       integer(c_int32_t), intent(in), value :: vec
       integer(c_int64_t)                    :: addr
     end function fk_isr_stub
+
+    ! Entry point of the trampoline for 8259 line n.  boot/interrupts.S.  A
+    ! separate table from the exception one because it ends in IRETQ.
+    function fk_irq_stub(line) result(addr) bind(c, name="fk_irq_stub")
+      import :: c_int32_t, c_int64_t
+      implicit none
+      integer(c_int32_t), intent(in), value :: line
+      integer(c_int64_t)                    :: addr
+    end function fk_irq_stub
 
     subroutine idt_flush(desc) bind(c, name="idt_flush")
       import :: c_int16_t
@@ -207,17 +240,33 @@ contains
     idt(vec)%reserved = 0_c_int32_t
   end subroutine idt_clear_gate
 
+  ! Not present first and installed second, so "every vector this kernel does
+  ! not handle raises #GP rather than jumping to a zeroed offset" is true by
+  ! construction rather than by a range test somebody has to keep correct.
+  !
+  ! Where the IRQ block goes is fk_pic_m's decision, not this file's: the 8259
+  ! is what turns a line number into a vector, so the table follows the chip.
+  ! NOTHING HERE ENFORCES FK_PIC1_VECTOR >= FK_IDT_VECTORS, and the consequence
+  ! of breaking it is that the second loop overwrites exception gates with IRQ
+  ! trampolines -- which is the RIGHT thing for the table to do, because a chip
+  ! answering in the exception range is the defect and an IDT that disagreed
+  ! with it would only hide where the interrupts were going.  M10 is that case.
   subroutine idt_init() bind(c, name="idt_init")
     implicit none
     integer(c_int32_t) :: v
 
     do v = 0_c_int32_t, FK_IDT_ENTRIES - 1_c_int32_t
-       if (v < FK_IDT_VECTORS) then
-          call idt_set_gate(v, fk_isr_stub(v))
-       else
-          call idt_clear_gate(v)
-       end if
+       call idt_clear_gate(v)
     end do
+
+    do v = 0_c_int32_t, FK_IDT_VECTORS - 1_c_int32_t
+       call idt_set_gate(v, fk_isr_stub(v))
+    end do
+
+    do v = 0_c_int32_t, FK_PIC_LINES - 1_c_int32_t
+       call idt_set_gate(FK_PIC1_VECTOR + v, fk_irq_stub(v))
+    end do
+
     call idt_reload()
   end subroutine idt_init
 
@@ -316,5 +365,43 @@ contains
     call serial_print_string(FK_HALTED)
     call fk_cpu_halt()
   end subroutine isr_handler
+
+  ! The router.  Called by every IRQ trampoline in boot/interrupts.S with the
+  ! address of the frame it built, and unlike isr_handler it RETURNS -- into the
+  ! POP_GPRS/IRETQ tail, which is the instruction this project had never
+  ! executed before roadmap 3.2b.
+  !
+  ! regs%int_no is the 8259 LINE, 0-15, because that is what the stub pushed;
+  ! the vector it arrived on is FK_PIC1_VECTOR + line and no code here needs it.
+  subroutine irq_handler(regs) bind(c, name="irq_handler")
+    implicit none
+    type(fk_regs_t), intent(in) :: regs
+    integer(c_int32_t) :: line
+
+    line = int(regs%int_no, c_int32_t)
+
+    ! THE SPURIOUS CHECK COMES FIRST, and it is not defensive programming: the
+    ! chip did not set an in-service bit for a spurious interrupt, so the EOI at
+    ! the bottom of this routine would clear the bit belonging to whatever IS in
+    ! service and the interrupt that owns it never completes.  pic_isr() returns
+    ! the slave in bits 15:8 and the master in 7:0, so the bit to test is the
+    ! line number itself for both cases.
+    if (line == FK_IRQ_SPURIOUS_MASTER .or. line == FK_IRQ_SPURIOUS_SLAVE) then
+       if (.not. btest(pic_isr(), line)) then
+          fk_irq_spurious = fk_irq_spurious + 1_c_int64_t
+          ! A spurious SLAVE interrupt still reached the CPU through the
+          ! master's cascade line, and the master really is holding that bit.
+          if (line == FK_IRQ_SPURIOUS_SLAVE) call pic_eoi(FK_PIC_CASCADE)
+          return
+       end if
+    end if
+
+    if (line == FK_PIT_IRQ) call pit_tick(regs%rip, regs%rflags)
+
+    ! Last, and before the IRETQ rather than after it: the 8259 delivers nothing
+    ! further while it holds an in-service bit, so a missing EOI presents as
+    ! exactly one interrupt ever arriving.
+    call pic_eoi(line)
+  end subroutine irq_handler
 
 end module fk_idt_m

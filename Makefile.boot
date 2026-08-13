@@ -68,13 +68,19 @@ LDFLAGS_KERNEL := -nostdlib -z max-page-size=0x1000 -T linker.ld
 # failure then has to be untangled from. fk_serial is in the image for precisely
 # the reason the rule states: roadmap 2.1 made kernel_main CALL it, so it is
 # boot path now, not library. fk_gdt and fk_idt clear the same bar for roadmap
-# 3.1/3.2, fk_pmm for 3.4, and the next module to appear here has to clear it
-# too.
+# 3.1/3.2, fk_pmm for 3.4, fk_pit for 3.2b, and the next module to appear here
+# has to clear it too.
+#
+# fk_pic and fk_pit MOVED AHEAD of fk_idt at roadmap 3.2b and the move is the
+# semantic kind: fk_idt_m's IRQ router now USEs both -- fk_pic_m to acknowledge
+# the chip and fk_pit_m to service line 0 -- so their .mod files have to exist
+# before it compiles.
 FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/cpu/fk_gdt.f90 \
                src/cpu/fk_tss.f90 \
-               src/cpu/fk_idt.f90 \
                src/drivers/pic/fk_pic.f90 \
+               src/drivers/pit/fk_pit.f90 \
+               src/cpu/fk_idt.f90 \
                src/mm/fk_pmm.f90 \
                src/lib/fk_string.f90 \
                src/lib/fk_string_abi.f90 \

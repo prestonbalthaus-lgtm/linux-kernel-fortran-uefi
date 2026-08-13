@@ -31,7 +31,9 @@ Subcommands
     check     assert the sentinel contract against a 16-byte dump
     hwstate   assert the TASK REGISTER and the two 8259s against the device
               models, via 'info registers' and 'info pic'
-    selftest  prove both assertions PASS on synthetic good input and FAIL on
+    ticks     read fk_tick_count out of the running guest TWICE and assert it
+              advanced in between (roadmap 3.2b)
+    selftest  prove every assertion PASSES on synthetic good input and FAILS on
               every corrupted one -- no QEMU and no kernel required
 
 WHY hwstate EXISTS SEPARATELY FROM THE SERIAL GREP
@@ -42,6 +44,16 @@ because masking works whatever the vector base is -- and so is a task register
 loaded with the wrong selector, up until the #DF that needs it. QEMU's monitor
 reports what the i8259 and the CPU's hidden descriptor cache actually hold, so
 those two facts are asserted there and not on COM1.
+
+WHY ticks EXISTS SEPARATELY FROM EITHER
+
+The kernel prints a tick count it read itself, which proves an interrupt was
+taken and returned from at some point BEFORE that line was printed. It cannot
+prove the machine is still doing it, because a kernel that printed the line and
+then wedged looks identical on COM1. Two reads of the same guest memory, taken
+from outside while the guest runs, is the only form that assertion can take --
+and the counter has to be advancing under a CPU that is parked in HLT, which
+means an interrupt woke it, a handler ran, and IRETQ put it back to sleep.
 
 Stdlib only. Runs on the host; never inside the guest.
 """
@@ -71,6 +83,16 @@ TSS_SYMBOL = "fk_tss"               # bind(c), so the name survives gfortran
 DF_STACK_SYMBOL = "fk_df_stack"     # likewise; its st_size gives the IST1 top
 TSS_LIMIT = 0x67                    # 104 bytes - 1, the architectural minimum
 GDT_LIMIT = 0x27                    # 5 slots: null, code, data, TSS lo, TSS hi
+
+# roadmap 3.2b. bind(c) in src/drivers/pit/fk_pit.f90, so the name survives.
+TICK_SYMBOL = "fk_tick_count"
+TICK_BYTES = 8
+# The master's line 0 is open and every other line on both chips is masked.
+# NOT 0xFF any more, and the change is the milestone: before 3.2b this kernel
+# could not have survived an interrupt, so masking everything was the only safe
+# state. A master IMR of 0xFF now means the timer was never let through.
+MASTER_IMR = 0xFE
+SLAVE_IMR = 0xFF
 
 
 class QmpError(Exception):
@@ -355,7 +377,8 @@ PIC_RE = re.compile(r"^pic([01]):.*?\bimr=([0-9a-fA-F]{2})\b.*?"
 def check_hwstate(regs_text, pic_text, tss_vaddr, tss_bytes=None,
                   ist1_want=None,
                   tr_sel=0x18, tss_limit=TSS_LIMIT, gdt_limit=GDT_LIMIT,
-                  master=0x20, slave=0x28):
+                  master=0x20, slave=0x28,
+                  master_imr=MASTER_IMR, slave_imr=SLAVE_IMR):
     """Assert the CPU's and the 8259s' state. Returns [(ok, description)].
 
     Every check names the value it SAW, because a gate that only says which
@@ -424,7 +447,8 @@ def check_hwstate(regs_text, pic_text, tss_vaddr, tss_bytes=None,
 
     pics = {int(g[0]): (int(g[1], 16), int(g[2], 16))
             for g in PIC_RE.findall(pic_text)}
-    for idx, want_base, who in ((0, master, "master"), (1, slave, "slave")):
+    for idx, want_base, want_imr, who in ((0, master, master_imr, "master"),
+                                          (1, slave, slave_imr, "slave")):
         if idx not in pics:
             out.append((False, f"'info pic' printed no pic{idx} line at all"))
             continue
@@ -432,9 +456,24 @@ def check_hwstate(regs_text, pic_text, tss_vaddr, tss_bytes=None,
         out.append((base == want_base,
                     f"8259 {who} vector base is 0x{base:02X} "
                     f"(want 0x{want_base:02X})"))
-        out.append((imr == 0xFF,
-                    f"8259 {who} IMR is 0x{imr:02X} (want 0xFF: every legacy "
-                    f"IRQ masked)"))
+        out.append((imr == want_imr,
+                    f"8259 {who} IMR is 0x{imr:02X} (want 0x{want_imr:02X})"))
+    return out
+
+
+# roadmap 3.2b. Two reads of one 64-bit counter, taken while the guest runs.
+def check_ticks(first, second, min_delta=2):
+    """Assert the guest is STILL taking timer interrupts. [(ok, description)]."""
+    out = []
+    out.append((first > 0,
+                f"the guest had taken {first} timer interrupts when it was "
+                f"first read"))
+    # Not >= first: a counter that is merely not going backwards is what a
+    # wedged kernel produces too. The delta is the whole assertion.
+    out.append((second - first >= min_delta,
+                f"it took {second - first} more between the two reads "
+                f"(want >= {min_delta}) -- the CPU is still returning from "
+                f"them"))
     return out
 
 
@@ -507,6 +546,39 @@ def do_hwstate(sock_path, elf, timeout, quiet, **want):
     return 0
 
 
+def do_ticks(sock_path, elf, timeout, quiet, interval=0.25, min_delta=2):
+    _vaddr, paddr = symbol_phys_addr(elf, TICK_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-ticks.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+
+    def read_once(client):
+        client.pmemsave(paddr, TICK_BYTES, tmp.name)
+        raw = open(tmp.name, "rb").read()
+        if len(raw) != TICK_BYTES:
+            raise QmpError(f"pmemsave wrote {len(raw)} bytes, expected "
+                           f"{TICK_BYTES}")
+        return struct.unpack("<Q", raw)[0]
+
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    try:
+        client.handshake()
+        first = read_once(client)
+        # The guest keeps running through this: nothing here stops the CPU.
+        time.sleep(interval)
+        second = read_once(client)
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+    results = check_ticks(first, second, min_delta=min_delta)
+    if not report_hwstate(results, quiet):
+        print(f"        {TICK_SYMBOL} at guest physical 0x{paddr:X}: "
+              f"{first} then {second}, {interval}s apart")
+        return 1
+    return 0
+
+
 def do_quit(sock_path, timeout):
     client = QmpClient(sock_path, time.monotonic() + timeout)
     client.connect()
@@ -526,27 +598,32 @@ def synth(tag=FK_BOOT_TAG, magic=MB2_BOOTLOADER_MAGIC, mbi=0x00009500,
 
 
 # Real QEMU 10.2.2 output, copied from a run rather than composed: the good
-# text is from the patched kernel, and the two BAD pic values below are the
+# text is from the roadmap 3.2b image, and the two BAD pic values below are the
 # ones the SAME VM printed before roadmap 3.2.5 -- irq_base=08 is the master
 # colliding with the CPU exception range, imr=b8 is SeaBIOS's mask.
-HW_TSS_VADDR = 0xFFFFFFFF801081C0
+#
+# pic0's imr=fe is the 3.2b change, and it is the only line in this fixture
+# whose value is an ASSERTION rather than scenery: the master's line 0 is open
+# because the timer is running through it.
+HW_TSS_VADDR = 0xFFFFFFFF8010BDA0
 HW_REGS_OK = (
     "LDT=0000 0000000000000000 0000ffff 00008200 DPL=0 LDT\n"
-    "TR =0018 ffffffff801081c0 00000067 00008b00 DPL=0 TSS64-busy\n"
-    "GDT=     ffffffff80104020 00000027\n"
-    "IDT=     ffffffff80107160 00000fff\n"
+    "TR =0018 ffffffff8010bda0 00000067 00008b00 DPL=0 TSS64-busy\n"
+    "GDT=     ffffffff80107020 00000027\n"
+    "IDT=     ffffffff801080e0 00000fff\n"
 )
 HW_REGS_NO_TSS = (
     "TR =0000 0000000000000000 0000ffff 00008b00 DPL=0 TSS64-busy\n"
-    "GDT=     ffffffff80104020 00000027\n"
+    "GDT=     ffffffff80107020 00000027\n"
 )
 HW_PIC_OK = (
     "pic1: irr=00 imr=ff isr=00 hprio=0 irq_base=28 rr_sel=0 elcr=0c fnm=0\n"
-    "pic0: irr=01 imr=ff isr=00 hprio=0 irq_base=20 rr_sel=0 elcr=00 fnm=0\n"
+    "pic0: irr=00 imr=fe isr=00 hprio=0 irq_base=20 rr_sel=0 elcr=00 fnm=0\n"
 )
 # 104 bytes with IST1 at 0x24 and iomap_base 0x0068 at 0x66, as fk_tss.f90
-# builds it. The two bad variants below are exactly mutations M12 and M8.
-def _hw_tss(ist1=0xFFFFFFFF8010A240, iomap=0x68):
+# builds it; the IST1 value is fk_df_stack + its st_size in the same image.
+# The two bad variants below are exactly mutations M12 and M8.
+def _hw_tss(ist1=0xFFFFFFFF8010BDA0, iomap=0x68):
     b = bytearray(104)
     struct.pack_into("<Q", b, 0x24, ist1)
     struct.pack_into("<H", b, 0x66, iomap)
@@ -609,26 +686,48 @@ def do_selftest():
                   f"{'accept' if got else 'reject'}")
             fail_n += 1
 
+    # Every corrupted fixture below is built by substitution, and a substitution
+    # that matches NOTHING hands the assertion the GOOD text -- so the case
+    # passes, reports that a defect was rejected, and has tested nothing. That
+    # is not hypothetical: the TR-base case here went quiet the moment roadmap
+    # 3.2b added a module and moved fk_tss. Refuse instead.
+    def spoil(text, old, new):
+        if old not in text:
+            raise AssertionError(f"self-test fixture is stale: {old!r} is no "
+                                 f"longer in the monitor text it corrupts")
+        return text.replace(old, new)
+
     print("=== hardware-state assertion self-test (no QEMU, no kernel) ===")
     expect_hw(True, HW_REGS_OK, HW_PIC_OK,
-              "the real post-3.2.5 monitor output is accepted")
+              "the real roadmap 3.2b monitor output is accepted")
     expect_hw(False, HW_REGS_NO_TSS, HW_PIC_OK,
               "a null task register (LTR never ran) is rejected")
     expect_hw(False, HW_REGS_OK, HW_PIC_UNREMAPPED,
               "the 8259 state this VM boots with -- master on 0x08 -- is "
               "rejected")
     expect_hw(False, HW_REGS_OK,
-              HW_PIC_OK.replace("imr=ff isr=00 hprio=0 irq_base=20",
-                                "imr=00 isr=00 hprio=0 irq_base=20"),
+              spoil(HW_PIC_OK, "imr=fe isr=00 hprio=0 irq_base=20",
+                    "imr=00 isr=00 hprio=0 irq_base=20"),
               "a master that was remapped but never masked is rejected")
-    expect_hw(False, HW_REGS_OK.replace("ffffffff801081c0", "ffffffff80108000"),
+    # roadmap 3.2b's, and the direction is the opposite one: fully masked was
+    # the CORRECT state until this milestone, so a gate that still accepts it
+    # would pass a kernel whose timer interrupt can never be delivered.
+    expect_hw(False, HW_REGS_OK,
+              spoil(HW_PIC_OK, "imr=fe isr=00 hprio=0 irq_base=20",
+                    "imr=ff isr=00 hprio=0 irq_base=20"),
+              "a master with IRQ0 still masked -- the pre-3.2b state -- is "
+              "rejected")
+    expect_hw(False, HW_REGS_OK,
+              spoil(HW_PIC_OK, "pic1: irr=00 imr=ff", "pic1: irr=00 imr=fe"),
+              "a SLAVE with a line unmasked is rejected: nothing drives one")
+    expect_hw(False, spoil(HW_REGS_OK, "ffffffff8010bda0", "ffffffff80108000"),
               HW_PIC_OK,
               "a TR base that is not where fk_tss actually is, is rejected")
-    expect_hw(False, HW_REGS_OK.replace("00000067", "0000ffff"), HW_PIC_OK,
+    expect_hw(False, spoil(HW_REGS_OK, "00000067", "0000ffff"), HW_PIC_OK,
               "a TSS limit of 0xFFFF (a 16-bit descriptor) is rejected")
-    expect_hw(False, HW_REGS_OK.replace("00000027", "00000017"), HW_PIC_OK,
+    expect_hw(False, spoil(HW_REGS_OK, "00000027", "00000017"), HW_PIC_OK,
               "a GDT still only 3 slots long is rejected")
-    expect_hw(False, HW_REGS_OK.replace("TSS64-busy", "TSS64-avl"), HW_PIC_OK,
+    expect_hw(False, spoil(HW_REGS_OK, "TSS64-busy", "TSS64-avl"), HW_PIC_OK,
               "a descriptor LTR never marked busy is rejected")
     expect_hw(False, "", HW_PIC_OK,
               "monitor output with no TR line at all is rejected")
@@ -642,13 +741,39 @@ def do_selftest():
               tss=_hw_tss(ist1=0))
     expect_hw(True, HW_REGS_OK, HW_PIC_OK,
               "IST1 exactly at the top of the emergency stack is accepted",
-              tss=_hw_tss(ist1=0xFFFFFFFF8010A240), ist1_want=0xFFFFFFFF8010A240)
+              tss=_hw_tss(ist1=0xFFFFFFFF8010BDA0), ist1_want=0xFFFFFFFF8010BDA0)
     expect_hw(False, HW_REGS_OK, HW_PIC_OK,
               "IST1 at the BOTTOM of the emergency stack is rejected",
-              tss=_hw_tss(ist1=0xFFFFFFFF80108240), ist1_want=0xFFFFFFFF8010A240)
+              tss=_hw_tss(ist1=0xFFFFFFFF80109DA0), ist1_want=0xFFFFFFFF8010BDA0)
     expect_hw(False, HW_REGS_OK, HW_PIC_OK,
               "a short read of the TSS is rejected rather than ignored",
               tss=b"")
+
+    def expect_ticks(ok_wanted, first, second, what, **kw):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_ticks(first, second, **kw))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} -- assertion said "
+                  f"{'accept' if got else 'reject'}")
+            fail_n += 1
+
+    print("=== tick-advance assertion self-test (no QEMU, no kernel) ===")
+    expect_ticks(True, 41, 66, "a counter that grew between the two reads is "
+                 "accepted")
+    expect_ticks(False, 0, 0, "a counter that never moved off zero -- no "
+                 "interrupt ever arrived -- is rejected")
+    # The one this assertion exists for. A kernel that takes exactly one
+    # interrupt and never acknowledges the 8259 leaves a NON-ZERO counter that
+    # never grows again, which every console line in the boot is consistent
+    # with.
+    expect_ticks(False, 1, 1, "a non-zero counter that stopped growing -- one "
+                 "interrupt, then no EOI -- is rejected")
+    expect_ticks(False, 41, 42, "a single tick between reads is rejected at "
+                 "min_delta 2")
+    expect_ticks(False, 41, 12, "a counter that went BACKWARDS is rejected")
 
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
@@ -686,7 +811,17 @@ def main(argv=None):
     w.add_argument("--gdt-limit", type=lambda v: int(v, 0), default=GDT_LIMIT)
     w.add_argument("--master", type=lambda v: int(v, 0), default=0x20)
     w.add_argument("--slave", type=lambda v: int(v, 0), default=0x28)
+    w.add_argument("--master-imr", type=lambda v: int(v, 0), default=MASTER_IMR)
+    w.add_argument("--slave-imr", type=lambda v: int(v, 0), default=SLAVE_IMR)
     w.add_argument("--quiet", action="store_true")
+
+    t = sub.add_parser("ticks", help="assert the guest is still ticking")
+    t.add_argument("--qmp", required=True)
+    t.add_argument("--elf", required=True)
+    t.add_argument("--timeout", type=float, default=10.0)
+    t.add_argument("--interval", type=float, default=0.25)
+    t.add_argument("--min-delta", type=int, default=2)
+    t.add_argument("--quiet", action="store_true")
 
     sub.add_parser("selftest", help="prove the assertion can fail")
 
@@ -705,7 +840,11 @@ def main(argv=None):
             return do_hwstate(args.qmp, args.elf, args.timeout, args.quiet,
                               tr_sel=args.tr_sel, tss_limit=args.tss_limit,
                               gdt_limit=args.gdt_limit, master=args.master,
-                              slave=args.slave)
+                              slave=args.slave, master_imr=args.master_imr,
+                              slave_imr=args.slave_imr)
+        if args.cmd == "ticks":
+            return do_ticks(args.qmp, args.elf, args.timeout, args.quiet,
+                            interval=args.interval, min_delta=args.min_delta)
         if args.cmd == "quit":
             return do_quit(args.qmp, args.timeout)
         if args.cmd == "check":
