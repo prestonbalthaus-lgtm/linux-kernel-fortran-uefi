@@ -81,9 +81,10 @@ OUTPUT_ARCH(i386:x86-64)
  */
 ENTRY(_start)
 
-KERNEL_VMA      = 0xFFFFFFFF80000000;
-KERNEL_LMA      = 0x0000000000100000;
-BOOT_STACK_SIZE = 0x4000;              /* 16 KiB, 16-byte aligned per SysV */
+KERNEL_VMA       = 0xFFFFFFFF80000000;
+KERNEL_LMA       = 0x0000000000100000;
+BOOT_STACK_SIZE  = 0x4000;             /* 16 KiB, 16-byte aligned per SysV */
+BOOT_STACK_GUARD = 0x1000;             /* one page, deliberately unmapped   */
 
 PHDRS
 {
@@ -160,7 +161,20 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
 
-        . = ALIGN(16);
+        /*
+         * THE GUARD PAGE (roadmap 3.5) IS RESERVED HERE AND NOT CARVED OUT OF
+         * A NEIGHBOUR, because it has no neighbour to spare: the PMM's 2 MiB
+         * bitmap is the object immediately below the boot stack with ZERO
+         * bytes of slack, so unmapping "the page below the stack" without this
+         * hole would punch a hole in the allocator's own bitmap instead.
+         *
+         * ALIGN(4096) rather than ALIGN(16): a guard page that shares a page
+         * frame with live data cannot be unmapped, and one that leaves the
+         * stack unaligned puts the first stack page partly in the guard.
+         */
+        . = ALIGN(4096);
+        __boot_stack_guard = .;
+        . += BOOT_STACK_GUARD;
         __boot_stack_bottom = .;
         . += BOOT_STACK_SIZE;
         __boot_stack_top = .;      /* stack grows DOWN from here */
@@ -241,6 +255,13 @@ ASSERT((__data_start   & 0xFFF) == 0, ".data is not 4 KiB aligned")
 ASSERT((__bss_start    & 0xFFF) == 0, ".bss is not 4 KiB aligned")
 ASSERT(__boot_stack_top - __boot_stack_bottom == BOOT_STACK_SIZE,
        "boot stack was resized without updating BOOT_STACK_SIZE")
+ASSERT((__boot_stack_guard & 0xFFF) == 0,
+       "the guard page must be a page frame of its own, or it cannot be unmapped")
+ASSERT(__boot_stack_bottom - __boot_stack_guard == BOOT_STACK_GUARD,
+       "something was allocated between the guard page and the boot stack")
+ASSERT((__boot_stack_bottom & 0xFFF) == 0,
+       "the boot stack must start on a page boundary: its first page is the \
+one the guard protects, and a misaligned stack shares that frame with the guard")
 ASSERT((__bss_end - __bss_start) % 8 == 0,
        "bss size must be a multiple of 8: boot.S clears it with rep stosq")
 ASSERT((__bootpt_start & 0xFFF) == 0,
