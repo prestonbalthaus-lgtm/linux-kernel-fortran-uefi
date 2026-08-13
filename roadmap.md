@@ -315,9 +315,145 @@ The most critical mathematical and structural phase. Setting up the brain of the
         faulting stack. No 8259 remap, so the IRQ vectors still collide with the
         exception range and interrupts stay masked.
 
+        BOTH OF THOSE ARE NOW CLOSED BY 3.2.5 BELOW.
+
+  *  [x] 3.2.5 TSS, IST and PIC pacification (the hardware safety patch)
+
+        Validation: a #DF raised by a deliberately smashed RSP is delivered on a
+        known-good stack and prints a Fortran panic, and the legacy 8259s answer
+        on 0x20/0x28 with every line masked.
+
+        DONE, and both halves were read back out of the DEVICE MODELS rather than
+        believed from the console. On COM1:
+
+            Fortran Kernel: TSS loaded, IST1 armed for #DF.
+            Fortran Kernel: 8259 PIC remapped to 0x20/0x28, all IRQs masked.
+            Fortran Kernel: smashing RSP to force a #DF (roadmap 3.2.5).
+
+            *** FORTRAN KERNEL PANIC ***
+            EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault
+            *** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***
+            RIP     = 0xFFFFFFFF8010123B
+            RSP     = 0x0000400000000000
+            FRAME   = 0xFFFFFFFF80108110
+            ...
+            *** HALTED -- CLI/HLT ***
+
+        Read those three numbers together, because separately none of them proves
+        anything. RIP is the PUSH in `boot/faultgen.S`. RSP is the pointer that
+        push was made through -- the smashed one, so the fault really did happen
+        on a stack that could not take a frame. FRAME is where the frame ACTUALLY
+        landed. `fk_df_stack` is 8192 bytes at 0xFFFFFFFF801061C0, so its
+        exclusive top is 0xFFFFFFFF801081C0, and 0x801081C0 - 0x80108110 = 176 --
+        one 22-quadword frame, the exact size `boot/interrupts.S` builds. The CPU
+        loaded RSP from IST1 and pushed once. It switched stacks.
+
+        The register dump cannot show this on its own, which is why the FRAME line
+        was added: `regs%rsp` is the RSP the fault happened WITH, so on a #DF it is
+        always the broken one. The address of the frame is the only thing that
+        says which stack the handler is standing on.
+
+        `fk_tss` happens to sit at 0xFFFFFFFF801081C0 -- immediately above the
+        stack, so the stack's exclusive top IS the TSS's address. That is safe
+        because the CPU decrements RSP before it writes, so the first byte stored
+        is at top-8; it is recorded because an inclusive top would corrupt the TSS
+        with the frame of the fault it is there to handle.
+
+        And from QEMU's monitor, which reports silicon state and not the kernel's
+        opinion of it:
+
+            TR =0018 ffffffff801081c0 00000067 00008b00 DPL=0 TSS64-busy
+            GDT=     ffffffff80104020 00000027
+            pic0: irr=01 imr=ff isr=00 hprio=0 irq_base=20 rr_sel=0 elcr=00 fnm=0
+            pic1: irr=00 imr=ff isr=00 hprio=0 irq_base=28 rr_sel=0 elcr=0c fnm=0
+
+        0xffffffff801081c0 is the address of `fk_tss` in the ELF; 0x67 is 104-1;
+        type 0xB is BUSY, which only LTR sets. Before this milestone the same VM
+        printed `TR =0000`, `GDT= ... 00000017`, and -- the reason this box exists
+        -- `pic0: ... irq_base=08`. The master really was answering in the CPU
+        exception range, so a spurious IRQ0 would have arrived as vector 8 and the
+        panic handler would have reported a #DF that never happened.
+
+        `src/cpu/fk_tss.f90` -- the TSS, an 8 KiB emergency stack in .bss, the
+        16-byte descriptor, LTR. THE ONE THING THAT IS NOT A TEXTBOOK STRUCT: the
+        TSS is a `bind(c)` type of 25 32-BIT fields and a closing pair of 16-bit
+        ones, not one field per architectural quadword. RSP0 sits at offset 4, and bind(c) means C struct
+        rules, so a `c_int64_t` declared there is aligned up to offset 8 -- which
+        moves IST1 from 0x24 to 0x28 and every field after it. Measured on
+        gfortran 16.1.1 before a line was written, not assumed. `tools/
+        linkscript-test.sh` reads the size back out of the linked image and fails
+        at anything but 104 bytes, and mutation M13 confirms it catches the
+        widening.
+
+        This is the same trap `fk_gdt_m`'s pseudo-descriptor comment describes,
+        arrived at from the other direction: there the answer was an array of an
+        intrinsic type, here it is a struct with nothing left to pad.
+
+        The GDT grew from three slots to five, because a TSS descriptor in 64-bit
+        mode is SIXTEEN bytes -- `FK_GDT_TSS_SLOT` is derived from the selector so
+        the two cannot drift. `boot/gdt_flush.S` gained `tss_flush`; the IST index
+        lives in `fk_tss_m` and `fk_idt_m` asks for it by name, so the slot the TSS
+        fills in and the slot the #DF gate selects are one decision.
+
+        `src/drivers/pic/fk_pic.f90` -- ICW1..ICW4, master 0x20, slave 0x28, then
+        0xFF into both data ports, then a READBACK: once the ICW sequence has
+        completed the data port reads the IMR, so the kernel's "all IRQs masked"
+        line is the chip's answer rather than the driver's intention.
+
+        `boot/faultgen.S` -- `fk_smash_stack`. 0x0000400000000000 is canonical and
+        mapped by nothing, so the push takes a #PF and the CPU's attempt to push
+        the #PF frame on the same broken RSP is the second fault. CR2 read back
+        0x00003ffffffffff8 afterwards, which is that push's target address.
+
+        WHAT THIS COST: nothing, on the first boot -- which is worth recording
+        only because the two traps that made 3.2 expensive were both looked for in
+        advance this time. The struct layout was measured before the module was
+        written, and the fault trigger is assembly precisely so no optimiser can
+        fold it away the way it folded `1/x`.
+
+        WHAT IT DOES NOT PROVE. IST1 only; ist2..ist7 are zero and no other vector
+        asks for one, so NMI and #MC still arrive on the faulting stack -- fine
+        while nothing raises them, and 3.3's problem the moment the APIC is live.
+        There is no guard page below the emergency stack; that needs the VMM at
+        3.5, and until then a runaway panic handler walks into whatever .bss put
+        underneath.
+
+        AND THE SHARPER VERSION OF THAT, found by review rather than by a gate:
+        `fk_tss` ends at 0xFFFFFFFF80108228 and `__boot_stack_bottom` is
+        0xFFFFFFFF80108230 -- EIGHT BYTES above it. linker.ld lays the Fortran
+        .bss objects down first and reserves the 16 KiB boot stack after them, so
+        the stack grows DOWN towards the TSS. A boot-stack overflow therefore
+        destroys the TSS, IST1 included, BEFORE the #DF that would have used it.
+        Nothing recurses today and 16 KiB is a long way, so this is a bound and
+        not a live bug -- but it is the specific way this milestone's safety net
+        fails, and it is the one thing 3.5 must fix before anything deepens the
+        call stack. `tools/linkscript-test.sh` prints the neighbour and the slack
+        on every run rather than asserting a link order. And the ONE boot exercises one IST index on one vector: see
+        `docs/HARNESS-VALIDATION-PHASE3.md` for the mutation table, including the
+        defects that got past it.
+
+        A NOTE ON THE COMMITTED IMAGE. `kernel_main` raises exactly one deliberate
+        fault, chosen by the `FK_FAULT_MODE` PARAMETER. 8 (#DF) is the default and
+        the milestone. 0 (#DE) is NOT redundant: #DF carries a CPU error code and
+        so only ever reaches the `ISR_ERR` half of `boot/interrupts.S`, leaving the
+        dummy-push half that 3.2's M1 mutation targets unexercised. Both gates are
+        driven from `tools/mutate-phase3.sh`, which rebuilds for each.
+
   *  [ ] 3.3 Advanced Programmable Interrupt Controller (APIC)
 
         Validation: Legacy 8259 PIC is disabled. Local APIC is mapped and active.
+
+        HALF DONE by 3.2.5. The legacy 8259s are remapped clear of the exception
+        range and fully masked, which is the "disabled" half and is asserted from
+        the device model (`pic0/pic1: imr=ff irq_base=20/28`). Masking is not the
+        same as the ICW3-less shutdown a system with a working IOAPIC does, and
+        that is deliberate: it is reversible, and nothing yet exists to take the
+        interrupts instead.
+
+        The MISSING half is the Local APIC: it is not mapped, its spurious-vector
+        register is untouched, and `info lapic` still shows LVT0 as ExtINT. That
+        needs the MADT (4.1) to find the APIC base, and an IST for NMI before any
+        of it is safe to unmask.
 
   *  [ ] 3.4 Physical Memory Manager (PMM)
 

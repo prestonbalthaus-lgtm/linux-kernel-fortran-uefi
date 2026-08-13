@@ -6,6 +6,7 @@ module fk_idt_m
   use, intrinsic :: iso_c_binding, only: c_int8_t, c_int16_t, c_int32_t, &
                                          c_int64_t, c_char, c_null_char, c_loc
   use fk_gdt_m,    only: FK_GDT_SEL_CODE
+  use fk_tss_m,    only: FK_TSS_IST_DF, tss_on_df_stack
   use fk_serial_m, only: serial_print_byte, serial_print_string
   implicit none
   private
@@ -41,9 +42,13 @@ module fk_idt_m
   ! a device interrupt while the panic handler is talking to the UART.
   integer(c_int8_t), parameter :: FK_IDT_ATTR_INTR = int(z'8E', c_int8_t)
 
-  ! IST 0 keeps the faulting stack.  A dedicated stack for #DF needs a TSS,
-  ! which is roadmap 3.3 work.
+  ! IST 0 keeps the faulting stack, which is right for every vector but one.
   integer(c_int8_t), parameter :: FK_IDT_IST_NONE = 0_c_int8_t
+
+  ! #DF is the fault whose cause may be that the stack is unusable, so it is
+  ! the one exception that must not be delivered on it.  fk_tss_m owns which
+  ! IST slot that is; this is only the vector that asks for it.
+  integer(c_int32_t), parameter :: FK_VEC_DF = 8_c_int32_t
 
   type(fk_idt_entry_t), target, save :: idt(0:FK_IDT_ENTRIES - 1)
 
@@ -65,6 +70,14 @@ module fk_idt_m
   character(kind=c_char, len=*), parameter :: FK_NL     = FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_HALTED = &
        "*** HALTED -- CLI/HLT ***" // FK_CRLF // c_null_char
+  ! The #DF verdict, printed before the register dump because it is the one
+  ! fact a panic on a broken stack may not survive long enough to reach.
+  character(kind=c_char, len=*), parameter :: FK_DF_IST = &
+       "*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***" // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_DF_NO_IST = &
+       "*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***" // &
+       FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_UNKNOWN = &
        "Unknown Exception" // c_null_char
 
@@ -159,7 +172,11 @@ contains
 
     idt(vec)%off_lo   = u16(handler)
     idt(vec)%sel      = FK_GDT_SEL_CODE
-    idt(vec)%ist      = FK_IDT_IST_NONE
+    if (vec == FK_VEC_DF) then
+       idt(vec)%ist   = int(FK_TSS_IST_DF, c_int8_t)
+    else
+       idt(vec)%ist   = FK_IDT_IST_NONE
+    end if
     idt(vec)%attr     = FK_IDT_ATTR_INTR
     idt(vec)%off_mid  = u16(ishft(handler, -16))
     idt(vec)%off_hi   = u32(ishft(handler, -32))
@@ -240,7 +257,12 @@ contains
   ! address of the register frame it just built.  Does not return.
   subroutine isr_handler(regs) bind(c, name="isr_handler")
     implicit none
-    type(fk_regs_t), intent(in) :: regs
+    type(fk_regs_t), intent(in), target :: regs
+    integer(c_int64_t) :: frame
+
+    ! Where the frame itself sits, i.e. which stack this handler is running on.
+    ! regs%rsp cannot answer that: it is the RSP the fault happened WITH.
+    frame = transfer(c_loc(regs), 0_c_int64_t)
 
     call serial_print_string(FK_PANIC_HDR)
 
@@ -256,11 +278,20 @@ contains
     end if
     call serial_print_string(FK_NL)
 
+    if (regs%int_no == int(FK_VEC_DF, c_int64_t)) then
+       if (tss_on_df_stack(frame) /= 0_c_int32_t) then
+          call serial_print_string(FK_DF_IST)
+       else
+          call serial_print_string(FK_DF_NO_IST)
+       end if
+    end if
+
     call print_reg("RIP    ", regs%rip)
     call print_reg("CS     ", regs%cs)
     call print_reg("RFLAGS ", regs%rflags)
     call print_reg("RSP    ", regs%rsp)
     call print_reg("SS     ", regs%ss)
+    call print_reg("FRAME  ", frame)
 
     call print_reg("RAX    ", regs%rax)
     call print_reg("RBX    ", regs%rbx)

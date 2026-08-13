@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * boot/gdt_flush.S -- load the GDT built by src/cpu/fk_gdt.f90.
+ * boot/gdt_flush.S -- load the descriptor tables built in src/cpu/.
  *
  *     void gdt_flush(const void *desc, uint16_t code_sel, uint16_t data_sel);
  *     desc RDI, code_sel SI, data_sel DX
+ *     void tss_flush(uint16_t sel);                          sel DI
  */
 
 	.section .text, "ax", @progbits
@@ -34,5 +35,19 @@ gdt_flush:
 	movw	%ax, %ss
 	ret
 	.size gdt_flush, . - gdt_flush
+
+/*
+ * LTR.  Requires the GDT already loaded and the 16-byte TSS descriptor already
+ * written -- and it MARKS that descriptor BUSY, so running it twice on one TSS
+ * raises #GP rather than reloading anything.
+ */
+	.section .text, "ax", @progbits
+	.code64
+	.globl tss_flush
+	.type tss_flush, @function
+tss_flush:
+	ltr	%di
+	ret
+	.size tss_flush, . - tss_flush
 
 	.section .note.GNU-stack, "", @progbits

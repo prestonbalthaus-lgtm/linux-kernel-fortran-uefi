@@ -8,10 +8,18 @@ module fk_gdt_m
   use, intrinsic :: iso_c_binding, only: c_int16_t, c_int32_t, c_int64_t, c_loc
   implicit none
   private
-  public :: FK_GDT_SEL_CODE, FK_GDT_SEL_DATA, gdt_init
+  public :: FK_GDT_SEL_CODE, FK_GDT_SEL_DATA, FK_GDT_SEL_TSS, gdt_init, &
+            gdt_set_tss
 
   integer(c_int16_t), parameter :: FK_GDT_SEL_CODE = int(z'08', c_int16_t)
   integer(c_int16_t), parameter :: FK_GDT_SEL_DATA = int(z'10', c_int16_t)
+  integer(c_int16_t), parameter :: FK_GDT_SEL_TSS  = int(z'18', c_int16_t)
+
+  ! A TSS descriptor is SIXTEEN bytes in 64-bit mode, not eight: it eats the
+  ! slot the selector names and the one after it.  The slot index is derived
+  ! from the selector rather than written down twice.
+  integer(c_int32_t), parameter :: FK_GDT_TSS_SLOT = &
+       int(FK_GDT_SEL_TSS, c_int32_t) / 8 + 1
 
   ! Access 0x9A = P|S|code|read, flags 0xA = G|L.  The L bit is the whole point
   ! of the code descriptor; D/B must be 0 whenever it is set.  Access 0x92 =
@@ -22,7 +30,8 @@ module fk_gdt_m
   integer(c_int64_t), parameter :: FK_GDT_DATA = int(z'00CF92000000FFFF', c_int64_t)
 
   integer(c_int64_t), target, save :: &
-       gdt(3) = [FK_GDT_NULL, FK_GDT_CODE, FK_GDT_DATA]
+       gdt(5) = [FK_GDT_NULL, FK_GDT_CODE, FK_GDT_DATA, &
+                 0_c_int64_t, 0_c_int64_t]
 
   ! LGDT reads a PACKED 16-bit limit followed by a 64-bit base.  A bind(c)
   ! derived type cannot express that -- C struct rules pad the base out to
@@ -69,5 +78,16 @@ contains
 
     call gdt_flush(gdtr, FK_GDT_SEL_CODE, FK_GDT_SEL_DATA)
   end subroutine gdt_init
+
+  ! The two quadwords of the TSS descriptor, built by fk_tss_m because only it
+  ! knows where the TSS is.  Safe to run after LGDT: the CPU re-reads the table
+  ! on every descriptor load, and nothing has loaded FK_GDT_SEL_TSS yet.
+  subroutine gdt_set_tss(lo, hi) bind(c, name="gdt_set_tss")
+    implicit none
+    integer(c_int64_t), intent(in), value :: lo, hi
+
+    gdt(FK_GDT_TSS_SLOT)     = lo
+    gdt(FK_GDT_TSS_SLOT + 1) = hi
+  end subroutine gdt_set_tss
 
 end module fk_gdt_m
