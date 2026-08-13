@@ -59,10 +59,43 @@ Fortran Kernel: PMM reclaim FAILED.
 Fortran Kernel: PMM guard FAILED.
 Fortran Kernel: PMM cursor rewind FAILED.'
 
+# roadmap 3.5 and 1.2b, on the same terms. Three of these are worth reading
+# twice because they are not verdicts the kernel awards itself:
+#
+#   "[0x100000] = 0x00000000E85250D6" is a LOAD from physical 1 MiB performed
+#   after CR3 was pointed at the VMM's own hierarchy, and the value is this
+#   image's Multiboot2 header magic. It proves the new tables carried the
+#   identity window, and that the read landed on this kernel rather than
+#   anywhere else -- which the "identity window is dead" line immediately
+#   below it then takes away.
+#
+#   " R-X" and the REJECTED "RWX" are the W^X property, asserted on the
+#   PERMISSION COLUMN OF THE LIVE TABLES rather than on the ELF's segment
+#   flags. They survive a relayout: no address appears in either pattern.
+#   linkscript-test.sh asks the same question of the image; this asks it of
+#   the page tables the CPU is actually walking, and those are different
+#   facts -- an image with RE/R/RW segments can still be mapped writable.
+FK_VMM_PASS_LINES=$'Fortran Kernel: VMM has EFER.NXE and CR0.WP, so the permissions bite.
+Fortran Kernel: VMM mapped every kernel page with the asked-for permission.
+Fortran Kernel: VMM left the stack guard page unmapped.
+Fortran Kernel: identity window still live, [0x100000] = 0x00000000E85250D6
+Fortran Kernel: PML4[0] unmapped; the identity window is dead.
+Fortran Kernel: VMM mapped a frame above 4 GiB and read back what it wrote.
+ R-X'
+FK_VMM_FAIL_LINES=$'Fortran Kernel: VMM init FAILED, status 0x
+Fortran Kernel: VMM could not enable NX; .rodata is not no-execute.
+Fortran Kernel: VMM section permissions are WRONG, pages 0x
+Fortran Kernel: VMM guard page is MAPPED.
+Fortran Kernel: PML4[0] is STILL MAPPED.
+Fortran Kernel: VMM high-frame mapping FAILED.
+RWX'
+
 EXPECT_SERIAL="${FK_EXPECT_SERIAL:-Fortran Kernel: UART Serial Initialized.
-$FK_PMM_PASS_LINES}"
+$FK_PMM_PASS_LINES
+$FK_VMM_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
-$FK_PMM_FAIL_LINES}"
+$FK_PMM_FAIL_LINES
+$FK_VMM_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a
@@ -96,7 +129,7 @@ say()  { printf '%s\n' "$*"; }
 [[ -r "$SENTINEL" ]] || { say "FAIL: missing $SENTINEL -- the assertion lives there"; exit 1; }
 
 rule
-say "PROJECT FORTRAN-KERNEL :: BOOT GATE (roadmap 1.2 + 2.1 + 3.4)"
+say "PROJECT FORTRAN-KERNEL :: BOOT GATE (roadmap 1.2 + 1.2b + 2.1 + 3.4 + 3.5)"
 rule
 
 if [[ "$MODE" == gate ]]; then
