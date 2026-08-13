@@ -1,4 +1,47 @@
 
+# PROPOSED NEXT MILESTONE -- AWAITING LEAD ARCHITECT APPROVAL
+
+Written 2026-08-13, after 1.3 / 3.5 / 1.2b landed (PR #7). Nothing below has been
+started. This block is a proposal to be argued with, not a plan of record; delete
+it once the decision is made.
+
+**Recommendation: 3.2b, "interrupts that return", before anything else.**
+
+The reason is one grep:
+
+    $ grep -rn "iretq\|iret" boot/ src/
+    NO iretq ANYWHERE IN THE TREE
+
+Every boot this project has ever taken ends in a deliberate panic, and the IDT has
+never been asked to do the other thing. It is the smallest item on the list and the
+only one everything in Phases 4 through 7 stands on. 3.2.5 already remapped and
+masked the 8259s, so the PIT is one IMR write away. Full reasoning in the 3.2b box.
+
+**Then, in order, with what each is really waiting on:**
+
+| # | milestone | why now | really blocked on |
+|---|---|---|---|
+| 3.2b | interrupts that return | nothing can be built on a kernel whose only end state is halted | nothing -- 3.2.5 did the setup |
+| 2.2 + 2.4 | framebuffer, and the first pixels | the milestone 3.5 explicitly unblocked; 2.4 is verified to 248853 checks and has never drawn a pixel | PAT / write-combining, which `fk_vmm_m` has no flags for yet |
+| 3.6 | kernel heap | 4.1, 4.2, 6.1 and 6.4 each otherwise grow a fixed array with a ceiling | nothing |
+| 0.3 | OVMF / the UEFI path | the target hardware is UEFI and NOTHING here has ever booted that way | a decision -- the PMM parses Multiboot2 tags only and needs a second front end |
+
+3.2b and 2.2 touch almost disjoint files -- `boot/interrupts.S` + `fk_idt.f90` + a
+PIT driver, versus `boot/boot.S`'s header tag + `fk_vmm_m`'s flags + the existing
+renderer -- so they parallelise the way 1.3 and 3.5 did.
+
+**The one I want a decision on rather than a preference: 0.3.** It is the largest
+unknown in the project, and the cost is not just a second entry stub -- see the
+note added to that box.
+
+**Corrections made to this file in the same pass**, all of them things that were
+stated here and are no longer true: 1.1's string debt is now half paid; 1.4's
+validation text is already satisfied; 2.2's above-4-GiB hazard was removed by 3.5
+and replaced by a narrower one; 3.3's "needs the MADT to find the APIC base" is
+wrong for the BSP's own LAPIC.
+
+---
+
 ## 🏗️ Phase 0: Project Initialization & Toolchain
 
 Before any Fortran is written, the autonomous build environment must be established.
@@ -53,6 +96,16 @@ Before any Fortran is written, the autonomous build environment must be establis
         different first stage (linker.ld's header describes it) and is not exercised by
         anything yet. Do not read the current PASS as evidence about UEFI.
 
+        AND THE COST IS NOT ONLY A SECOND ENTRY STUB, which is the part that is easy to
+        underestimate. `src/mm/fk_pmm.f90` parses MULTIBOOT2 TAGS and nothing else: it
+        walks the tag list for type 6, validates the entry size, and refuses an MBI
+        outside the identity window. A UEFI first stage has no tag list -- it hands over
+        the array of EFI_MEMORY_DESCRIPTORs that `GetMemoryMap` returned, with different
+        type codes and a runtime-supplied descriptor stride. So the PMM needs a SECOND
+        front end feeding the same bitmap, and every milestone built on the current one
+        inherits that fork. Deciding when to pay it is a Lead Architect call; discovering
+        it at 5.3 would be the expensive version.
+
 ## ⚙️ Phase 1: The Boot Layer & Bare-Metal Runtime
 
 Bypassing Fortran's reliance on the OS and successfully handing control from UEFI to the Fortran entry point.
@@ -61,14 +114,21 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
 
         Validation: String manipulation and math modules exist without libgfortran.
 
-        CAUTION -- THIS BOX IS OVER-TICKED. Only the MATH half was delivered:
-        `src/lib/math/` has 7 modules plus `src/lib/fk_bcd.f90`. There are ZERO string
-        handlers -- no strlen, strcpy, memcmp, memcpy. `docs/AUDIT-PHASE1.md` flagged this
-        already: "Phase 1 delivered no string handlers ... any Phase 2 planning that
-        assumes lib/string.c is already translated is working from a wrong inventory."
-        Anything downstream needing string ops (the ELF loader at 6.4, VFS paths at 6.1)
-        must translate lib/string.c first. Note 1.3 below needs memcpy/memset anyway, so
-        that is where the debt gets paid.
+        CAUTION -- THIS BOX IS OVER-TICKED, and it is now HALF paid rather than
+        unpaid. Only the MATH half was ever delivered: `src/lib/math/` has 7 modules plus
+        `src/lib/fk_bcd.f90`. `docs/AUDIT-PHASE1.md` flagged the rest already: "Phase 1
+        delivered no string handlers ... any Phase 2 planning that assumes lib/string.c is
+        already translated is working from a wrong inventory."
+
+        PAID BY 1.3 (2026-08-13): the four MEMORY intrinsics -- memset, memcpy, memmove
+        and memcmp -- are translated from vendor `lib/string.c` and diffed against it.
+
+        STILL OWED: the STRING half. There is no strlen, strcpy, strcmp or strncmp in the
+        tree. ACPI signature matching at 4.1 can use the memcmp that now exists, so this
+        does not block Phase 4; the VFS paths at 6.1 and the ELF loader at 6.4 cannot, and
+        it does block those. `mk/string.mk` and `tests/shims/string/` already select
+        functions out of the vendor file with its own `__HAVE_ARCH_*` guards, so adding a
+        handler is now a fragment edit and a Fortran module, not a new harness.
 
   *  [ ] 1.2 Multiboot2 / EFI Assembly Stub  (Multiboot2 half only)
 
@@ -171,6 +231,24 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
 
         Validation: A Fortran subroutine exists to halt the CPU (hlt) safely when an unrecoverable error occurs.
 
+        THIS BOX'S VALIDATION TEXT IS ALREADY SATISFIED, and has been since 3.2 --
+        left unticked deliberately, because closing a box is the Lead Architect's
+        call and this one was satisfied incidentally rather than worked on.
+        `fk_cpu_halt` (boot/boot.S) is the CLI/HLT park, `isr_handler`
+        (src/cpu/fk_idt.f90) is the Fortran subroutine that reaches it, and the
+        register dump it prints on the way has been quoted from a running CPU at
+        3.2, 3.2.5, 3.4 and 3.5.
+
+        WHAT IS ACTUALLY MISSING, if the box is meant to mean more than its
+        wording: there is no general `panic(message)` any Fortran caller can
+        reach. Today the only route into the dump is a CPU exception, and
+        software conditions have to BORROW one -- roadmap 3.4's out-of-memory
+        path raises INT3 through `boot/faultgen.S` to get a register dump at all.
+        That works and is honest about where the registers came from, but it
+        means a subsystem cannot report "this is unrecoverable and here is why"
+        without inventing a fault. Rewording the box to ask for that, or ticking
+        it as written, are both reasonable; it should not stay ambiguous.
+
 ## 🖥️ Phase 2: Modern Display & Debugging
 
 The Minisforum has no legacy VGA text mode. The kernel must render its own pixels via UEFI GOP.
@@ -248,13 +326,27 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
         routinely outside the 1 GiB the boot stub identity-maps. boot/boot.S carries the
         exact tag to add and the mapping work that must land with it.
 
-        HAZARD FOR WHOEVER DOES 1.2: the GOP framebuffer is a PCI BAR that on modern
-        hardware sits ABOVE 4 GiB, while a bootloader identity map usually covers only the
-        low 1-4 GiB. Passing the firmware's reported address straight to
-        `vga_init_framebuffer` will page-fault with no IDT (3.2) installed -> double ->
-        triple fault -> silent reboot, which reads as "the kernel crashed" but is purely
-        an unmapped address. The stub must map the framebuffer range explicitly, and after
-        3.5 the VMM must hand over the VIRTUAL address with write-combining attributes.
+        HAZARD FOR WHOEVER DID 1.2, AND IT IS NOW SUPERSEDED: the GOP framebuffer is a
+        PCI BAR that on modern hardware sits ABOVE 4 GiB, while a bootloader identity map
+        usually covers only the low 1-4 GiB. Passing the firmware's reported address
+        straight to `vga_init_framebuffer` used to page-fault with no IDT (3.2) installed
+        -> double -> triple fault -> silent reboot, which reads as "the kernel crashed"
+        but is purely an unmapped address.
+
+        3.5 REMOVED THAT BLOCKER AND REPLACED IT WITH A NARROWER ONE. `vmm_map_page` will
+        map an arbitrary physical address anywhere in the canonical space, so a BAR above
+        4 GiB is no longer special. But the VMM's LINEAR MAP stops at the top of the RAM
+        the loader reported, so a BAR above that is in NO window and reaching for it
+        through `FK_VMM_PHYSMAP + phys` is the new version of the same silent fault. The
+        framebuffer must be mapped explicitly with `vmm_map_page`, at a virtual address
+        this kernel chooses, and never assumed to be in the linear map.
+
+        AND THE ATTRIBUTES ARE NOT OPTIONAL. A framebuffer mapped write-back is correct
+        but unusably slow -- every glyph is a read-modify-write of a cache line that is
+        never read. This wants write-combining, which means PAT rather than the
+        PCD/PWT pair alone, and `fk_vmm_m` currently defines neither: FK_PTE_PWT and
+        FK_PTE_PCD are not among its exported flags and nothing programs the PAT MSR.
+        That is the real work item hiding inside this box.
 
   *  [x] 2.3 Bitmap Font System
 
@@ -506,6 +598,67 @@ The most critical mathematical and structural phase. Setting up the brain of the
         dummy-push half that 3.2's M1 mutation targets unexercised. Both gates are
         driven from `tools/mutate-phase3.sh`, which rebuilds for each.
 
+  *  [ ] 3.2b Interrupts that RETURN (the deferred half of 3.2)
+
+        Validation: the CPU takes a hardware interrupt, a Fortran handler runs, and
+        execution RESUMES at the instruction that was interrupted. A tick counter
+        advances while the kernel keeps running.
+
+        NOT STARTED, and it is not a refinement -- it is a hole. Found by reading
+        the tree rather than by a gate, 2026-08-13:
+
+            $ grep -rn "iretq\|iret" boot/ src/
+            NO iretq ANYWHERE IN THE TREE
+
+        `boot/interrupts.S` ends its common trampoline with `jmp fk_cpu_halt` and
+        `isr_handler` ends with `call fk_cpu_halt()`. THIS KERNEL HAS NEVER
+        EXECUTED AN INTERRUPT RETURN. The IDT is a one-way door: it catches a
+        fault, prints it accurately, and dies. There are also only 32 trampolines
+        -- isr0..isr31 -- and 3.2 installs vectors 32-255 with the present bit
+        deliberately CLEAR, so there is no hardware-interrupt path at all.
+
+        Every green gate in Phase 3 is consistent with that, because every one of
+        them ends in a deliberate panic. The kernel's only reachable end state
+        today is halted.
+
+        WHY IT COMES BEFORE THE REST OF PHASE 3 AND 4. A keyboard that generates
+        interrupts (5.2), an APIC that delivers them (3.3), a syscall that returns
+        a value (6.3) and any scheduler at all are each built on the assumption
+        that an interrupt can be taken and survived. None of that assumption is
+        currently tested by anything.
+
+        WHAT THE WORK IS, and it is small because 3.2.5 already did the setup. The
+        8259s are remapped clear of the exception range and fully masked -- the
+        PIT is sitting behind one IMR write. So: trampolines for vectors 32-47, a
+        SECOND tail that restores the frame and executes IRETQ instead of halting,
+        an EOI, a vector-32 handler that increments a counter, and one IMR bit
+        cleared.
+
+        THE PROOF IS THE THING THIS PROJECT HAS NEVER PRINTED: a tick count that
+        is larger the second time it is read, and a boot that reaches the end of
+        `kernel_main` WITHOUT faulting. Every boot in this tree's history has
+        ended in a panic; this would be the first that does not.
+
+        FOUR HAZARDS TO PLAN FOR, since none of them has ever been exercised here:
+
+          * the panic tail and the IRQ tail must be genuinely separate. The
+            current `isr_common` hard-codes `jmp fk_cpu_halt` for all 32 vectors,
+            and an exception must keep going there -- resuming from a #GP is not
+            this milestone.
+          * EOI ordering: before the IRETQ, and slave-then-master for IRQ >= 8.
+            An 8259 that is never acknowledged delivers exactly one interrupt and
+            then goes quiet, which presents as "interrupts do not work" rather
+            than as a missing OUT.
+          * spurious IRQ7 and IRQ15. The 8259 raises them under load and the ISR
+            must read the in-service register rather than EOI blindly.
+          * AND THE BIG ONE: unmasking the PIT is the first time this kernel ever
+            runs with IF set. Everything that has been safe because interrupts
+            were masked stops being -- the UART driver's LSR spin loop, the PMM's
+            walk over 262144 bitmap words, and every module variable that is
+            written without any notion of re-entrancy. That is not a reason to
+            defer it; it is a reason to do it while the kernel is still small
+            enough to reason about.
+
   *  [ ] 3.3 Advanced Programmable Interrupt Controller (APIC)
 
         Validation: Legacy 8259 PIC is disabled. Local APIC is mapped and active.
@@ -518,9 +671,23 @@ The most critical mathematical and structural phase. Setting up the brain of the
         interrupts instead.
 
         The MISSING half is the Local APIC: it is not mapped, its spurious-vector
-        register is untouched, and `info lapic` still shows LVT0 as ExtINT. That
-        needs the MADT (4.1) to find the APIC base, and an IST for NMI before any
-        of it is safe to unmask.
+        register is untouched, and `info lapic` still shows LVT0 as ExtINT.
+
+        CORRECTION (2026-08-13): the claim that this "needs the MADT (4.1) to find
+        the APIC base" is wrong for the BSP's own LAPIC, and it made this box look
+        more blocked than it is. `IA32_APIC_BASE` (MSR 0x1B) carries the base
+        address in bits 51:12 and the enable bit in bit 11, with no ACPI involved.
+        The MADT IS needed -- for the IOAPIC's address, for the other five cores,
+        and for the interrupt source overrides that say which ISA IRQ landed on
+        which GSI -- but the LAPIC's spurious-vector register and LVT0 could be
+        dealt with today, on this machine, without parsing a single table.
+
+        Two real prerequisites remain, and neither is 4.1. An IST slot for NMI
+        (3.2.5 armed IST1 for #DF only, and ist2..ist7 are zero) before anything
+        can be unmasked safely. And a mapping for 0xFEE00000, which on this 24 GiB
+        box happens to fall inside the VMM's linear map by accident and on a
+        smaller machine does not -- so it wants `vmm_map_page` with caching
+        DISABLED, not the physmap. See the note in 3.5.
 
   *  [x] 3.4 Physical Memory Manager (PMM)
 
@@ -833,6 +1000,33 @@ The most critical mathematical and structural phase. Setting up the brain of the
         linear map covers MMIO holes as ordinary write-back memory because it
         maps [0, top) rather than the AVAILABLE regions; nothing dereferences
         those addresses today, and the day something does, it wants PCD/PWT.
+
+  *  [ ] 3.6 The Kernel Heap
+
+        Validation: a Fortran allocator hands out arbitrary-sized blocks of kernel
+        memory and takes them back, on top of the PMM's frames and the VMM's
+        mappings.
+
+        NOT PREVIOUSLY A BOX, and its absence is the gap between what Phase 3
+        built and what Phase 4 needs. 3.4 hands out 4 KiB FRAMES. 3.5 hands out
+        MAPPINGS. Nothing in this tree hands out forty bytes.
+
+        WHO NEEDS IT: 4.1 (an ACPI table set whose size is whatever the firmware
+        says), 4.2 (a device list whose length is whatever the bus scan finds),
+        6.1 (a VFS tree), 6.4 (an ELF's segment list). Without it each of those
+        grows its own fixed-size array with a ceiling and a "too many" error --
+        which is exactly what 3.4 already had to do with FK_PMM_MAX_REGIONS = 128
+        and the FK_PMM_MAX_PHYS bound, and those were justified by having nothing
+        underneath them. After 3.5 that justification is gone.
+
+        AND IT IS NOT THE SAME PROBLEM AS DMA MEMORY, which 5.1 and 5.3 need and
+        which should not be smuggled into this box. An xHCI ring and an NVMe
+        submission queue must be PHYSICALLY CONTIGUOUS, aligned, and known by
+        their physical address to a device that does not use the CPU's page
+        tables. A general heap gives none of those three. What 3.5 did make easy
+        is the conversion -- the linear map means virtual-to-physical for any
+        heap address is a subtraction -- so the DMA allocator is a thin thing over
+        `pmm_alloc_page`, not a second heap.
 
 ## 🔌 Phase 4: The Bus & Subsystems
 
