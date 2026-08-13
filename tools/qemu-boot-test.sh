@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Boots build/boot/fortran-kernel.iso in a headless QEMU and asserts three
-# things about the running guest: the four-word handoff record in guest
-# physical memory (read over QMP), the banner the kernel puts on COM1, and the
-# absence of the kernel's own report that its UART self-test failed.
+# Boots build/boot/fortran-kernel.iso in a headless QEMU and asserts what the
+# running guest did: the four-word handoff record in guest physical memory
+# (read over QMP), every string COM1 must carry, no string it must not, and --
+# on request -- the state of the task register and the two 8259s as the DEVICE
+# MODELS report it rather than as the kernel claims it.
 #
 # Usage:
-#   tools/qemu-boot-test.sh              boot the ISO and assert all three
+#   tools/qemu-boot-test.sh              boot the ISO and assert
 #   tools/qemu-boot-test.sh --selftest   prove the assertion logic (no QEMU)
 #   tools/qemu-boot-test.sh --smoke      prove the QMP plumbing against a
 #                                        kernel-less guest, and that both
@@ -19,8 +20,9 @@
 #   FK_BOOT_WAIT      seconds before first dump (default 3)
 #   FK_BOOT_DEADLINE  seconds to keep retrying  (default 45)
 #   FK_POLL_INTERVAL  seconds between attempts  (default 1)
-#   FK_EXPECT_SERIAL  the exact string COM1 must carry
-#   FK_REJECT_SERIAL  the exact string COM1 must NOT carry
+#   FK_EXPECT_SERIAL  strings COM1 must carry, ONE PER LINE -- all must appear
+#   FK_REJECT_SERIAL  strings COM1 must NOT carry, one per line -- any is fatal
+#   FK_CHECK_HW       non-empty: also assert TR and the 8259s over QMP
 #   FK_ACCEL          force 'kvm' or 'tcg'
 #   FK_SMP / FK_MEM   override the mandated 6 vCPU / 24 GB allocation
 set -uo pipefail
@@ -33,8 +35,21 @@ BOOT_WAIT="${FK_BOOT_WAIT:-3}"
 DEADLINE="${FK_BOOT_DEADLINE:-45}"
 POLL_INTERVAL="${FK_POLL_INTERVAL:-1}"
 
-# The default must stay byte-for-byte the literal in src/boot/fk_kmain.f90.
+# The defaults must stay byte-for-byte the literals in src/boot/fk_kmain.f90.
+# Both are LISTS, one pattern per line: the positive one must match in full,
+# the negative one must not match at all.
 EXPECT_SERIAL="${FK_EXPECT_SERIAL:-Fortran Kernel: UART Serial Initialized.}"
+REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.}"
+
+# Blank lines are dropped, and NOT because they are untidy: an empty pattern
+# matches every file, so one stray newline would turn an assertion into a
+# no-op that passes on any input whatsoever.
+readarray -t EXPECTS < <(printf '%s\n' "$EXPECT_SERIAL" | grep -v '^[[:space:]]*$')
+readarray -t REJECTS < <(printf '%s\n' "$REJECT_SERIAL" | grep -v '^[[:space:]]*$')
+if (( ${#EXPECTS[@]} == 0 )); then
+  echo "qemu-boot-test: FK_EXPECT_SERIAL is empty -- there is nothing to assert" >&2
+  exit 2
+fi
 
 # The project's mandated allocation; QEMU does not preallocate the 24G.
 SMP="${FK_SMP:-6}"
@@ -45,7 +60,7 @@ usage() { sed -n '3,${/^#/!q;s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]}"; }
 
 MODE=gate
 case "${1:-}" in
-  --selftest) exec python3 "$SENTINEL" selftest ;;
+  --selftest) MODE=selftest ;;
   --smoke)    MODE=smoke ;;
   -h|--help)  usage; exit 0 ;;
   "")         ;;
@@ -80,12 +95,14 @@ if [[ "$MODE" == gate ]]; then
     say "FAIL: cannot locate the sentinel symbol in $KERNEL"; say "$ADDR_OUT"; exit 1
   fi
   say "sentinel   : ${ADDR_OUT#\# }"
-else
+elif [[ "$MODE" == smoke ]]; then
   say "image      : NONE (--smoke: kernel-less guest; BOTH assertions MUST refuse it)"
   [[ -f "$KERNEL" ]] || { say "FAIL: --smoke still needs $KERNEL for the symbol address"; exit 1; }
   DEADLINE=0
 fi
-say "banner     : \"$EXPECT_SERIAL\""
+for pat in "${EXPECTS[@]}"; do say "must carry : \"$pat\""; done
+for pat in "${REJECTS[@]}"; do say "must not   : \"$pat\""; done
+[[ -n "${FK_CHECK_HW:-}" ]] && say "hw check   : task register and both 8259s, over QMP"
 
 if [[ -n "${FK_ACCEL:-}" ]]; then ACCEL="$FK_ACCEL"
 elif [[ -r /dev/kvm && -w /dev/kvm ]]; then ACCEL=kvm
@@ -126,19 +143,103 @@ show_qemu_log() {
   if [[ -s "$QEMU_LOG" ]]; then sed 's/^/  /' "$QEMU_LOG"; else say "  (QEMU said nothing)"; fi
 }
 
-#   -F  the banner is a literal, so its trailing '.' is not a regex wildcard
+#   -F  the strings are literals, so a trailing '.' is not a regex wildcard
 #   -a  a stray control byte must not make grep treat the capture as binary
 #   --  the expected string is overridable and could begin with '-'
-serial_has_banner() {
-  [[ -s "$SERIAL_LOG" ]] && grep -aFq -- "$EXPECT_SERIAL" "$SERIAL_LOG"
+#
+# One assertion per LINE of FK_EXPECT_SERIAL. A milestone whose proof is two
+# facts -- "the CPU reported a #DF" AND "it did so on the emergency stack" --
+# must not be reducible to whichever one is easier to produce, and running the
+# whole VM twice to ask two questions of one boot is worse than looping here.
+# Blank lines are dropped: an empty pattern matches every file, so a stray
+# newline would otherwise turn an assertion into a no-op that always passes.
+serial_matches() {
+  local pat
+  [[ -s "$SERIAL_LOG" ]] || return 1
+  for pat in "$@"; do
+    grep -aFq -- "$pat" "$SERIAL_LOG" || return 1
+  done
+  return 0
 }
 
-# The negative assertion: src/boot/fk_kmain.f90 prints this when serial_init's
-# loopback probe does not read back the byte it wrote.
-REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.}"
+serial_has_banner() { serial_matches "${EXPECTS[@]}"; }
+
+# Any single hit is fatal. The default is the line src/boot/fk_kmain.f90 prints
+# when serial_init's loopback probe does not read back the byte it wrote.
 serial_has_failure() {
-  [[ -s "$SERIAL_LOG" ]] && grep -aFq -- "$REJECT_SERIAL" "$SERIAL_LOG"
+  local pat
+  [[ -s "$SERIAL_LOG" ]] || return 1
+  for pat in "${REJECTS[@]}"; do
+    grep -aFq -- "$pat" "$SERIAL_LOG" && return 0
+  done
+  return 1
 }
+
+# Prove the matcher can FAIL before trusting the fact that it passes -- the
+# same standard the sentinel half has been held to since roadmap 1.2. These
+# call the REAL serial_has_banner and serial_has_failure; `local` on EXPECTS,
+# REJECTS and SERIAL_LOG shadows the globals for everything they call, so
+# nothing here is a reimplementation of the logic under test.
+FIX_DF_HEADLINE="EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault"
+FIX_DF_IST="*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***"
+FIX_DF_NO_IST="*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***"
+
+selftest_serial_matching() {
+  local pass=0 fail=0 dir
+  local SERIAL_LOG
+  local -a EXPECTS=("$FIX_DF_HEADLINE" "$FIX_DF_IST")
+  local -a REJECTS=("$FIX_DF_NO_IST" "Fortran Kernel: the deliberate fault did NOT trap.")
+  dir="$(mktemp -d /tmp/fk-serial-selftest.XXXXXX)"
+  SERIAL_LOG="$dir/serial.log"
+
+  # want_banner want_reject <body> <what>
+  expect_serial() {
+    local want_b=$1 want_r=$2 body=$3 what=$4 gb=0 gr=0
+    printf '%s' "$body" > "$SERIAL_LOG"
+    serial_has_banner  && gb=1
+    serial_has_failure && gr=1
+    if (( gb == want_b && gr == want_r )); then
+      printf "  \033[32mPASS\033[0m  %s\n" "$what"; pass=$((pass+1))
+    else
+      printf "  \033[31mFAIL\033[0m  %s -- banner=%d (want %d), reject=%d (want %d)\n" \
+             "$what" "$gb" "$want_b" "$gr" "$want_r"; fail=$((fail+1))
+    fi
+  }
+
+  say "=== COM1 assertion self-test (no QEMU, no kernel) ==="
+  expect_serial 1 0 \
+    "$FIX_DF_HEADLINE"$'\r\n'"$FIX_DF_IST"$'\r\n' \
+    "both expected lines present -> accepted"
+  # THE ONE THAT MATTERS. A single-pattern matcher passes this: the exception
+  # headline is exactly what a #DF delivered on the broken stack would print
+  # too, right up until the push that kills it.
+  expect_serial 0 0 "$FIX_DF_HEADLINE"$'\r\n' \
+    "the headline WITHOUT the IST1 line -> refused"
+  expect_serial 0 0 "$FIX_DF_IST"$'\r\n' \
+    "the IST1 line without the headline -> refused"
+  expect_serial 1 1 \
+    "$FIX_DF_HEADLINE"$'\r\n'"$FIX_DF_NO_IST"$'\r\n'"$FIX_DF_IST"$'\r\n' \
+    "a log carrying BOTH verdicts -> the negative assertion still fires"
+  expect_serial 0 0 "" "an empty capture -> refused"
+  expect_serial 0 0 "SeaBIOS (version 1.17.0)"$'\r\n' \
+    "firmware chatter alone -> refused"
+  # -F, not a regex: the '***' and '#' in these lines are literal text.
+  expect_serial 0 0 "EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Faul"$'\r\n' \
+    "a truncated headline -> refused (fixed-string match, not a prefix)"
+
+  rm -rf "$dir"
+  unset -f expect_serial
+  say "=== $pass passed, $fail failed ==="
+  return $(( fail > 0 ))
+}
+
+if [[ "$MODE" == selftest ]]; then
+  rc=0
+  selftest_serial_matching || rc=1
+  say ""
+  python3 "$SENTINEL" selftest || rc=1
+  exit $rc
+fi
 
 # CRs are stripped for display only; serial_has_banner greps the file itself.
 show_serial_log() {
@@ -156,20 +257,38 @@ assertion_summary() {
   elif (( GOT_DUMP    == 0 )); then sent="FAIL  guest memory never became readable, so it was never asserted"
   else                              sent="FAIL  read back, but not the record src/boot/fk_kmain.f90 promises"
   fi
-  if (( SERIAL_OK == 1 )); then ser="PASS  the expected string appeared on COM1"
-  else                          ser="FAIL  the expected string never appeared on COM1"
+  if (( SERIAL_OK == 1 )); then ser="PASS  every expected string appeared on COM1"
+  else                          ser="FAIL  at least one expected string never appeared"
   fi
   say "  sentinel   (1.2) : $sent"
-  say "  COM1 banner(2.1) : $ser"
+  say "  COM1 lines (2.1) : $ser"
+  # Which one, when it is not all of them: with several patterns "the string
+  # never appeared" no longer identifies anything.
+  if (( SERIAL_OK == 0 )); then
+    local pat
+    for pat in "${EXPECTS[@]}"; do
+      if serial_matches "$pat"; then say "      found    : \"$pat\""
+      else                           say "      MISSING  : \"$pat\""
+      fi
+    done
+  fi
 # --smoke boots no kernel, so the negative assertion is vacuous there.
   if [[ "$MODE" == gate ]]; then
-    local slf
     if serial_has_failure; then
-      slf="FAIL  the kernel itself reported the COM1 loopback probe FAILED"
+      say "  forbidden  lines : FAIL  COM1 carried a line it must not"
+      local pat
+      for pat in "${REJECTS[@]}"; do
+        serial_matches "$pat" && say "      PRESENT  : \"$pat\""
+      done
     else
-      slf="PASS  the kernel did not report a UART self-test failure"
+      say "  forbidden  lines : PASS  none of them appeared on COM1"
     fi
-    say "  UART self-test   : $slf"
+    if [[ -n "${FK_CHECK_HW:-}" ]]; then
+      if   (( HW_OK == 1 )); then say "  hardware state   : PASS  TR and both 8259s are what the kernel claims"
+      elif (( HW_RAN == 0 )); then say "  hardware state   : FAIL  the guest died before it could be asked"
+      else                        say "  hardware state   : FAIL  see the monitor output above"
+      fi
+    fi
   fi
 }
 
@@ -243,6 +362,24 @@ ELAPSED=$(( SECONDS - START ))
 # "printed the banner, then triple-faulted" from "never said anything".
 if (( SERIAL_OK == 0 )) && serial_has_banner; then SERIAL_OK=1; fi
 
+# Asked of the DEVICE MODELS, not of the kernel, and asked while the guest is
+# still up -- a PIC whose ICW2 was never written looks identical from inside
+# the kernel, because masking works whatever the vector base happens to be.
+HW_RAN=0; HW_OK=0
+if [[ -n "${FK_CHECK_HW:-}" && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    HW_RAN=1
+    rule
+    say "--- hardware state, read back over QMP ---"
+    if python3 "$SENTINEL" hwstate --qmp "$SOCK" --elf "$KERNEL" --timeout 10; then
+      HW_OK=1
+    fi
+  else
+    say ""
+    say "hardware state NOT asserted: the guest was already gone."
+  fi
+fi
+
 if qemu_alive; then
   python3 "$SENTINEL" quit --qmp "$SOCK" --timeout 5 >/dev/null 2>&1 || true
 fi
@@ -297,8 +434,11 @@ SELFTEST_BAD=0
 if serial_has_failure; then SELFTEST_BAD=1; fi
 
 rule
+HW_BAD=0
+if [[ -n "${FK_CHECK_HW:-}" && "$MODE" == gate ]] && (( HW_OK == 0 )); then HW_BAD=1; fi
+
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
-   && (( QEMU_DIED == 0 )); then
+   && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule
@@ -312,6 +452,11 @@ if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
   say "          COM1 then carried the banner, so Fortran also drove a real"
   say "          16550A device model with real OUT instructions: those bytes"
   say "          LEFT the CPU, which no dump of guest memory could ever show."
+  if [[ -n "${FK_CHECK_HW:-}" ]]; then
+    say "          The task register and both 8259s were then read back out of"
+    say "          the device models, so those are the machine's answers and"
+    say "          not the kernel's."
+  fi
   rule
   exit 0
 fi
@@ -355,28 +500,47 @@ elif (( SENTINEL_OK == 0 )); then
   say "The guest is alive and its memory is readable, so the machine did NOT"
   say "triple-fault: execution reached somewhere and stopped. If every word is"
   say "still 0x11111111, kernel_main was never called."
+elif (( HW_BAD == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )); then
+  say "THE HARDWARE STATE IS NOT WHAT THE KERNEL SAID IT WAS -- ${ELAPSED}s."
+  say ""
+  say "  Everything on COM1 held. This is a fail anyway, and it is the class of"
+  say "  failure the console CANNOT report: the kernel can only tell you what it"
+  say "  believes it wrote. The failing assertion is printed above, with the"
+  say "  monitor's own line under it. Usual causes:"
+  say "    * ICW2 never reached the chip -- the 0x80 delay write went to the"
+  say "      command port, or the ICW order slipped, so the master is still on"
+  say "      0x08 and a spurious IRQ0 would arrive as vector 8: a #DF that"
+  say "      never happened"
+  say "    * LTR never ran, or ran before the descriptor was written: TR = 0"
+  say "    * the GDT limit still covers three slots, so the second half of the"
+  say "      16-byte TSS descriptor is outside the table"
+  show_serial_log
 elif (( SELFTEST_BAD == 1 )); then
-  say "THE KERNEL REPORTED ITS OWN UART SELF-TEST AS FAILED -- ${ELAPSED}s,"
-  say "$ATTEMPT attempt(s)."
+  say "COM1 CARRIED A LINE THE GATE FORBIDS -- ${ELAPSED}s, $ATTEMPT attempt(s)."
   say ""
-  say "  Both positive assertions held: the handoff record is correct and the"
-  say "  banner reached COM1. This is a fail anyway, and it is the most useful"
-  say "  failure this gate produces, because the kernel diagnosed itself:"
-  say "  serial_init put the port in internal loopback, transmitted 0xAE and"
-  say "  did NOT read 0xAE back."
-  say ""
-  say "  That the banner still appeared narrows it sharply. Transmission works,"
-  say "  so the WRITE path -- fk_outb, the port space, LCR/DLAB, the divisor --"
-  say "  is fine. What failed is the read side or the loopback itself:"
-  say "    * boot/io.S fk_inb not zero-extending EAX, so the probe comes back"
-  say "      with the previous EAX's upper bits attached and compares unequal"
-  say "      to 0xAE on a UART that is behaving perfectly"
-  say "    * fk_inb reading the wrong port (%si rather than %di)"
-  say "    * MCR loopback (0x1E) not actually taking effect before the probe"
-  say "    * a FIFO flush ordered after the probe instead of before it, so the"
-  say "      byte read back is a stale one"
-  say "    * genuinely absent hardware: an unassigned port floats to 0xFF, and"
-  say "      0xFF is not 0xAE -- which is exactly what the probe is for"
+  say "  The line itself is named in the summary above, and it is the most"
+  say "  useful class of failure this gate produces, because the kernel"
+  say "  diagnosed itself rather than merely dying."
+  # The UART advice below is only correct when the UART line is the one that
+  # hit; the reject list is general now and a #DF verdict can land here too.
+  if serial_matches "Fortran Kernel: COM1 loopback self-test FAILED."; then
+    say ""
+    say "  THE UART PROBE: serial_init put the port in internal loopback,"
+    say "  transmitted 0xAE and did NOT read 0xAE back."
+    say ""
+    say "  That the banner still appeared narrows it sharply. Transmission"
+    say "  works, so the WRITE path -- fk_outb, the port space, LCR/DLAB, the"
+    say "  divisor -- is fine. What failed is the read side or the loopback:"
+    say "    * boot/io.S fk_inb not zero-extending EAX, so the probe comes back"
+    say "      with the previous EAX's upper bits attached and compares unequal"
+    say "      to 0xAE on a UART that is behaving perfectly"
+    say "    * fk_inb reading the wrong port (%si rather than %di)"
+    say "    * MCR loopback (0x1E) not actually taking effect before the probe"
+    say "    * a FIFO flush ordered after the probe instead of before it, so"
+    say "      the byte read back is a stale one"
+    say "    * genuinely absent hardware: an unassigned port floats to 0xFF,"
+    say "      and 0xFF is not 0xAE -- which is exactly what the probe is for"
+  fi
   show_serial_log
 else
   say "SENTINEL PASSED, but COM1 never carried the banner -- ${ELAPSED}s,"

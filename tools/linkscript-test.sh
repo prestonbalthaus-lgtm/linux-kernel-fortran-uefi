@@ -277,6 +277,90 @@ else
 fi
 
 echo
+echo "=== the TSS and its emergency stack (roadmap 3.2.5) ==="
+# nm -S: <addr> <size> <type> <name>.
+symsize() { nm -S "$K" | awk -v s="$1" '$4==s{print "0x"$2}'; }
+
+# THE CHECK THIS SECTION EXISTS FOR.  A 64-bit TSS puts RSP0 at offset 4, and a
+# bind(c) derived type follows C struct rules: a c_int64_t declared there is
+# aligned up to offset 8, which moves IST1 from 0x24 to 0x28 and every field
+# after it.  Nothing complains -- the type compiles, the descriptor loads, and
+# the CPU then reads the #DF stack pointer out of the wrong eight bytes.  The
+# structure is spelled in 32-bit halves for exactly this reason, and 104 bytes
+# is how that decision is held in place.
+tsz=$(( $(symsize fk_tss) ))
+if [ "$tsz" -eq 104 ]; then
+  ok "fk_tss is 104 bytes -- the architectural TSS, with no padding in it"
+else
+  bad "fk_tss is $tsz bytes, not 104: a field has been aligned up, so IST1 is"
+  bad "     no longer at offset 0x24 and the CPU will load a #DF stack pointer"
+  bad "     out of whichever eight bytes landed there instead"
+fi
+
+dsz=$(( $(symsize fk_df_stack) ))
+if [ "$dsz" -ge 4096 ]; then ok "fk_df_stack is $dsz bytes"
+else bad "fk_df_stack is $dsz bytes -- too small to take a panic dump"; fi
+
+bs=$(sym __bss_start); be=$(sym __bss_end)
+for v in fk_tss fk_df_stack; do
+  a=$(sym $v)
+  if [ -z "$a" ]; then bad "$v is not in the linked image"
+  elif [ $(( a >= bs && a < be )) -eq 1 ]; then
+    ok "$v is inside .bss, so boot.S zeroes it and it costs no image bytes"
+  else
+    bad "$v at $a is OUTSIDE .bss [$bs,$be): it is not zeroed before use"
+  fi
+done
+
+# The whole point of IST1 is that it is NOT the stack that just failed.
+#
+# HONEST LABEL: this one is an INVARIANT, not a test. linker.ld emits
+# *(.bss .bss.*) and *(COMMON) and only then reserves the boot stack inline,
+# with no symbol inside the reservation, so no Fortran object can land there
+# and no layout the current script can produce makes this fail. It is kept
+# because the day the boot stack becomes an ordinary .bss array -- which is
+# how most kernels end up spelling it -- it starts to bite. The property it
+# does NOT cover is reported below it.
+sb=$(sym __boot_stack_bottom); st=$(sym __boot_stack_top)
+ds=$(sym fk_df_stack); de=$(( ds + dsz ))
+if [ $(( ds >= st || de <= sb )) -eq 1 ]; then
+  ok "the #DF stack [$ds,0x$(printf %x $de)) is disjoint from the boot stack"
+else
+  bad "the #DF stack OVERLAPS the boot stack -- the emergency stack would be"
+  bad "     the same memory as the one whose corruption caused the #DF"
+fi
+
+# REPORTED, deliberately not asserted. The boot stack grows DOWN out of
+# __boot_stack_bottom into whatever .bss put underneath it, and there is no
+# guard page until the VMM at roadmap 3.5. Which object is underneath is worth
+# printing every build, because today it is the TSS itself -- so a boot-stack
+# overflow destroys IST1 before the #DF that would have used it. Asserting a
+# particular neighbour would only freeze an arbitrary link order.
+python3 - "$K" <<'PY'
+import subprocess, sys
+bb = None
+syms = []
+for line in subprocess.run(["nm", "-S", "-n", sys.argv[1]],
+                           capture_output=True, text=True).stdout.splitlines():
+    f = line.split()
+    if len(f) == 3 and f[2] == "__boot_stack_bottom":
+        bb = int(f[0], 16)
+    elif len(f) == 4 and f[2] in "Bb":
+        syms.append((int(f[0], 16), int(f[1], 16), f[3]))
+if bb is None:
+    print("  NOTE  __boot_stack_bottom not found")
+else:
+    below = [x for x in syms if x[0] < bb]
+    if below:
+        a, n, name = max(below)
+        print("  NOTE  directly below __boot_stack_bottom (0x%x): %s, ending 0x%x"
+              % (bb, name, a + n))
+        print("        %d byte(s) of slack, and no guard page until roadmap 3.5 --"
+              % (bb - (a + n)))
+        print("        a boot-stack overflow lands in it")
+PY
+
+echo
 echo "=== no 2 MiB segment padding (the -z max-page-size flag is doing its job) ==="
 # Catches a missing -z max-page-size, which pads each of the three PT_LOADs to
 # 2 MiB.  Image is 25600 bytes today, 25248 without io.S and the serial driver.
