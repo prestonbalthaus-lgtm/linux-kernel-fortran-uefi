@@ -457,8 +457,7 @@ case_M29() {
 # No EOI. The 8259 goes on holding its in-service bit, so exactly ONE interrupt
 # is ever delivered -- which is why the proof loop waits for three.
 case_M30() {
-  subst src/cpu/fk_idt.f90 $'    call pic_eoi(line)\n  end subroutine irq_handler' \
-                           $'    continue\n  end subroutine irq_handler'
+  subst src/cpu/fk_idt.f90 '    call pic_eoi(line)' '    continue'
   run_case M30-no-eoi
 }
 # The line is never opened. Everything else is correct and nothing arrives.
@@ -484,10 +483,65 @@ case_M33() {
   run_case M33-pit-never-programmed
 }
 
+
+# --- roadmap 2.2: the framebuffer's memory type ------------------------------
+# Drop PWT from the framebuffer's flags. The mapping still works and every
+# pixel still lands; it is merely WRITE-BACK, so each glyph becomes a
+# read-modify-write of a cache line nothing ever reads. Nothing on screen looks
+# different, which is why the PTE is decoded and printed rather than trusted.
+case_M34() {
+  subst src/mm/fk_vmm.f90 "ior(FK_PTE_PWT, FK_PTE_NX))" \
+                          "ior(0_c_int64_t, FK_PTE_NX))"
+  run_case M34-framebuffer-write-back
+}
+# Stop punching the aperture out of the linear map. The framebuffer is then
+# reachable BOTH ways -- write-combining at FK_VMM_MMIO and write-back through
+# the physmap -- which is undefined behaviour (SDM Vol.3 11.12.4) and which
+# nothing on screen, on COM1 or in a pixel dump would otherwise reveal.
+case_M35() {
+  subst src/mm/fk_vmm.f90 "       if (.not. hits_hole(p)) then" \
+                          "       if (.true.) then"
+  run_case M35-framebuffer-aliased
+}
+
+# --- roadmap 3.6: the heap ---------------------------------------------------
+# Backward coalescing removed. Forward coalescing alone passes every other heap
+# verdict -- alignment, non-overlap, patterns, the guards -- and leaves the heap
+# in a fragment per free that no later allocation can merge.
+case_M36() {
+  subst src/mm/fk_heap.f90 $'    call coalesce_fwd(a)\n    call coalesce_back(a)' \
+                           $'    call coalesce_fwd(a)'
+  run_case M36-heap-no-backward-coalesce
+}
+
+# --- roadmap 3.7: tasks ------------------------------------------------------
+# A spawned task's RFLAGS with IF CLEAR. It runs, and it is never preempted
+# again: the round robin stops on the first task it switches to and the boot
+# thread -- the one that prints every verdict -- never runs again.
+case_M37() {
+  subst src/cpu/fk_sched.f90 "RFLAGS_IF = int(z'202', c_int64_t)" \
+                             "RFLAGS_IF = int(z'2', c_int64_t)"
+  run_case M37-task-starts-with-IF-clear
+}
+# THE SWITCH ITSELF. Ignore the RSP irq_handler returned and pop the frame that
+# was pushed. Every task is created, the scheduler picks them in turn and
+# increments its own counters, and not one instruction of either thread ever
+# executes -- which is exactly why fk_task_runs is incremented by the THREAD.
+case_M38() {
+  subst boot/interrupts.S "$(printf '\tmovq\t%%rax, %%rsp')" "$(printf '\tnop')"
+  run_case M38-irq-ignores-returned-rsp
+}
+# The scheduler is never armed. Identical to M38 from every serial line's point
+# of view, and it is a one-word difference in the source.
+case_M39() {
+  subst src/boot/fk_kmain.f90 $'    call sched_start()\n' ''
+  run_case M39-preemption-never-armed
+}
+
 ALL="baseline_none baseline_df baseline_de baseline_oom baseline_guard \
      baseline_idmap baseline_wp M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 \
      M12 M13 M14 M15 M16 M17 M18 M19 M20 M21 M22 M23 M24 M25 M26 M27 \
-     M28 M29 M30 M31 M32 M33"
+     M28 M29 M30 M31 M32 M33 M34 M35 M36 M37 M38 M39"
 for c in $ALL; do
   want_case "$c" || continue
   echo "=== $c ==="

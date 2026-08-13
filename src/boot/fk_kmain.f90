@@ -40,7 +40,8 @@ module fk_kmain_m
                          console_print_hex, console_cols, console_rows, &
                          console_ready, fk_console_scrolls
   use fk_vmm_m,    only: FK_VMM_OK, FK_VMM_SECTIONS, FK_VMM_SCRATCH, &
-                         FK_PTE_P, FK_PTE_RW, FK_PTE_NX, &
+                         FK_PTE_P, FK_PTE_RW, FK_PTE_NX, FK_PTE_PWT, &
+                         FK_PTE_PCD, &
                          vmm_init, vmm_activate, vmm_drop_identity, &
                          vmm_map_page, vmm_translate, vmm_phys_of, &
                          vmm_pml4_phys, vmm_table_frames, vmm_physmap_top, &
@@ -297,6 +298,12 @@ module fk_kmain_m
        "not write-combining." // FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_FB_MAP_BAD = &
        "Fortran Kernel: GOP framebuffer mapping FAILED, status 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_WC_OK = &
+       "Fortran Kernel: GOP framebuffer PTE selects PAT index 1, " // &
+       "write-combining." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_FB_WC_BAD = &
+       "Fortran Kernel: GOP framebuffer PTE is NOT write-combining." // &
+       FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_FB_ALIAS_OK = &
        "Fortran Kernel: GOP framebuffer has no write-back alias in the " // &
        "linear map." // FK_CRLF // c_null_char
@@ -1348,6 +1355,18 @@ contains
     call serial_print_string(FK_PMM_SLASH)
     call serial_print_hex(entry, 16_c_int32_t)
     call serial_print_string(FK_NL)
+
+    ! The memory type, decoded from the LIVE entry rather than from the flags
+    ! that were requested.  The addresses in the line above are machine
+    ! specific and cannot be asserted; this is one bit and it is the bit that
+    ! decides whether every glyph is a read-modify-write of a cache line
+    ! nothing ever reads.
+    if (iand(entry, FK_PTE_PWT) /= 0_c_int64_t .and. &
+        iand(entry, FK_PTE_PCD) == 0_c_int64_t) then
+       call serial_print_string(FK_FB_WC_OK)
+    else
+       call serial_print_string(FK_FB_WC_BAD)
+    end if
 
     ! The aperture must be reachable ONE way.  A linear-map entry over the same
     ! frames would be write-back, and two memory types for one physical page is

@@ -147,11 +147,13 @@ Fortran Kernel: the first tick\'s saved frame is NOT kernel .text with IF set.'
 #   bit 16 and blue at bit 0 -- BGRX -- and a kernel that assumed RGB would
 #   print the same geometry line above it and draw a blue panic banner.
 FK_FB_PASS_LINES=$'Fortran Kernel: GOP IA32_PAT is 0x0007010600070106, PAT index 1 is write-combining.
+Fortran Kernel: GOP framebuffer PTE selects PAT index 1, write-combining.
 Fortran Kernel: GOP framebuffer has no write-back alias in the linear map.
 Fortran Kernel: GOP renderer armed on the mapped framebuffer (roadmap 2.4).'
 FK_FB_FAIL_LINES=$'Fortran Kernel: GOP framebuffer tag REJECTED, status 0x
 Fortran Kernel: GOP could NOT program the PAT; the framebuffer is not write-combining.
 Fortran Kernel: GOP framebuffer mapping FAILED, status 0x
+Fortran Kernel: GOP framebuffer PTE is NOT write-combining.
 Fortran Kernel: GOP framebuffer is ALIASED write-back in the linear map.
 Fortran Kernel: GOP renderer REFUSED the framebuffer, status 0x'
 
