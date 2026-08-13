@@ -38,8 +38,31 @@ POLL_INTERVAL="${FK_POLL_INTERVAL:-1}"
 # The defaults must stay byte-for-byte the literals in src/boot/fk_kmain.f90.
 # Both are LISTS, one pattern per line: the positive one must match in full,
 # the negative one must not match at all.
-EXPECT_SERIAL="${FK_EXPECT_SERIAL:-Fortran Kernel: UART Serial Initialized.}"
-REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.}"
+#
+# roadmap 3.4 added six verdicts and their FAIL twins. They are DEFAULTS and
+# not something a caller has to opt into, because the shipped image prints them
+# on every boot: a verdict the gate does not refuse is one the kernel is free to
+# get wrong. Note that each pair is one property -- the PASS line proves the
+# kernel reached the check, the FAIL line proves it did not fail it, and a boot
+# that crashed before the PMM ran satisfies neither.
+FK_PMM_PASS_LINES=$'Fortran Kernel: PMM reserved and ACPI frames are all marked used.
+Fortran Kernel: PMM locked the kernel image and the loader map out.
+Fortran Kernel: PMM allocated 5 contiguous frames.
+Fortran Kernel: PMM freed and reclaimed the same 5 frames.
+Fortran Kernel: PMM refused a double, unaligned and locked free.
+Fortran Kernel: PMM rewound its scan cursor to a freed frame.'
+FK_PMM_FAIL_LINES=$'Fortran Kernel: PMM init FAILED, status 0x
+Fortran Kernel: PMM reserved or ACPI frames are STILL FREE.
+Fortran Kernel: PMM did NOT lock the kernel image out.
+Fortran Kernel: PMM allocation is NOT contiguous.
+Fortran Kernel: PMM reclaim FAILED.
+Fortran Kernel: PMM guard FAILED.
+Fortran Kernel: PMM cursor rewind FAILED.'
+
+EXPECT_SERIAL="${FK_EXPECT_SERIAL:-Fortran Kernel: UART Serial Initialized.
+$FK_PMM_PASS_LINES}"
+REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
+$FK_PMM_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a
@@ -73,7 +96,7 @@ say()  { printf '%s\n' "$*"; }
 [[ -r "$SENTINEL" ]] || { say "FAIL: missing $SENTINEL -- the assertion lives there"; exit 1; }
 
 rule
-say "PROJECT FORTRAN-KERNEL :: BOOT GATE (roadmap 1.2 + 2.1)"
+say "PROJECT FORTRAN-KERNEL :: BOOT GATE (roadmap 1.2 + 2.1 + 3.4)"
 rule
 
 if [[ "$MODE" == gate ]]; then

@@ -427,7 +427,15 @@ The most critical mathematical and structural phase. Setting up the brain of the
         Nothing recurses today and 16 KiB is a long way, so this is a bound and
         not a live bug -- but it is the specific way this milestone's safety net
         fails, and it is the one thing 3.5 must fix before anything deepens the
-        call stack. `tools/linkscript-test.sh` prints the neighbour and the slack
+        call stack.
+
+        SUPERSEDED BY 3.4, AND ONLY BY LUCK. The PMM's 2 MiB bitmap is now the
+        object directly below the boot stack -- with ZERO bytes of slack -- so an
+        overflow corrupts the allocator instead of the TSS, and IST1 survives to
+        catch the fault the overflow causes. That is strictly better and it is
+        nobody's design: it is what the link order happens to be this week, which
+        is exactly why linkscript-test.sh PRINTS the neighbour instead of
+        asserting one. The guard page at 3.5 is still the fix. `tools/linkscript-test.sh` prints the neighbour and the slack
         on every run rather than asserting a link order. And the ONE boot exercises one IST index on one vector: see
         `docs/HARNESS-VALIDATION-PHASE3.md` for the mutation table, including the
         defects that got past it.
@@ -455,13 +463,177 @@ The most critical mathematical and structural phase. Setting up the brain of the
         needs the MADT (4.1) to find the APIC base, and an IST for NMI before any
         of it is safe to unmask.
 
-  *  [ ] 3.4 Physical Memory Manager (PMM)
+  *  [x] 3.4 Physical Memory Manager (PMM)
 
         Validation: Fortran parses the UEFI memory map and tracks free/used memory pages (e.g., via a bitmap).
+
+        DONE for the MULTIBOOT2 map, which is the map this kernel is handed
+        today; the UEFI wording is 0.3's outstanding half, not this box's. On
+        COM1, from the shipped image with the mandated 6 vCPU / 24 GB VM:
+
+            PMM  ID BASE               END                TYPE
+            PMM  01 0x0000000000000000 0x000000000009FC00 AVAILABLE
+            PMM  02 0x000000000009FC00 0x00000000000A0000 RESERVED
+            PMM  03 0x00000000000F0000 0x0000000000100000 RESERVED
+            PMM  04 0x0000000000100000 0x00000000BFFE0000 AVAILABLE
+            PMM  05 0x00000000BFFE0000 0x00000000C0000000 RESERVED
+            PMM  06 0x00000000FEFFC000 0x00000000FF000000 RESERVED
+            PMM  07 0x00000000FFFC0000 0x0000000100000000 RESERVED
+            PMM  08 0x0000000100000000 0x0000000640000000 AVAILABLE
+            Fortran Kernel: PMM frames total/free/unmanaged-bytes 0x5FFF7F/0x5FFD6C/0x0
+            Fortran Kernel: PMM reserved and ACPI frames are all marked used.
+            Fortran Kernel: PMM locked the kernel image and the loader map out.
+            PMM  ALLOC 0x0000000000001000 ... 0x0000000000005000
+            Fortran Kernel: PMM allocated 5 contiguous frames.
+            Fortran Kernel: PMM freed and reclaimed the same 5 frames.
+            Fortran Kernel: PMM refused a double, unaligned and locked free.
+            Fortran Kernel: PMM rewound its scan cursor to a freed frame.
+
+        THE NUMBERS ARE THE PROOF, AND THEY ARE LIVE. 159 + 786144 + 5505024 =
+        6291327 = 0x5FFF7F frames, which is the three AVAILABLE regions rounded
+        INWARD. The 531 used are the kernel's 530 plus frame 0. Booting the SAME
+        IMAGE at -m 4G gives 0x0FFF7F, and at -m 2G gives 0x07FF7F and SEVEN
+        regions rather than eight -- QEMU emits no above-4 GiB entry at all. A
+        table of constants cannot do that; this is 1.2's "word 3 is computed at
+        run time" argument, for a data structure instead of a scalar.
+
+        `src/mm/fk_pmm.f90`. One bit per 4 KiB frame, 0 = free, 1 = used, in a
+        2 MiB .bss array covering 64 GiB. STATIC and not placed in discovered
+        RAM, which is what a real kernel does: placing it needs a writable
+        mapping for an arbitrary physical address, and that is 3.5. The price is
+        a ceiling, and memory above it is COUNTED and REPORTED
+        (`pmm_ignored_bytes`) rather than silently dropped -- a PMM that quietly
+        forgets a third of the machine is indistinguishable from one that works.
+        NOLOAD, so it costs zero image bytes and one rep-stosq in boot.S; the
+        static gate reads the sizes back out of the linked ELF and asserts the
+        last PT_LOAD carries it as MemSiz and not FileSiz.
+
+        THE INIT ORDER IS THE SAFETY PROPERTY, and every step of it is a
+        mutation in docs/HARNESS-VALIDATION-PHASE3.md:
+
+          1. EVERY BIT SET. .bss arrives zeroed, which for this array means "the
+             whole address space is free RAM" -- ACPI tables, MMIO apertures and
+             the holes between them. The safe default has to be established, not
+             inherited, and before any path that can return early.
+          2. clear the type-1 regions, rounding INWARD.
+          3. set every OTHER region, rounding OUTWARD. A separate pass, strictly
+             after 2: maps with overlapping entries exist, and one pass would let
+             entry ORDER decide whether reserved memory is allocatable.
+          4. set [__kernel_phys_start, __kernel_phys_end).
+          5. set the MBI's own extent -- it is in memory GRUB reported as
+             AVAILABLE, correctly, and the parser is still reading it.
+          6. set frame 0, so 0 is an unambiguous out-of-memory answer and never
+             also a valid address.
+
+        The rounding is ASYMMETRIC and that is the whole point: available rounds
+        inward, unusable rounds outward, so both directions err towards not
+        allocating. A symmetric rule has to be wrong in one of them.
+
+        WHAT GRUB DID THAT NO PLAN ANTICIPATED. The MBI came back at physical
+        0x103540 -- INSIDE the kernel's own span, in the 0xB10-byte alignment gap
+        between the first and second PT_LOAD. The relocator tucked its structure
+        into a hole in the middle of the loaded image. Reserving the file-backed
+        ranges instead of the whole __kernel_phys_start..__kernel_phys_end span
+        would have handed out the frame holding the memory map being parsed. It
+        also bounds what the boot gate proves: step 5 is masked on this hardware
+        and only the host suite tests it independently.
+
+        `boot/ksyms.S` -- fk_kernel_phys_start/_end. linker.ld's symbols are
+        ABSOLUTE: the VALUE is the address and there is nothing stored there to
+        read. Fortran cannot name such a thing -- a bind(c) module variable
+        DEFINES a symbol rather than importing one, and would hand the PMM the
+        address of four bytes of .bss. So the value is moved into RAX as an
+        immediate, and linkscript-test.sh disassembles the accessor and compares
+        that immediate against nm. Nothing else can: a wrong constant marks the
+        wrong frames used and every console verdict still prints PASS.
+
+        THE OUT-OF-MEMORY PANIC IS RAISED BY THE CPU. `pmm_alloc_page` returns 0
+        and the caller decides; kernel_main prints the allocator's state and then
+        executes INT3 in boot/faultgen.S, so vector 3 reaches the same catcher
+        every hardware fault does and the register dump is the machine's own.
+        FK_FAULT_MODE = -1 drains the PMM to prove it, and does so:
+
+            Fortran Kernel: PMM handed out 0x5FFD6C frames before it refused.
+            *** PMM OUT OF MEMORY ***
+            EXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint
+            RBX = 0x00000000005FFD6C   RBP = 0x00000000005FFF7F
+
+        0x5FFD6C is exactly the free count printed at init, and it is in a
+        register because the CPU was holding it.
+
+        WHAT IT COST. gcc's loop-distribution pass rewrites a DO loop that stores
+        one value across an array into a call to MEMSET -- an undefined symbol
+        until 1.3. Measured, not guessed: the 262144-word bitmap fill emits
+        `U memset` at -O2 and nothing with -fno-tree-loop-distribute-patterns,
+        which is now in mk/kflags.mk. It is the Fortran half of what
+        -ffreestanding does for C. Every earlier fill in this tree was four
+        elements long, which is why it took until now.
+
+        And it exposed a gate carrying a stale fourth copy of KFLAGS:
+        tools/linktest.sh transcribed the flag list instead of reading
+        mk/kflags.mk, so it missed the new flag and reported the PMM as
+        libc-dependent in a module the real build links clean. It reads the file
+        now, the way linkscript-test.sh already did.
+
+        PROVEN, at four levels, and the mutation tables are in
+        docs/HARNESS-VALIDATION-PHASE3.md. `build/run-pmm`: 390 checks against a
+        reference bitmap built from the specification, compared BIT FOR BIT
+        against fk_pmm_bitmap itself -- the array is bind(c) so the diff is with
+        the real thing and not with an accessor that could agree with a wrong
+        bitmap. 16 injected defects, 16 refused. `linkscript-test.sh`: 7 new
+        static checks. The boot gate: five verdict lines, each with a FAIL twin
+        the gate REJECTS. `mutate-phase3.sh`: M14-M20.
+
+        THREE ESCAPES OF THE FIXTURES, RECORDED BECAUSE THEY WERE MINE, and
+        all three are the same mistake wearing different clothes -- a test whose
+        interesting case was masked by something else being right.
+
+          * H6: the overlapping-reserved region sat inside the kernel image
+            span, so the kernel marking covered it and deleting the ENTIRE
+            reserved-wins pass changed nothing. The fixture moved to 16 MiB.
+          * M18: the five-frame reclaim test allocates frames 1-5, which share
+            ONE 64-bit bitmap word, so the scan cursor never moves and a free()
+            that never rewinds it still passes. kernel_main now takes 96 frames
+            first and asks for the first one back, under its own verdict.
+          * HE: an allocator that forgets to set the bit made an unbounded drain
+            loop spin for ever instead of failing. Both drains are bounded now,
+            here and in the host suite.
+
+        And one mis-aimed mutation, which is the same class again: M16's
+        substitution matched pmm_init's CLEANUP fill instead of pmm_build's,
+        because the two are byte-identical for six lines and the cleanup comes
+        first in the file. It reported an escape that did not exist. The anchor
+        now reaches as far as `cursor`.
+
+        AND ONE DEFECT NO BOOT CAN SEE, which is why boot/ksyms.S has a static
+        check of its own. M20 replaces the accessor's immediate with 0: the
+        locked span becomes [0, __kernel_phys_end), which covers MORE than the
+        real one, so nothing reserved becomes allocatable, first-fit simply
+        starts higher, and all six verdicts print PASS on a running machine.
+        Only the disassembly disagrees. This is 3.2.5's M10 again -- the kernel
+        can only report what it believes.
+
+        WHAT THIS DOES NOT PROVE. The reserved-wins pass has no boot-gate
+        coverage at all: QEMU's map has no region of one type inside a region of
+        another, so it flips no bits on this machine and is host-proven only.
+        Nothing is ever WRITTEN to an allocated frame -- the PMM hands out
+        addresses, and 0x100000000 is a perfectly good answer that this kernel
+        cannot map until 3.5. And no page is a page yet: these are frame numbers
+        until the VMM gives them virtual addresses.
 
   *  [ ] 3.5 Virtual Memory Manager (VMM)
 
         Validation: 4-level Page Tables (PML4) are constructed in Fortran, mapping virtual addresses to physical addresses.
+
+        WHAT 3.4 HANDS IT, AND WHAT IT OWES 3.4 BACK. `pmm_alloc_page()` is the
+        page-table allocator: every PML4/PDPT/PD/PT this milestone builds comes
+        out of it. In return the VMM has to unblock three things 3.4 wrote down
+        as limits -- a mapping for frames above the 1 GiB identity window, so an
+        allocation up there becomes memory rather than a number; a guard page
+        below the boot stack, which now abuts the PMM bitmap with zero slack; and
+        the unmapping of PML4[0], after which `pmm_init` can no longer read the
+        MBI at its physical address (it must run first, and it checks that it
+        can).
 
 ## 🔌 Phase 4: The Bus & Subsystems
 

@@ -361,6 +361,85 @@ else:
 PY
 
 echo
+echo "=== the PMM bitmap and the linker symbols it is built from (roadmap 3.4) ==="
+
+# fk_pmm.f90 duplicates two constants boot/boot.S owns, because there is no way
+# to import an assembler .set into Fortran -- the same situation KERNEL_VMA has
+# been in since roadmap 1.2, and the same remedy: diff them here.
+#
+# FK_PMM_IDMAP_BYTES is the load-bearing one. pmm_init dereferences the
+# Multiboot information structure at its PHYSICAL address, which is only legal
+# inside the window boot.S identity-maps. If this constant grows past what the
+# stub actually maps, the check that is supposed to refuse an unmapped MBI
+# accepts it instead, and the kernel takes a page fault reading the memory map.
+asm_num() { sed -n "s/^[[:space:]]*\.set[[:space:]]*$1,[[:space:]]*\([0-9xA-Fa-f]*\).*/\1/p" boot/boot.S | head -1; }
+f90_num() { sed -n "s/^[[:space:]]*integer(c_int64_t), parameter :: $1[[:space:]]*=[[:space:]]*\([0-9]*\)_c_int64_t.*/\1/p" src/mm/fk_pmm.f90 | head -1; }
+
+pd_entries=$(asm_num PD_ENTRIES)
+size_2m=$(asm_num SIZE_2M)
+asm_page=$(asm_num PAGE_SIZE)
+pmm_idmap=$(f90_num FK_PMM_IDMAP_BYTES)
+pmm_page=$(f90_num FK_PMM_PAGE_SIZE)
+pmm_maxphys=$(f90_num FK_PMM_MAX_PHYS)
+
+if [ -z "$pd_entries" ] || [ -z "$size_2m" ] || [ -z "$pmm_idmap" ]; then
+  bad "cannot read PD_ENTRIES/SIZE_2M from boot.S or FK_PMM_IDMAP_BYTES from fk_pmm.f90"
+else
+  want_idmap=$(( pd_entries * size_2m ))
+  want "the identity window fk_pmm assumes == the one boot.S builds" \
+       "$want_idmap" "$pmm_idmap"
+fi
+want "PAGE_SIZE agrees between boot.S and fk_pmm.f90" "$asm_page" "$pmm_page"
+
+# The bitmap is one bit per 4 KiB frame of FK_PMM_MAX_PHYS. Read the size back
+# out of the LINKED image rather than trusting the arithmetic in the source: a
+# mistyped exponent in either constant is invisible until the allocator walks
+# off the end of the array, which in a kernel is somebody else's .bss.
+if [ -n "$pmm_maxphys" ] && [ -n "$pmm_page" ]; then
+  want_bytes=$(( pmm_maxphys / pmm_page / 8 ))
+  got_bytes=$(( $(symsize fk_pmm_bitmap) ))
+  want "fk_pmm_bitmap is one bit per frame of $pmm_maxphys bytes" \
+       "$want_bytes" "$got_bytes"
+fi
+
+pb=$(sym fk_pmm_bitmap); bs=$(sym __bss_start); be=$(sym __bss_end)
+if [ -z "$pb" ]; then bad "fk_pmm_bitmap is not in the linked image"
+elif [ $(( pb >= bs && pb < be )) -eq 1 ]; then
+  ok "fk_pmm_bitmap is inside .bss, so boot.S zeroes it and it costs no image bytes"
+else
+  bad "fk_pmm_bitmap at $pb is OUTSIDE .bss [$bs,$be): 2 MiB of zeros in the image,"
+  bad "     and nothing clears it before pmm_init reads it"
+fi
+
+# The claim above, measured: the data segment must carry the bitmap in its
+# MemSiz and not in its FileSiz.
+read -r dfile dmem < <(readelf -lW "$K" \
+  | awk '/^  LOAD/{f=$5; m=$6} END{printf "%d %d\n", strtonum(f), strtonum(m)}')
+if [ "${dmem:-0}" -gt "${dfile:-0}" ] && [ $(( dmem - dfile )) -ge "$got_bytes" ]; then
+  ok "the last PT_LOAD carries $(( dmem - dfile )) bytes of NOBITS, so the bitmap is not in the file"
+else
+  bad "the last PT_LOAD has FileSiz $dfile MemSiz $dmem -- the bitmap is taking file space"
+fi
+
+# boot/ksyms.S hands Fortran the value of an ABSOLUTE linker symbol as an
+# immediate. Nothing else in the tree can check that the immediate is the right
+# one: a wrong constant marks the wrong frames used and every verdict the PMM
+# prints still says PASS.
+for pair in "fk_kernel_phys_start __kernel_phys_start" "fk_kernel_phys_end __kernel_phys_end"; do
+  set -- $pair
+  imm=$(objdump -d --disassemble="$1" "$K" 2>/dev/null \
+        | sed -n 's/.*movabs[[:space:]]*\$\(0x[0-9a-f]*\),%rax.*/\1/p' | head -1)
+  real=$(sym "$2")
+  if [ -z "$imm" ]; then
+    bad "$1 does not load an immediate -- is it still a movabs of $2?"
+  elif [ "$(norm_hex "$imm")" = "$(norm_hex "$real")" ]; then
+    ok "$1 returns $2 = $imm"
+  else
+    bad "$1 returns $imm but the linker puts $2 at $real"
+  fi
+done
+
+echo
 echo "=== no 2 MiB segment padding (the -z max-page-size flag is doing its job) ==="
 # Catches a missing -z max-page-size, which pads each of the three PT_LOADs to
 # 2 MiB.  Image is 25600 bytes today, 25248 without io.S and the serial driver.

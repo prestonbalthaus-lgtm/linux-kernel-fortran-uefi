@@ -7,7 +7,8 @@ module fk_idt_m
                                          c_int64_t, c_char, c_null_char, c_loc
   use fk_gdt_m,    only: FK_GDT_SEL_CODE
   use fk_tss_m,    only: FK_TSS_IST_DF, tss_on_df_stack
-  use fk_serial_m, only: serial_print_byte, serial_print_string
+  use fk_serial_m, only: serial_print_byte, serial_print_string, &
+                         serial_print_hex
   implicit none
   private
   public :: idt_init, isr_handler
@@ -220,23 +221,6 @@ contains
     call idt_flush(idtr)
   end subroutine idt_init
 
-  subroutine print_hex(v, nibbles)
-    implicit none
-    integer(c_int64_t), intent(in) :: v
-    integer(c_int32_t), intent(in) :: nibbles
-    integer(c_int32_t) :: i, d
-
-    ! 48 = '0', 55 = 'A' - 10.  Bytes, not characters: see serial_print_byte.
-    do i = nibbles - 1_c_int32_t, 0_c_int32_t, -1_c_int32_t
-       d = int(iand(ishft(v, -4 * i), 15_c_int64_t), c_int32_t)
-       if (d < 10_c_int32_t) then
-          call serial_print_byte(48 + d)
-       else
-          call serial_print_byte(55 + d)
-       end if
-    end do
-  end subroutine print_hex
-
   ! "<label> = 0x<16 digits>".  Labels are passed pre-padded so the dump lines
   ! up without a format string; Fortran I/O statements are banned in the kernel.
   subroutine print_reg(label, v)
@@ -249,7 +233,7 @@ contains
        call serial_print_byte(iachar(label(i:i), c_int32_t))
     end do
     call serial_print_string(FK_EQUALS)
-    call print_hex(v, 16_c_int32_t)
+    call serial_print_hex(v, 16_c_int32_t)
     call serial_print_string(FK_NL)
   end subroutine print_reg
 
@@ -267,9 +251,9 @@ contains
     call serial_print_string(FK_PANIC_HDR)
 
     call serial_print_string(FK_EXC)
-    call print_hex(regs%int_no, 2_c_int32_t)
+    call serial_print_hex(regs%int_no, 2_c_int32_t)
     call serial_print_string(FK_ERR)
-    call print_hex(regs%err_code, 16_c_int32_t)
+    call serial_print_hex(regs%err_code, 16_c_int32_t)
     call serial_print_string(FK_DASH)
     if (regs%int_no >= 0_c_int64_t .and. regs%int_no < int(FK_IDT_VECTORS, c_int64_t)) then
        call serial_print_string(FK_FAULT_NAME(int(regs%int_no, c_int32_t)))

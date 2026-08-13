@@ -2,8 +2,7 @@
 # Does a translated module survive kernel build constraints?
 # Usage: tools/linktest.sh [srcdir]   (srcdir defaults to src)
 #
-# Flag set mirrors arch/x86/Makefile for x86_64 (:76, :152-153, :175-176) plus
-# -fno-common, -fno-PIE and -fno-strict-aliasing from the top-level Makefile.
+# The flag set comes from mk/kflags.mk, which is the one place it is defined.
 #
 # Three gates per module:
 #   (a) compiles under the kernel flag set
@@ -16,11 +15,15 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-KFLAGS="-O2 -fwrapv -fno-underscoring \
-        -mcmodel=kernel -mno-red-zone -fno-pic -fno-stack-protector \
-        -fno-asynchronous-unwind-tables -fno-common -fno-strict-aliasing \
-        -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a \
-        -mno-80387 -mno-fp-ret-in-387"
+# READ BACK from mk/kflags.mk, not copied.  This file used to carry its own
+# transcription of the list, which is exactly what that file's header says must
+# not happen -- and it duly drifted: roadmap 3.4 added
+# -fno-tree-loop-distribute-patterns there, this copy did not get it, and this
+# gate then reported the PMM's bitmap fill as `memset <- a libc that kernel
+# space does not have` in a module the real kernel build links cleanly.
+# A gate with its own idea of the build is a gate testing something else.
+KFLAGS=$(printf 'include mk/kflags.mk\nprint:\n\t@echo $(KFLAGS)\n' | make -s -f - print) || {
+  echo "  FAIL  cannot read KFLAGS out of mk/kflags.mk"; exit 1; }
 
 SRCDIR="${1:-src}"
 WORK=$(mktemp -d) || exit 1
@@ -118,9 +121,13 @@ for f in $(find "$SRCDIR" -name "fk_*.f90" | sort); do
     echo "  FAIL  $n: no global text symbol to link against"; fail=1; continue
   fi
   others=$(for o in $objs; do [ "$o" = "$obj" ] || printf '%s ' "$o"; done)
-  # boot.o references three symbols that only linker.ld defines; this probe links
-  # without that script, so they are supplied as placeholder absolutes.
-  LDSCRIPT_SYMS="--defsym __bss_start=0 --defsym __bss_end=0 --defsym __boot_stack_top=0"
+  # boot.o and ksyms.o reference symbols that only linker.ld defines; this probe
+  # links WITHOUT that script -- deliberately, since it is asking about one
+  # module and not about the image -- so they are supplied as placeholder
+  # absolutes.  Their VALUES are checked where they can be: against the real
+  # script, by tools/linkscript-test.sh.
+  LDSCRIPT_SYMS="--defsym __bss_start=0 --defsym __bss_end=0 --defsym __boot_stack_top=0 \
+                 --defsym __kernel_phys_start=0 --defsym __kernel_phys_end=0"
   if ld -nostdlib $LDSCRIPT_SYMS -e "$ent" -o /dev/null "$obj" $others 2>"$WORK/$n.link"; then
     echo "  OK    $n  (kernel flags, no FP/vector, $ndep in-tree dep(s), links -nostdlib)"
   else

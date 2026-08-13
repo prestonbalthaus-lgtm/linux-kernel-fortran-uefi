@@ -13,6 +13,12 @@ fourth and fifth kinds of thing this tree has had to test.
   There is no return value, no trace to compare, and no second chance: the code
   under test runs on a CPU whose last instruction faulted, on a stack frame the
   CPU built and the assembly rearranged.
+* Roadmap 3.4 added a sixth: **a data structure derived from something the
+  kernel did not write**. The memory map comes from GRUB, it is different on
+  every machine, and the PMM's answer is 2 MiB of bits nobody can read off a
+  console. That one is testable in a way none of the others were — the bitmap
+  is `bind(c)`, so a host test can build its own from the same map and diff
+  them bit for bit.
 * Roadmap 3.2.5 added a fifth kind, and it is the awkward one: **state the
   kernel cannot report on itself**. A PIC whose ICW2 never reached the chip is
   invisible from inside — masking works whatever the vector base is, so the
@@ -361,6 +367,234 @@ freshness test, and running mkrescue unpiped so its status survives. This is the
 `docs/HARNESS-VALIDATION-SERIAL.md` stale-image class again, arriving through a
 different door: there it was mtime, here it was an exit status.
 
+## Roadmap 3.4: the PMM
+
+Three channels again, and a fourth that is new: a host suite that can read the
+kernel's own bitmap.
+
+### 1. The host suite (`build/run-pmm`, 390 checks)
+
+`tests/mm/test_pmm.c` assembles real Multiboot2 information structures byte by
+byte, hands their address to `pmm_init`, and then compares `fk_pmm_bitmap`
+against a reference bitmap built in C from the specification. Not against an
+accessor — against the array, because `fk_pmm_bitmap` is `bind(c)` and an
+accessor can agree with a wrong bitmap.
+
+**The MBI is `mmap`ed at a fixed address below 1 GiB**, and that is not a
+workaround for the range check — it is the range check being exercised. `pmm_init`
+refuses an MBI outside the window `boot/boot.S` identity-maps, because outside it
+the dereference is a page fault three files from its cause; a static buffer at
+the usual PIE address would be refused before it was ever parsed.
+
+Sixteen defects, injected one at a time, every one refused:
+
+| # | Defect | How the suite refused it |
+|---|---|---|
+| H1 | `pmm_init` never fills the bitmap with ones | bitmap differs at frame 9; `.bss` arrives zeroed, so the default becomes "the whole address space is free RAM" |
+| H2 | available regions rounded OUTWARD | `awkward edges` differs by one frame at a region whose base is mid-frame |
+| H3 | reserved regions rounded INWARD | frame 786 (0x312000) free where the reference has it used — the kernel's own last, partial frame |
+| H4 | the kernel image is never marked used | frame 256 (0x100000) free: the allocator would hand out this module's text |
+| H5 | the loader's structure is never marked used | frame 131072 free — the frame holding the map being parsed |
+| H6 | the reserved-wins second pass dropped | frame 4160 (0x1040000) free: a RESERVED region inside an AVAILABLE one, and entry order decides |
+| H7 | frame 0 left allocatable | frame 0 free, so `0` is both a valid address and the OOM answer |
+| H8 | `entry_size` assumed to be 24 | the `entry_size 32` map parses into nonsense: 786303 frames instead of 6291327 |
+| H9 | tag stepping drops the `(size+7) & ~7` padding | `E_TAG_OVERRUN` (5) on the map with a 13-byte tag ahead of it |
+| HA | region-table overflow truncates instead of failing | init returns OK with 5242880 frames from a map it only half read |
+| HB | `free()` skips the in-RAM test | freeing an ACPI address succeeds, putting firmware memory into the pool |
+| HC | `free()` skips the already-free test | double free succeeds and the free count drifts up by one per stray call |
+| HD | `free()` never rewinds the scan cursor | reclaim reports success and the frame is never handed out again |
+| HE | `alloc()` computes the address but never sets the bit | `alloc marks the frame used` — see below |
+| HF | a failed `pmm_init` keeps its counters | a refused map still reports 128 regions |
+| HG | `free()` ignores the locked span | freeing the kernel's base address returns OK instead of `E_LOCKED` |
+
+**H6 escaped the first run, and the fixture was wrong rather than the module.**
+The overlapping RESERVED region in the awkward map sat at 2.5 MiB — inside
+`[__kernel_phys_start, __kernel_phys_end)`. The kernel span marked those frames
+used anyway, so deleting `pmm_init`'s entire second pass changed nothing and the
+suite passed a module in which entry ORDER decided whether reserved memory was
+allocatable. The overlap moved to 16 MiB, clear of the kernel, and H6 has been a
+catch since. The lesson is not about this map: a fixture whose interesting case
+is masked by an unrelated correct behaviour tests the masking.
+
+**HE did something worse than escape: it hung.** An allocator that computes an
+address and forgets to set the bit returns the same frame for ever, and
+`while (alloc() != 0)` then spins at 100% with no output — not a failing test,
+a hung suite somebody has to debug. Both drains are bounded now, the host one by
+`free_pages + 16` and `pmm_drain_to_oom` by `pmm_total_pages() + 1`, and HE fails
+in under a second on a check that was already there.
+
+### 2. The static gate
+
+`tools/linkscript-test.sh` gained seven checks, and two of them cannot be made
+anywhere else:
+
+    PASS  the identity window fk_pmm assumes == the one boot.S builds = 1073741824
+    PASS  PAGE_SIZE agrees between boot.S and fk_pmm.f90 = 4096
+    PASS  fk_pmm_bitmap is one bit per frame of 68719476736 bytes = 2097152
+    PASS  fk_pmm_bitmap is inside .bss, so boot.S zeroes it and it costs no image bytes
+    PASS  the last PT_LOAD carries 2149856 bytes of NOBITS, so the bitmap is not in the file
+    PASS  fk_kernel_phys_start returns __kernel_phys_start = 0x100000
+    PASS  fk_kernel_phys_end returns __kernel_phys_end = 0x314000
+
+`FK_PMM_IDMAP_BYTES` is the `KERNEL_VMA` problem again: an assembler `.set`
+cannot be imported into Fortran, so the value is duplicated and diffed here. If
+this one drifts, the check that refuses an unmapped MBI accepts it instead.
+
+The last two are the only witness `boot/ksyms.S` has. It hands Fortran the VALUE
+of an absolute linker symbol as a `movabsq` immediate, and a wrong constant marks
+the wrong frames used while every verdict on the console still prints PASS. The
+gate disassembles the accessor and compares the immediate against `nm`.
+
+### 3. The boot gate
+
+Six verdict lines, each with a FAIL twin in the reject list, on every build —
+not opt-in, because the shipped image prints them:
+
+    Fortran Kernel: PMM reserved and ACPI frames are all marked used.
+    Fortran Kernel: PMM locked the kernel image and the loader map out.
+    Fortran Kernel: PMM allocated 5 contiguous frames.
+    Fortran Kernel: PMM freed and reclaimed the same 5 frames.
+    Fortran Kernel: PMM refused a double, unaligned and locked free.
+    Fortran Kernel: PMM rewound its scan cursor to a freed frame.
+
+The sixth is there because of M18 below; the other five did not cover it.
+
+There is a seventh build, not in the shipped image. `FK_FAULT_MODE = -1` drains
+the allocator and panics through a real `INT3`, which is how the out-of-memory
+path is watched firing rather than argued about:
+
+    Fortran Kernel: PMM handed out 0x00000000005FFD6C frames before it refused.
+    *** PMM OUT OF MEMORY ***
+    EXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint
+    RBX     = 0x00000000005FFD6C
+    RBP     = 0x00000000005FFF7F
+    *** HALTED -- CLI/HLT ***
+
+0x5FFD6C is exactly the free count printed at init, 0x5FFF7F the total, and both
+are in registers because the CPU was holding them when the breakpoint hit. The
+panic is the SAME catcher every hardware fault reaches — `boot/faultgen.S` puts
+one `int3` byte in the way rather than calling a Fortran panic routine, because
+a register dump is only evidence if the registers are the machine's.
+
+### 4. The proof the map is LIVE, which is this milestone's word-3-xor-magic
+
+A region table is exactly the kind of output a constant could fake. It cannot
+fake this — the same image, three `-m` values:
+
+| `-m` | regions | frames total | free |
+|---|---|---|---|
+| 24G | 8 | 0x5FFF7F (6291327) | 0x5FFD6C |
+| 4G  | 8 | 0x0FFF7F (1048447) | 0x0FFD6C |
+| 2G  | **7** | 0x07FF7F (524159) | 0x07FD6C |
+
+At 2G the map has one region FEWER — QEMU emits no above-4 GiB entry at all — and
+the top of low RAM moves from `0xBFFE0000` to `0x7FFE0000`. Every number the PMM
+prints tracks what the loader said, so live loader data crossed into Fortran and
+was parsed, not merely received.
+
+The 24G arithmetic checks by hand: 159 + 786144 + 5505024 = 6291327 frames. The
+531 used are the kernel's 530 (0x100000-0x314000, outward) plus frame 0.
+
+**And a finding worth more than the numbers.** The sentinel reports the MBI at
+physical `0x103540` — which is *inside* `[__kernel_phys_start,
+__kernel_phys_end)`, in the 0xB10-byte alignment gap between the kernel's first
+and second PT_LOAD. GRUB's relocator tucked its own structure into a hole in the
+middle of the loaded image. A PMM that reserved the file-backed ranges instead
+of the whole `__kernel_phys_start .. __kernel_phys_end` span would have handed
+out the frame holding the memory map it was reading.
+
+That is also a limit on this channel: because the MBI is inside the kernel span
+here, removing the MBI marking alone changes nothing on this hardware. Only H5
+proves it, and only because the host suite can put the MBI where it likes.
+
+### 5. Boot mutations
+
+`M14`-`M20` re-run defects the host suite already catches, on a real machine,
+because the host suite parses a map this tree wrote and the boot gate parses one
+GRUB wrote.
+
+| # | Defect | Result |
+|---|---|---|
+| M14 | `pmm_init` handed 0 instead of the loader's pointer | **caught** — `PMM init FAILED, status 0x00000001` and all six verdicts missing |
+| M15 | the kernel image is never marked used | **caught** — `PMM did NOT lock the kernel image out.`, a line the gate forbids |
+| M16 | `pmm_init` never fills the bitmap with ones | **caught** — every AVAILABLE clear flips nothing, so `ram_pages` is 0 and init returns `E_NO_RAM` |
+| M17 | `alloc()` computes the address but never sets the bit | **caught** — three verdicts flip at once; the ALLOC one fails first (five identical addresses) |
+| M18 | `free()` never rewinds the scan cursor | **caught, but only after the gate was strengthened** — see below |
+| M19 | `free()` ignores the locked span | **caught** — `PMM guard FAILED.`, and freeing the kernel's own base returns OK |
+| M20 | `boot/ksyms.S` returns 0 instead of `__kernel_phys_start` | **caught ONLY by the static gate** — see below |
+
+**M20 is this milestone's M10, and the reason the static check was written before
+the mutation existed.** The boot gate passes it completely: with `kern_lo = 0`
+the locked span becomes `[0, __kernel_phys_end)`, which covers strictly MORE than
+the real one, so nothing reserved becomes allocatable, `pmm_verify_kernel_locked`
+is satisfied, first-fit simply starts above the span, and all six verdicts print
+PASS. The kernel is not wrong about anything it can see. Only
+
+    FAIL  fk_kernel_phys_start returns 0x0 but the linker puts __kernel_phys_start at 0x100000
+
+disagrees, and it can only be written because the accessor is a `movabsq` whose
+immediate is in the linked image. The mirror-image defect — a constant that is
+too HIGH — would leave the kernel image allocatable and be caught on COM1; the
+gate has to cover both, and only one of them has a console witness.
+
+**M18 escaped the first run, and the escape was a fact about the fixture, not
+about the module — the same shape as H6.** The five-frame reclaim test allocates
+frames 1 to 5. All five live in the SAME 64-bit bitmap word, so the scan cursor
+never leaves it, and a `free()` that forgets to rewind the cursor still finds
+them: `freed and reclaimed the same 5 frames` printed PASS on a kernel that
+cannot reclaim anything the cursor has moved past. The host suite caught it
+(`alloc after OOM`) only because a drain moves the cursor to the end first.
+
+The fix is in the kernel, not in the gate: `pmm_verify` now takes 96 frames —
+enough to cross a word boundary from any start — frees the FIRST, and demands it
+back, under its own verdict:
+
+    Fortran Kernel: PMM rewound its scan cursor to a freed frame.
+
+M18 now fails it on the boot gate as well. The general lesson is the one H6
+taught from the other direction: **a test whose interesting case fits inside one
+machine word is testing the word, not the algorithm.**
+
+
+### What the boot gate cannot see, stated rather than implied
+
+* **The reserved-wins pass (H6) has no boot-gate coverage.** QEMU's map has no
+  region of one type inside a region of another, so pass B flips no bits on this
+  machine. It is host-proven only. A real firmware map with an overlap would
+  change that, and until one is in hand this is an assumption about QEMU.
+* **The MBI lock (H5) has no independent boot-gate coverage**, for the reason
+  above: GRUB put the MBI inside the kernel span.
+* **Everything above 1 GiB is tracked and never touched.** The PMM hands out
+  addresses; it does not write to the frames. `0x100000000` is a perfectly good
+  answer from `pmm_alloc_page` on this machine and the kernel cannot yet map it.
+  That is roadmap 3.5's, and until then an allocation above the identity window
+  is a number, not memory.
+* **64 GiB is a ceiling, not the architecture's.** Above `FK_PMM_MAX_PHYS` the
+  memory is counted into `pmm_ignored_bytes` and reported. It reads 0 on every
+  boot so far, which means the reporting path itself is only proven by the host
+  suite's `awkward edges` map.
+
+### A gate defect this milestone found, and fixed
+
+`tools/linktest.sh` carried its **own fourth copy of KFLAGS**, which is precisely
+what `mk/kflags.mk`'s header says must not happen. It drifted the first time a
+flag was added: 3.4 put `-fno-tree-loop-distribute-patterns` in `mk/kflags.mk`,
+the copy did not get it, and the gate then reported
+
+    FAIL  fk_pmm: undefined symbols that NOTHING in this tree defines:
+          memset   <- a libc that kernel space does not have
+
+for a module the real kernel build links clean. It now reads the flags back
+through make, the way `tools/linkscript-test.sh` already did.
+
+The flag itself is the finding underneath. gcc's loop-distribution pass rewrites
+a DO loop that stores one value across an array into a call to `memset` — the
+Fortran half of what `-ffreestanding` does for C, and a live problem the moment a
+fill loop is bigger than a handful of elements. Measured: the PMM's 262144-word
+bitmap fill emits `U memset` at -O2 without the flag and nothing with it. The
+tree got this far without noticing because every earlier fill was four elements
+long.
+
 ## Reproducing
 
     ./tools/run.sh audit                          # every static gate
@@ -371,7 +605,12 @@ different door: there it was mtime, here it was an exit status.
     FK_REJECT_SERIAL=$'*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***\nFortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.' \
     FK_CHECK_HW=1 tools/qemu-boot-test.sh         # 3.2.5
 
-    tools/mutate-phase3.sh                        # the whole table, ~15 boots
+    ./tools/run.sh build/run-pmm                  # roadmap 3.4, 390 host checks
+    FK_MEM=4G tools/qemu-boot-test.sh             # the map tracks -m: see above
+    FK_EXPECT_SERIAL=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint' \
+      tools/qemu-boot-test.sh                     # after sedding FK_FAULT_MODE to -1
+
+    tools/mutate-phase3.sh                        # the whole table, ~23 boots
     tools/mutate-phase3.sh M10 M13                # or just these
 
 `tools/mutate-phase3.sh` edits the tree in place and restores it with

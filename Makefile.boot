@@ -68,12 +68,14 @@ LDFLAGS_KERNEL := -nostdlib -z max-page-size=0x1000 -T linker.ld
 # failure then has to be untangled from. fk_serial is in the image for precisely
 # the reason the rule states: roadmap 2.1 made kernel_main CALL it, so it is
 # boot path now, not library. fk_gdt and fk_idt clear the same bar for roadmap
-# 3.1/3.2, and the next module to appear here has to clear it too.
+# 3.1/3.2, fk_pmm for 3.4, and the next module to appear here has to clear it
+# too.
 FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/cpu/fk_gdt.f90 \
                src/cpu/fk_tss.f90 \
                src/cpu/fk_idt.f90 \
                src/drivers/pic/fk_pic.f90 \
+               src/mm/fk_pmm.f90 \
                src/boot/fk_kmain.f90
 
 # Assembly sources. NAMED ONE BY ONE, deliberately not $(wildcard boot/*.S):
@@ -96,7 +98,8 @@ ASRC_KERNEL := boot/boot.S \
                boot/io.S \
                boot/gdt_flush.S \
                boot/interrupts.S \
-               boot/faultgen.S
+               boot/faultgen.S \
+               boot/ksyms.S
 
 AOBJ := $(patsubst boot/%.S,$(BUILD)/%.o,$(ASRC_KERNEL))
 FOBJ := $(foreach s,$(FSRC_KERNEL),$(BUILD)/$(basename $(notdir $(s))).o)
