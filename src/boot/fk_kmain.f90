@@ -15,12 +15,12 @@
 ! captured COM1 log.
 module fk_kmain_m
   use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t, c_char, &
-                                         c_null_char
+                                         c_null_char, c_funloc
   use fk_serial_m, only: FK_SERIAL_COM1, serial_init, serial_print_string, &
                          serial_print_hex
   use fk_gdt_m,    only: gdt_init
   use fk_tss_m,    only: tss_init
-  use fk_idt_m,    only: idt_init, fk_irq_spurious
+  use fk_idt_m,    only: idt_init, fk_irq_spurious, idt_set_panic_colors
   use fk_pic_m,    only: pic_remap, pic_unmask, pic_imr
   use fk_pit_m,    only: FK_PIT_HZ, FK_PIT_IRQ, pit_init, fk_tick_count, &
                          fk_first_rip, fk_first_rflags
@@ -34,7 +34,11 @@ module fk_kmain_m
   use fk_fbinfo_m, only: FK_FB_OK, FK_FB_BASE, FK_FB_PITCH, FK_FB_WIDTH, &
                          FK_FB_HEIGHT, FK_FB_BPP, FK_FB_MASKS, FK_FB_BYTES, &
                          fk_fb_info, fb_probe, fb_pixel_pack, fb_note_mapping
-  use fk_gop_renderer_m, only: vga_init_framebuffer, vga_fill_rect
+  use fk_gop_renderer_m, only: vga_init_framebuffer, vga_fill_rect, &
+                         vga_width, vga_height, vga_print_string
+  use fk_console_m, only: FK_CON_OK, console_init, console_write, &
+                         console_print_hex, console_cols, console_rows, &
+                         console_ready, fk_console_scrolls
   use fk_vmm_m,    only: FK_VMM_OK, FK_VMM_SECTIONS, FK_VMM_SCRATCH, &
                          FK_PTE_P, FK_PTE_RW, FK_PTE_NX, &
                          vmm_init, vmm_activate, vmm_drop_identity, &
@@ -43,8 +47,18 @@ module fk_kmain_m
                          vmm_nx_enabled, vmm_verify_image, vmm_read_cr3, &
                          vmm_section_start, vmm_section_end, vmm_section_flags, &
                          vmm_guard_page, vmm_phys_to_virt, &
-                         FK_VMM_MMIO, FK_VMM_WC, vmm_reserve_mmio, &
-                         vmm_map_mmio, vmm_pat_arm, vmm_read_pat
+                         FK_VMM_MMIO, FK_VMM_HEAP, FK_VMM_WC, &
+                         vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, &
+                         vmm_read_pat
+  use fk_sched_m,  only: FK_SCHED_MAX, fk_task_runs, fk_sched_switches, &
+                         sched_init, sched_spawn, sched_start, sched_current, &
+                         sched_tasks
+  use fk_heap_m,   only: FK_HEAP_OK, FK_HEAP_ALIGN, FK_HEAP_HDR, &
+                         FK_HS_MAPPED, FK_HS_USED, FK_HS_FREE, FK_HS_BLOCKS, &
+                         FK_HS_ALLOCS, FK_HS_FREES, FK_HS_LARGEST, &
+                         FK_HS_FAILED, FK_HS_BADFREE, fk_heap_stat, &
+                         heap_init, kmalloc, kzalloc, kfree, heap_check, &
+                         heap_base, heap_top, heap_size_of
   implicit none
   private
   public :: kernel_main
@@ -297,9 +311,145 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_FB_ARM_BAD = &
        "Fortran Kernel: GOP renderer REFUSED the framebuffer, status 0x" // c_null_char
 
+  character(kind=c_char, len=*), parameter :: FK_CON_READY = &
+       "Fortran Kernel: console is live on the framebuffer, cols/rows 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_CON_BAD = &
+       "Fortran Kernel: console REFUSED the framebuffer geometry, status 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_CON_SCROLL = &
+       "Fortran Kernel: console scrolled 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_CON_SCROLL_TAIL = &
+       " times, costing 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_CON_SCROLL_TICKS = &
+       " PIT ticks for the last one." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_CON_SCROLL_BAD = &
+       "Fortran Kernel: console never scrolled." // FK_CRLF // c_null_char
+
+  ! Printed to the SCREEN, not to COM1.  It is the only line in the boot whose
+  ! evidence is a pixel, so it says so.
+  character(kind=c_char, len=*), parameter :: FK_SCREEN_BANNER = &
+       "PROJECT FORTRAN-KERNEL -- this line is glyphs, not a serial byte." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SCREEN_GEOM = &
+       "console " // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SCREEN_X = "x" // c_null_char
+
+  ! roadmap 4.0.  Frames are staged here before any of them is mapped, so a
+  ! growth that cannot be completed costs nothing.  512 pages = 2 MiB, which is
+  ! also the largest single kmalloc this kernel serves.
+  integer(c_int32_t), parameter :: FK_SBRK_MAX_PAGES = 512_c_int32_t
+  integer(c_int64_t), save :: sbrk_frames(FK_SBRK_MAX_PAGES) = 0_c_int64_t
+  integer(c_int64_t), save :: heap_next = 0_c_int64_t
+
+  integer(c_int32_t), parameter :: FK_HEAP_PROBES = 8_c_int32_t
+  ! Sizes that straddle the allocator's boundaries: under the header, exactly a
+  ! block, one over an alignment unit, and past the 64 KiB growth chunk.
+  integer(c_int64_t), parameter :: FK_HEAP_SIZES(FK_HEAP_PROBES) = &
+       [ 1_c_int64_t, 16_c_int64_t, 17_c_int64_t, 64_c_int64_t, &
+         4095_c_int64_t, 4096_c_int64_t, 65536_c_int64_t, 131072_c_int64_t ]
+  integer(c_int64_t), parameter :: FK_HEAP_PATTERN = int(z'5A5AA5A500C0FFEE', c_int64_t)
+
   ! The virtual address the framebuffer is mapped at, and the width of the
   ! test bar the harness looks for in a pmemsave of the framebuffer.
   integer(c_int32_t), parameter :: FK_FB_BAR_H = 16_c_int32_t
+
+  ! A string drawn in the status bar at a FIXED cell, in a colour nothing else
+  ! uses, and never scrolled.  tools/qmp-sentinel.py renders the same glyphs
+  ! from the kernel's OWN font table -- read out of guest memory -- and
+  ! compares them pixel for pixel.  Counting lit pixels proves the renderer
+  ! reached video memory; this proves it drew the RIGHT glyphs, which is the
+  ! only thing that catches a character arriving at vga_print_char mangled.
+  character(kind=c_char, len=*), parameter :: FK_FB_SIG = &
+       "FK-GOP 2.4" // c_null_char
+  integer(c_int32_t), parameter :: FK_FB_SIG_X = 256_c_int32_t
+
+  ! roadmap 4.0, the scheduler.
+  character(kind=c_char, len=*), parameter :: FK_SCHED_START = &
+       "Fortran Kernel: scheduler spawning two kernel threads (roadmap 4.0)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SCHED_SPAWNED = &
+       "Fortran Kernel: scheduler tasks/current 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SCHED_SPAWN_BAD = &
+       "Fortran Kernel: scheduler could NOT spawn a thread, status 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SCHED_LIVE = &
+       "Fortran Kernel: preemption is on; the timer now switches tasks." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SCHED_RAN = &
+       "Fortran Kernel: both threads ran, switches/A/B 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SCHED_STUCK = &
+       "Fortran Kernel: a spawned thread NEVER ran; the switch did not " // &
+       "happen." // FK_CRLF // c_null_char
+
+  ! What the two threads put on screen.  Single characters, because the proof
+  ! is that they INTERLEAVE: a long string from each would be indistinguishable
+  ! from one thread running to completion and then the other.
+  character(kind=c_char, len=*), parameter :: FK_THREAD_A = "A" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_THREAD_B = "B" // c_null_char
+
+  ! Ticks a thread waits between characters.  10 ms each at 100 Hz, so the two
+  ! threads produce a few characters a second and a boot's worth of output is
+  ! bounded.
+  integer(c_int64_t), parameter :: FK_THREAD_PERIOD = 5_c_int64_t
+
+  ! How long the boot thread waits for the other two before calling it stuck.
+  ! Generous: three thread periods plus slack, so a slow emulator does not
+  ! produce a failure that looks like a scheduling bug.
+  integer(c_int64_t), parameter :: FK_SCHED_WAIT_TICKS = 200_c_int64_t
+
+  ! Console colours, packed once the loader's channel layout is known.
+  integer(c_int32_t), parameter :: FK_CON_FG_R = 208_c_int32_t
+  integer(c_int32_t), parameter :: FK_CON_FG_G = 224_c_int32_t
+  integer(c_int32_t), parameter :: FK_CON_FG_B = 208_c_int32_t
+  integer(c_int32_t), parameter :: FK_CON_BG_R =   0_c_int32_t
+  integer(c_int32_t), parameter :: FK_CON_BG_G =  16_c_int32_t
+  integer(c_int32_t), parameter :: FK_CON_BG_B =  32_c_int32_t
+
+  ! roadmap 4.0, the heap.
+  character(kind=c_char, len=*), parameter :: FK_HEAP_START = &
+       "Fortran Kernel: heap bringing up kmalloc/kfree (roadmap 4.0)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_BASE = &
+       "Fortran Kernel: heap base/top/mapped 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_SBRK_BAD = &
+       "Fortran Kernel: heap could not get memory from the PMM/VMM." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_ALIGN_OK = &
+       "Fortran Kernel: heap returned 16-byte aligned, non-overlapping blocks." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_ALIGN_BAD = &
+       "Fortran Kernel: heap blocks are misaligned or OVERLAP." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_PATTERN_OK = &
+       "Fortran Kernel: heap kept every block's contents across the other " // &
+       "allocations." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_PATTERN_BAD = &
+       "Fortran Kernel: heap blocks OVERWROTE each other." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_ZERO_OK = &
+       "Fortran Kernel: kzalloc returned memory that was already zero." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_ZERO_BAD = &
+       "Fortran Kernel: kzalloc returned DIRTY memory." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_COAL_OK = &
+       "Fortran Kernel: heap coalesced every freed block back into one, " // &
+       "largest free 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_COAL_BAD = &
+       "Fortran Kernel: heap did NOT coalesce; it is fragmented, blocks 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_GUARD_OK = &
+       "Fortran Kernel: heap refused a double free, a stray pointer and a " // &
+       "wrapped size." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_GUARD_BAD = &
+       "Fortran Kernel: heap ACCEPTED a free it should have refused." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_CHECK_OK = &
+       "Fortran Kernel: heap tiles its window exactly, blocks/used/free 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_HEAP_CHECK_BAD = &
+       "Fortran Kernel: heap FAILED its own consistency walk, faults 0x" // &
+       c_null_char
 
   ! Same order as fk_vmm_m's section table, which is the order linker.ld lays
   ! them down.  A mismatch here mislabels a row and nothing else, which is
@@ -827,6 +977,327 @@ contains
   ! running" is a VERDICT and not an announcement: printed unconditionally it
   ! appeared underneath this routine's own three FAIL lines in mutation M31,
   ! which is a kernel contradicting itself in the same log.
+  ! --- roadmap 4.0: two kernel threads ---------------------------------------
+
+  ! The thread bodies.  bind(c) so their addresses are ordinary symbols the
+  ! scheduler can put in a frame's RIP, and they NEVER RETURN: a task that
+  ! returns lands on the fake return address sched_spawn planted, which is
+  ! fk_cpu_halt.
+  !
+  ! Each waits on fk_tick_count rather than spinning a counter, so what it is
+  ! waiting for is the same clock that preempts it, and the two threads
+  ! interleave at a rate a human reading COM1 can follow.
+  subroutine thread_a() bind(c, name="thread_a")
+    implicit none
+    call thread_body(1_c_int32_t, FK_THREAD_A)
+  end subroutine thread_a
+
+  subroutine thread_b() bind(c, name="thread_b")
+    implicit none
+    call thread_body(2_c_int32_t, FK_THREAD_B)
+  end subroutine thread_b
+
+  subroutine thread_body(slot, mark)
+    implicit none
+    integer(c_int32_t), intent(in) :: slot
+    character(kind=c_char, len=*), intent(in) :: mark
+    integer(c_int64_t) :: due
+
+    do
+       due = fk_tick_count + FK_THREAD_PERIOD
+       ! A plain spin, and it is deliberate: this is the loop the timer
+       ! interrupt has to preempt for any of this to work, so replacing it with
+       ! HLT would hide the very thing being demonstrated.
+       do while (fk_tick_count < due)
+       end do
+
+       ! The counter is bumped by the THREAD, so it is evidence the thread's
+       ! own instructions executed and not that the scheduler chose it.
+       fk_task_runs(slot + 1_c_int32_t) = fk_task_runs(slot + 1_c_int32_t) + 1_c_int64_t
+       call console_write(mark, 2_c_int32_t)
+       call serial_print_string(mark)
+    end do
+  end subroutine thread_body
+
+  ! roadmap 4.0's verification.  It runs on task 1 -- the boot thread -- and the
+  ! two counters it waits on are incremented by the other two, so the wait can
+  ! only end if a context switch really happened and really came back.
+  function sched_bringup() result(status)
+    implicit none
+    integer(c_int32_t) :: status
+    integer(c_int32_t) :: a, b
+    integer(c_int64_t) :: deadline
+
+    call serial_print_string(FK_SCHED_START)
+    status = sched_init()
+    if (status /= 0_c_int32_t) return
+
+    a = sched_spawn(transfer(c_funloc(thread_a), 0_c_int64_t))
+    b = sched_spawn(transfer(c_funloc(thread_b), 0_c_int64_t))
+    if (a < 0_c_int32_t .or. b < 0_c_int32_t) then
+       call serial_print_string(FK_SCHED_SPAWN_BAD)
+       call serial_print_hex(int(min(a, b), c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       status = -1_c_int32_t
+       return
+    end if
+
+    call serial_print_string(FK_SCHED_SPAWNED)
+    call serial_print_hex(int(sched_tasks(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(sched_current(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call sched_start()
+    call serial_print_string(FK_SCHED_LIVE)
+
+    ! Wait for BOTH to have run at least twice.  Once each would be satisfied
+    ! by a scheduler that switches away and never comes back -- this thread
+    ! would still be running to print the verdict, but only because the timer
+    ! kept returning to it by luck of the round robin.
+    deadline = fk_tick_count + FK_SCHED_WAIT_TICKS
+    do while (fk_tick_count < deadline)
+       if (fk_task_runs(2) >= 2_c_int64_t .and. fk_task_runs(3) >= 2_c_int64_t) exit
+    end do
+
+    if (fk_task_runs(2) >= 2_c_int64_t .and. fk_task_runs(3) >= 2_c_int64_t) then
+       call serial_print_string(FK_SCHED_RAN)
+       call serial_print_hex(fk_sched_switches, 8_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(fk_task_runs(2), 8_c_int32_t)
+       call serial_print_string(FK_PMM_SLASH)
+       call serial_print_hex(fk_task_runs(3), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       status = 0_c_int32_t
+    else
+       call serial_print_string(FK_SCHED_STUCK)
+       status = -1_c_int32_t
+    end if
+  end function sched_bringup
+
+  ! --- roadmap 4.0: the heap ------------------------------------------------
+
+  ! Where the heap's pages come from.  fk_heap_m calls this and knows nothing
+  ! else about the machine: it asks for BYTES immediately above what it already
+  ! has, and gets back the address they landed at or 0.
+  !
+  ! TWO PHASES, AND THE REASON IS THAT THERE IS NO vmm_unmap.  Allocating a
+  ! frame and mapping it one page at a time would, on a mid-way failure, leave
+  ! pages mapped that the heap never learns about and frames the PMM has handed
+  ! out that nothing can return -- while still reporting failure.  Every frame
+  ! is therefore taken first, and only a complete set is mapped.
+  function heap_sbrk(bytes) result(virt) bind(c, name="heap_sbrk")
+    implicit none
+    integer(c_int64_t), intent(in), value :: bytes
+    integer(c_int64_t) :: virt
+    integer(c_int64_t) :: pages, i
+    integer(c_int32_t) :: st
+
+    virt = 0_c_int64_t
+    if (bytes <= 0_c_int64_t) return
+    pages = (bytes + FK_PMM_PAGE_SIZE - 1_c_int64_t) / FK_PMM_PAGE_SIZE
+    ! The staging array is the cap, stated rather than discovered: a kmalloc
+    ! bigger than FK_SBRK_MAX_PAGES pages is refused instead of half-served.
+    if (pages > int(FK_SBRK_MAX_PAGES, c_int64_t)) return
+
+    do i = 1_c_int64_t, pages
+       sbrk_frames(int(i, c_int32_t)) = pmm_alloc_page()
+       if (sbrk_frames(int(i, c_int32_t)) == 0_c_int64_t) then
+          ! Give back what was taken.  A failed growth must cost nothing.
+          call sbrk_unwind(i - 1_c_int64_t)
+          return
+       end if
+    end do
+
+    do i = 1_c_int64_t, pages
+       st = vmm_map_page(heap_next + (i - 1_c_int64_t) * FK_PMM_PAGE_SIZE, &
+                         sbrk_frames(int(i, c_int32_t)), &
+                         ior(ior(FK_PTE_P, FK_PTE_RW), FK_PTE_NX))
+       if (st /= FK_VMM_OK) then
+          ! The frames are still ours to give back; the pages already mapped
+          ! are left mapped and simply not advertised, because unmapping is a
+          ! roadmap 3.5 operation that does not exist.
+          call sbrk_unwind(pages)
+          return
+       end if
+    end do
+
+    virt      = heap_next
+    heap_next = heap_next + pages * FK_PMM_PAGE_SIZE
+  end function heap_sbrk
+
+  subroutine sbrk_unwind(n)
+    implicit none
+    integer(c_int64_t), intent(in) :: n
+    integer(c_int64_t) :: i
+    integer(c_int32_t) :: st
+
+    do i = 1_c_int64_t, n
+       st = pmm_free_page(sbrk_frames(int(i, c_int32_t)))
+    end do
+  end subroutine sbrk_unwind
+
+  ! roadmap 4.0's verification, on the same terms as pmm_verify: every property
+  ! is checked against the heap's own structure after the fact, and each PASS
+  ! line has a FAIL twin the boot gate refuses.
+  function heap_bringup() result(status)
+    implicit none
+    integer(c_int32_t) :: status
+    integer(c_int32_t) :: i, j, bad
+    integer(c_int64_t) :: p(FK_HEAP_PROBES), sz, before_bad, v
+
+    call serial_print_string(FK_HEAP_START)
+    status = heap_init()
+    if (status /= FK_HEAP_OK) return
+
+    ! Sizes that straddle every interesting boundary: below the minimum block,
+    ! exactly one alignment unit, one byte over, and past the growth chunk.
+    do i = 1_c_int32_t, FK_HEAP_PROBES
+       p(i) = kmalloc(FK_HEAP_SIZES(i))
+    end do
+    if (p(1) == 0_c_int64_t) then
+       call serial_print_string(FK_HEAP_SBRK_BAD)
+       status = -1_c_int32_t
+       return
+    end if
+
+    call serial_print_string(FK_HEAP_BASE)
+    call serial_print_hex(heap_base(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(heap_top(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_heap_stat(FK_HS_MAPPED), 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! Alignment, and that no two live blocks overlap.  Overlap is checked
+    ! against the size the ALLOCATOR reports for each pointer, not against the
+    ! size that was asked for: a block rounded up and then handed out twice
+    ! passes a request-sized comparison.
+    bad = 0_c_int32_t
+    do i = 1_c_int32_t, FK_HEAP_PROBES
+       if (p(i) == 0_c_int64_t) then
+          bad = bad + 1_c_int32_t
+          cycle
+       end if
+       if (iand(p(i), FK_HEAP_ALIGN - 1_c_int64_t) /= 0_c_int64_t) &
+            bad = bad + 1_c_int32_t
+       if (heap_size_of(p(i)) < FK_HEAP_SIZES(i)) bad = bad + 1_c_int32_t
+       do j = i + 1_c_int32_t, FK_HEAP_PROBES
+          if (p(j) == 0_c_int64_t) cycle
+          if (p(i) < p(j) + heap_size_of(p(j)) .and. &
+              p(j) < p(i) + heap_size_of(p(i))) bad = bad + 1_c_int32_t
+       end do
+    end do
+    if (bad == 0_c_int32_t) then
+       call serial_print_string(FK_HEAP_ALIGN_OK)
+    else
+       call serial_print_string(FK_HEAP_ALIGN_BAD)
+    end if
+
+    ! Fill each block with a value derived from its index, then read them all
+    ! back AFTER every write: a block that overlaps its neighbour holds the
+    ! neighbour's pattern by the time the last one is written.
+    do i = 1_c_int32_t, FK_HEAP_PROBES
+       call fk_poke64(p(i), FK_HEAP_PATTERN + int(i, c_int64_t))
+       sz = heap_size_of(p(i))
+       if (sz >= 16_c_int64_t) &
+            call fk_poke64(p(i) + sz - 8_c_int64_t, FK_HEAP_PATTERN - int(i, c_int64_t))
+    end do
+    bad = 0_c_int32_t
+    do i = 1_c_int32_t, FK_HEAP_PROBES
+       if (fk_peek64(p(i)) /= FK_HEAP_PATTERN + int(i, c_int64_t)) &
+            bad = bad + 1_c_int32_t
+       sz = heap_size_of(p(i))
+       if (sz >= 16_c_int64_t) then
+          if (fk_peek64(p(i) + sz - 8_c_int64_t) /= &
+              FK_HEAP_PATTERN - int(i, c_int64_t)) bad = bad + 1_c_int32_t
+       end if
+    end do
+    if (bad == 0_c_int32_t) then
+       call serial_print_string(FK_HEAP_PATTERN_OK)
+    else
+       call serial_print_string(FK_HEAP_PATTERN_BAD)
+    end if
+
+    ! kzalloc, into a block that was just freed and is therefore full of the
+    ! pattern above -- which is the only way this test means anything.
+    call kfree(p(2))
+    v   = kzalloc(FK_HEAP_SIZES(2))
+    bad = 0_c_int32_t
+    if (v == 0_c_int64_t) then
+       bad = 1_c_int32_t
+    else
+       do i = 0_c_int32_t, int(min(FK_HEAP_SIZES(2), 64_c_int64_t) / 8_c_int64_t, c_int32_t) - 1_c_int32_t
+          if (fk_peek64(v + int(i, c_int64_t) * 8_c_int64_t) /= 0_c_int64_t) &
+               bad = bad + 1_c_int32_t
+       end do
+    end if
+    if (bad == 0_c_int32_t) then
+       call serial_print_string(FK_HEAP_ZERO_OK)
+    else
+       call serial_print_string(FK_HEAP_ZERO_BAD)
+    end if
+    p(2) = v
+
+    ! The guards.  A double free, a pointer that was never in the heap and a
+    ! size that wrapped negative must all be REFUSED and COUNTED -- an
+    ! allocator that quietly accepts any of them corrupts itself and reports
+    ! the damage in an unrelated call.
+    before_bad = fk_heap_stat(FK_HS_BADFREE)
+    call kfree(p(1))
+    call kfree(p(1))
+    call kfree(heap_base() - 4096_c_int64_t)
+    call kfree(p(3) + 1_c_int64_t)
+    if (fk_heap_stat(FK_HS_BADFREE) == before_bad + 3_c_int64_t .and. &
+        kmalloc(-1_c_int64_t) == 0_c_int64_t .and. &
+        kmalloc(0_c_int64_t) == 0_c_int64_t) then
+       call serial_print_string(FK_HEAP_GUARD_OK)
+    else
+       call serial_print_string(FK_HEAP_GUARD_BAD)
+    end if
+    p(1) = 0_c_int64_t
+
+    ! Free everything still live, in an order that is not the allocation order,
+    ! and require the heap to come back to ONE free block.  Freeing in order
+    ! only ever exercises forward coalescing.
+    do i = FK_HEAP_PROBES, 1_c_int32_t, -2_c_int32_t
+       call kfree(p(i))
+       p(i) = 0_c_int64_t
+    end do
+    do i = 1_c_int32_t, FK_HEAP_PROBES, 2_c_int32_t
+       call kfree(p(i))
+       p(i) = 0_c_int64_t
+    end do
+
+    if (heap_check() /= 0_c_int64_t) then
+       call serial_print_string(FK_HEAP_CHECK_BAD)
+       call serial_print_hex(heap_check(), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       status = -1_c_int32_t
+       return
+    end if
+    call serial_print_string(FK_HEAP_CHECK_OK)
+    call serial_print_hex(fk_heap_stat(FK_HS_BLOCKS), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_heap_stat(FK_HS_USED), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_heap_stat(FK_HS_FREE), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    if (fk_heap_stat(FK_HS_BLOCKS) == 1_c_int64_t .and. &
+        fk_heap_stat(FK_HS_USED) == 0_c_int64_t) then
+       call serial_print_string(FK_HEAP_COAL_OK)
+       call serial_print_hex(fk_heap_stat(FK_HS_LARGEST), 16_c_int32_t)
+       call serial_print_string(FK_NL)
+    else
+       call serial_print_string(FK_HEAP_COAL_BAD)
+       call serial_print_hex(fk_heap_stat(FK_HS_BLOCKS), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+    end if
+
+    status = 0_c_int32_t
+  end function heap_bringup
+
   ! roadmap 2.2 + 2.4.  Runs AFTER the higher-half handoff, because everything
   ! it does needs the VMM's hierarchy: the PAT write, the write-combining
   ! mapping and the alias check are all statements about tables the boot stub
@@ -895,8 +1366,85 @@ contains
     end if
     call fb_test_bar()
     call serial_print_string(FK_FB_ARMED)
-    status = 0_c_int32_t
+
+    ! The panic handler is told what white and red ARE on this framebuffer
+    ! before anything can panic on it; it packs no channels of its own.
+    call idt_set_panic_colors( &
+         fb_pixel_pack(255_c_int32_t, 255_c_int32_t, 255_c_int32_t), &
+         fb_pixel_pack(170_c_int32_t, 0_c_int32_t, 0_c_int32_t))
+
+    status = console_bringup()
   end function fb_bringup
+
+  ! roadmap 2.4's terminal.  The console owns every pixel row BELOW the status
+  ! bar and scrolls only inside that band, so the four primaries the harness
+  ! asserts survive a screen that has wrapped many times.
+  function console_bringup() result(status)
+    implicit none
+    integer(c_int32_t) :: status
+
+    status = console_init(vga_width(), vga_height(), FK_FB_BAR_H, &
+                          fb_pixel_pack(FK_CON_FG_R, FK_CON_FG_G, FK_CON_FG_B), &
+                          fb_pixel_pack(FK_CON_BG_R, FK_CON_BG_G, FK_CON_BG_B))
+    if (status /= FK_CON_OK) then
+       call serial_print_string(FK_CON_BAD)
+       call serial_print_hex(int(status, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    call serial_print_string(FK_CON_READY)
+    call serial_print_hex(int(console_cols(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(console_rows(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call console_write(FK_SCREEN_BANNER, 128_c_int32_t)
+    call console_write(FK_SCREEN_GEOM, 32_c_int32_t)
+    call console_print_hex(int(console_cols(), c_int64_t), 4_c_int32_t)
+    call console_write(FK_SCREEN_X, 4_c_int32_t)
+    call console_print_hex(int(console_rows(), c_int64_t), 4_c_int32_t)
+    call console_write(FK_NL, 4_c_int32_t)
+
+    status = 0_c_int32_t
+  end function console_bringup
+
+  ! Fill the console past its last row so it HAS to scroll, and price the last
+  ! scroll in PIT ticks.  A write-combining framebuffer is read uncached, and a
+  ! full-screen scroll reads and writes every visible byte -- so this is the
+  ! most expensive thing the driver does, and the number is measured rather
+  ! than asserted.  Runs after irq_bringup, which is what makes the clock run.
+  subroutine console_scroll_probe()
+    implicit none
+    integer(c_int32_t) :: i, n
+    integer(c_int64_t) :: t0, t1, before
+
+    if (console_ready() == 0_c_int32_t) return
+
+    before = fk_console_scrolls
+    ! One more line than the console has rows, so the last one must scroll
+    ! however far down the cursor already was.
+    n = console_rows() + 1_c_int32_t
+    do i = 1_c_int32_t, n
+       call console_write(FK_SCREEN_GEOM, 32_c_int32_t)
+       call console_print_hex(int(i, c_int64_t), 4_c_int32_t)
+       call console_write(FK_NL, 4_c_int32_t)
+    end do
+
+    t0 = fk_tick_count
+    call console_write(FK_NL, 4_c_int32_t)
+    t1 = fk_tick_count
+
+    if (fk_console_scrolls > before) then
+       call serial_print_string(FK_CON_SCROLL)
+       call serial_print_hex(fk_console_scrolls, 8_c_int32_t)
+       call serial_print_string(FK_CON_SCROLL_TAIL)
+       call serial_print_hex(t1 - t0, 8_c_int32_t)
+       call serial_print_string(FK_CON_SCROLL_TICKS)
+    else
+       call serial_print_string(FK_CON_SCROLL_BAD)
+    end if
+  end subroutine console_scroll_probe
 
   ! The status bar, and the only thing on screen whose exact pixel values are
   ! known before a single glyph is drawn.  Four primaries rather than one
@@ -923,6 +1471,8 @@ contains
                        fb_pixel_pack(0_c_int32_t, 0_c_int32_t, i))
     call vga_fill_rect(3_c_int32_t * BLK, 0_c_int32_t, BLK, FK_FB_BAR_H, &
                        fb_pixel_pack(i, i, i))
+    call vga_print_string(FK_FB_SIG, 16_c_int32_t, FK_FB_SIG_X, 0_c_int32_t, &
+                          fb_pixel_pack(i, i, 0_c_int32_t))
   end subroutine fb_test_bar
 
   function irq_bringup() result(status)
@@ -1130,6 +1680,20 @@ contains
     ! FK_FAULT_MODE build runs with interrupts live from here on, so the tick
     ! proof rides on all of them the way 3.4's and 3.5's verdicts do.
     status = irq_bringup()
+
+    ! Needs a running clock, so it comes after the timer is live.
+    call console_scroll_probe()
+
+    ! roadmap 4.0.  After the VMM (it maps pages) and after the PMM (it takes
+    ! frames), and with interrupts already live so the allocator is exercised
+    ! on a machine that is being interrupted rather than a quiet one.
+    heap_next = FK_VMM_HEAP
+    status = heap_bringup()
+
+    ! roadmap 4.0's second half.  Last, because from here on this routine is
+    ! one of three threads rather than the only one, and everything above
+    ! wanted a machine that was not being switched out from under it.
+    status = sched_bringup()
 
     ! How the boot ends.  The default raises nothing at all; every other value
     ! raises one fault, from the CPU and never simulated by a call.

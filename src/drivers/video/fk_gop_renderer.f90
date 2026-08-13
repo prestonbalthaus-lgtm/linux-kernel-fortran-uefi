@@ -106,7 +106,7 @@
 !! that scribbles past the framebuffer before the memory manager exists is a
 !! far worse outcome than a dropped pixel.
 module fk_gop_renderer_m
-  use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t, &
+  use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t, c_size_t, &
                                          c_char, c_ptr, c_f_pointer, c_null_char
   ! The font is DATA and lives in its own module. Only the accessor is used
   ! here, never the array: gfortran materialises a PARAMETER array into the
@@ -114,10 +114,12 @@ module fk_gop_renderer_m
   ! module too would put a second 4096-byte copy in the kernel image. See the
   ! header of fk_font_8x16.f90.
   use fk_font_8x16_m, only: FONT_W, FONT_H, vga_font_row
+  use fk_string_m,    only: fk_memmove
   implicit none
   private
   public :: vga_init_framebuffer, vga_plot_pixel, vga_print_char, &
-            vga_print_string, vga_fill_rect
+            vga_print_string, vga_fill_rect, vga_scroll_up, &
+            vga_width, vga_height
 
   ! --- Framebuffer state, established by vga_init_framebuffer -------------
   ! Module variables are implicitly SAVE.  They live in .bss and need no
@@ -129,6 +131,12 @@ module fk_gop_renderer_m
   integer(c_int32_t) :: fb_height = 0_c_int32_t   ! visible rows
   integer(c_int64_t) :: fb_stride = 0_c_int64_t   ! 32-bit words per scanline
   logical            :: fb_ready  = .false.
+
+  ! The base as an INTEGER as well as a pointer.  vga_scroll_up hands scanline
+  ! addresses to fk_memmove, which takes c_ptr; deriving them arithmetically
+  ! from the value that arrived is the same transfer c_f_pointer already did,
+  ! and avoids C_LOC on a VOLATILE pointer target.
+  integer(c_int64_t) :: fb_addr   = 0_c_int64_t
 
 
 contains
@@ -199,7 +207,8 @@ contains
 
     ! TRANSFER, not INT(): the address is a bit pattern that may have its high
     ! bit set, and no arithmetic may be performed on it.
-    base = transfer(base_addr, base)
+    base    = transfer(base_addr, base)
+    fb_addr = base_addr
     call c_f_pointer(base, fb, [words])
 
     fb_ready = .true.
@@ -330,5 +339,66 @@ contains
        end do
     end do
   end subroutine vga_fill_rect
+
+  !> Visible geometry, for a console that must decide how many cells fit.
+  function vga_width() result(w) bind(c, name="vga_width")
+    implicit none
+    integer(c_int32_t) :: w
+
+    w = fb_width
+  end function vga_width
+
+  function vga_height() result(h) bind(c, name="vga_height")
+    implicit none
+    integer(c_int32_t) :: h
+
+    h = fb_height
+  end function vga_height
+
+  !> Move the pixel band [y0, y0+h) up by DY rows and fill the DY rows it
+  !! vacated with COLOR.  This is what a text console scrolls with.
+  !!
+  !! ONE fk_memmove PER SCANLINE, and not one call for the whole band.  The
+  !! stride is routinely wider than the visible width, so a single call would
+  !! copy the off-screen slack too -- including the slack of the LAST scanline,
+  !! which vga_init_framebuffer deliberately left outside the mapped extent.
+  !! Per-row it cannot reach past the last visible pixel, and the destination
+  !! row is always above the source row, so no call overlaps itself.
+  !!
+  !! COST, STATED.  The framebuffer is write-combining: writes are buffered,
+  !! reads are not, and every byte of a scroll is read once and written once.
+  !! A full-screen scroll is therefore the most expensive thing this driver
+  !! does by two orders of magnitude, and src/boot/fk_kmain.f90 prints what it
+  !! measured in PIT ticks rather than leaving that as folklore.
+  subroutine vga_scroll_up(y0, h, dy, color) bind(c, name="vga_scroll_up")
+    implicit none
+    integer(c_int32_t), intent(in), value :: y0, h, dy, color
+    integer(c_int32_t) :: rows, r
+    integer(c_int64_t) :: pitch, row_bytes, dst, src
+    type(c_ptr) :: dp, sp
+
+    if (.not. fb_ready) return
+    if (h <= 0_c_int32_t .or. dy <= 0_c_int32_t) return
+    if (y0 < 0_c_int32_t .or. y0 >= fb_height) return
+
+    ! Clip the band to the screen before anything is moved: a caller that asks
+    ! to scroll more rows than exist must not read past the last one.
+    rows = min(h, fb_height - y0)
+    if (dy >= rows) then
+       call vga_fill_rect(0_c_int32_t, y0, fb_width, rows, color)
+       return
+    end if
+
+    pitch     = fb_stride * 4_c_int64_t
+    row_bytes = int(fb_width, c_int64_t) * 4_c_int64_t
+    do r = 0_c_int32_t, rows - dy - 1_c_int32_t
+       dst = fb_addr + int(y0 + r,      c_int64_t) * pitch
+       src = fb_addr + int(y0 + r + dy, c_int64_t) * pitch
+       dp  = transfer(dst, dp)
+       sp  = transfer(src, sp)
+       dp  = fk_memmove(dp, sp, int(row_bytes, c_size_t))
+    end do
+    call vga_fill_rect(0_c_int32_t, y0 + rows - dy, fb_width, dy, color)
+  end subroutine vga_scroll_up
 
 end module fk_gop_renderer_m

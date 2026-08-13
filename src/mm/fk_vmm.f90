@@ -36,7 +36,7 @@ module fk_vmm_m
             FK_VMM_E_NOT_READY, FK_VMM_E_UNREACHABLE, FK_VMM_E_NO_NX, &
             FK_VMM_PHYSMAP, FK_VMM_SCRATCH, &
             FK_PTE_P, FK_PTE_RW, FK_PTE_PS, FK_PTE_NX, FK_PTE_ADDR, &
-            FK_PTE_PWT, FK_PTE_PCD, FK_VMM_MMIO, FK_VMM_WC, &
+            FK_PTE_PWT, FK_PTE_PCD, FK_VMM_MMIO, FK_VMM_HEAP, FK_VMM_WC, &
             vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, vmm_read_pat, &
             vmm_init, vmm_activate, vmm_drop_identity, vmm_map_page, &
             vmm_translate, vmm_phys_of, vmm_pml4_phys, vmm_table_frames, &
@@ -80,6 +80,13 @@ module fk_vmm_m
   ! reachable at two virtual addresses with two memory types is architecturally
   ! undefined (SDM Vol.3 11.12.4), not merely slow.
   integer(c_int64_t), parameter :: FK_VMM_MMIO = int(z'FFFF808000000000', c_int64_t)
+
+  ! PML4[258], the slot after the device window.  The kernel heap grows upward
+  ! from here (roadmap 4.0).  A slot of its own rather than a hole inside the
+  ! linear map: the heap's pages come from the PMM at arbitrary physical
+  ! addresses and must be CONTIGUOUS in virtual space, which is exactly the
+  ! property a linear map cannot offer.
+  integer(c_int64_t), parameter :: FK_VMM_HEAP = int(z'FFFF810000000000', c_int64_t)
 
   integer(c_int32_t), parameter :: FK_VMM_OK           = 0_c_int32_t
   integer(c_int32_t), parameter :: FK_VMM_E_NOMEM      = 1_c_int32_t

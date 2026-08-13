@@ -17,8 +17,8 @@
  * of exception it caught.
  *
  * TWO TAILS, AND THEY ARE NOT INTERCHANGEABLE.  isr_common calls a handler that
- * does not return and parks the CPU behind it; irq_common restores the frame
- * and executes IRETQ.  Resuming from a #GP is not something this kernel knows
+ * does not return and parks the CPU behind it; irq_common loads the RSP its
+ * handler RETURNED and executes IRETQ off that.  Resuming from a #GP is not something this kernel knows
  * how to do, and an IRQ that does not resume is not an IRQ, so which of the two
  * a vector gets is decided by the IDT and nowhere else.
  *
@@ -187,6 +187,24 @@ irq_common:
 
 	movq	%rsp, %rdi
 	call	irq_handler
+
+	/*
+	 * THE CONTEXT SWITCH, and it is one instruction (roadmap 4.0).
+	 *
+	 * irq_handler returns the address of the frame to resume on.  With no
+	 * scheduler that is the frame it was handed, so this is a no-op and the
+	 * interrupted thread continues.  With one, it is a frame the scheduler
+	 * saved on ANOTHER task's stack the last time that task was
+	 * interrupted -- identical in layout, because every task's first frame
+	 * is built to look exactly like one this stub pushed.  POP_GPRS then
+	 * restores that task's registers and IRETQ returns to its RIP with its
+	 * RSP and RFLAGS.
+	 *
+	 * Nothing is saved here: the outgoing task's registers are ALREADY on
+	 * its own stack, pushed by PUSH_GPRS above, and its RSP is the value
+	 * that was in %rdi.  The scheduler wrote that down before answering.
+	 */
+	movq	%rax, %rsp
 
 	POP_GPRS
 

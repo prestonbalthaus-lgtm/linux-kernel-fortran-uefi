@@ -103,6 +103,45 @@ FB_MAGIC = 0x46425F49               # "FB_I", written only on a clean probe
 FB_VIRT_WANT = 0xFFFF808000000000   # FK_VMM_MMIO in src/mm/fk_vmm.f90
 FB_BAR_H = 16                       # FK_FB_BAR_H in src/boot/fk_kmain.f90
 FB_BLOCK = 64                       # the width of one primary in the bar
+FONT_H = 16                         # FONT_H in src/drivers/video/fk_font_8x16.f90
+# The console's own colours, from src/boot/fk_kmain.f90. Carried as RGB and
+# packed here through the loader's masks, exactly as the kernel packs them --
+# a literal pixel word would agree with a kernel that ignored the masks.
+CON_FG_RGB = (208, 224, 208)
+CON_BG_RGB = (0, 16, 32)
+# How many lit glyph pixels a row of text must contain before it counts as
+# text. One would be satisfied by a stray write; a whole line of 8x16 glyphs
+# lights hundreds.
+CON_MIN_GLYPH_PX = 64
+# How many text rows at the bottom of the screen the panic assertion reads.
+# TWO, not one: every line the handler prints ends in CRLF, so the cursor is
+# always parked on a freshly cleared row and the bottom line of a finished
+# panic is blank by construction.
+PANIC_TAIL_ROWS = 2
+# roadmap 2.4's glyph-identity check. The kernel draws this string into the
+# status bar at a fixed cell, in yellow, and never scrolls it. The expected
+# pixels are rendered here from the kernel's OWN font table, read out of guest
+# memory -- so this compares what the renderer drew against what the font says,
+# and not against a picture somebody transcribed.
+FONT_SYMBOL = "__fk_font_8x16_m_MOD_font_8x16"
+FONT_BYTES = 4096
+FONT_W = 8
+FB_SIG = b"FK-GOP 2.4"
+FB_SIG_X = 256
+FB_SIG_RGB = (255, 255, 0)
+
+# roadmap 4.0. bind(c) in src/cpu/fk_sched.f90 and src/mm/fk_heap.f90.
+SCHED_SYMBOL = "fk_sched_state"
+SCHED_WORDS = 4
+RUNS_SYMBOL = "fk_task_runs"
+RUNS_TASKS = 4
+SCHED_MAGIC = 0x5343484544000001
+HEAP_SYMBOL = "fk_heap_stat"
+HEAP_WORDS = 10
+HEAP_MAGIC = 0x4B48454150000001
+# The panic colours, from src/cpu/fk_idt.f90 by way of idt_set_panic_colors.
+PANIC_FG_RGB = (255, 255, 255)
+PANIC_BG_RGB = (170, 0, 0)
 
 
 class QmpError(Exception):
@@ -535,8 +574,64 @@ FB_BAR = [("red", (255, 0, 0)), ("green", (0, 255, 0)),
           ("blue", (0, 0, 255)), ("white", (255, 255, 255))]
 
 
-def check_framebuffer(info, scanline):
-    """Return a list of (ok, description) -- the whole framebuffer contract."""
+def check_signature(info, band, font):
+    """Compare the status-bar signature against the kernel's own font table.
+
+    The renderer walks each font byte MSB FIRST -- bit 7 is the leftmost pixel
+    -- and composes the glyph over whatever is already there, so a clear bit
+    means "unchanged", never "background". Reading the table LSB-first mirrors
+    every glyph, which is a defect no lit-pixel count can see.
+    """
+    if font is None or len(font) < FONT_BYTES:
+        return [(False, "the kernel's font table could not be read back")]
+    fg = fb_pack(info, *FB_SIG_RGB)
+    lit = 0
+    wrong = None
+    for i, ch in enumerate(FB_SIG):
+        for row in range(FONT_H):
+            bits = font[ch * FONT_H + row]
+            for dx in range(FONT_W):
+                on = (bits >> (7 - dx)) & 1
+                x = FB_SIG_X + i * FONT_W + dx
+                got, = struct.unpack_from("<I", band, row * info["pitch"] + x * 4)
+                # BOTH directions. Checking only the lit bits accepts a solid
+                # block of the signature colour, which is what a renderer that
+                # filled the cell instead of walking the font would leave --
+                # and any glyph whose bits are a superset of the right ones.
+                if on:
+                    lit += 1
+                    if got != fg and wrong is None:
+                        wrong = (chr(ch), x, row, got, "lit")
+                elif got == fg and wrong is None:
+                    wrong = (chr(ch), x, row, got, "clear")
+    if wrong is not None:
+        c, x, y, got, kind = wrong
+        return [(False, f"the bar signature is not the font's glyphs: "
+                        f"'{c}' wants a {kind} pixel at ({x},{y}) and the "
+                        f"framebuffer holds 0x{got:08X} (fg 0x{fg:08X})")]
+    return [(True, f"all {lit} lit pixels of \"{FB_SIG.decode()}\" in the "
+                   "status bar match the kernel's own font table, glyph for "
+                   "glyph")]
+
+
+def _row(band, info, y):
+    off = y * info["pitch"]
+    return band[off:off + info["width"] * 4]
+
+
+def check_framebuffer(info, band, tail=None, font=None, expect="console"):
+    """Return a list of (ok, description) -- the whole framebuffer contract.
+
+    BAND is guest memory from the framebuffer base covering the status bar and
+    the FIRST row of console text; TAIL is the LAST row of console text.
+
+    Which of the two carries the evidence depends on the build, and not
+    arbitrarily.  In the shipped image the console has scrolled several screens,
+    so the top row holds text that was pushed up there and the first row is the
+    honest place to look.  A panic dump is 26 lines on a 47-row screen: it
+    CANNOT reach the top, and asserting there would fail on a kernel whose
+    panic handler works perfectly.  The newest output is always at the bottom.
+    """
     out = []
     out.append((info["tag"] == FB_MAGIC,
                 f"fb_info magic is 0x{info['tag']:08X} "
@@ -554,30 +649,76 @@ def check_framebuffer(info, scanline):
     out.append((info["base"] != 0 and info["base"] % 4096 == 0,
                 f"the loader's base 0x{info['base']:X} is page-aligned"))
 
-    if scanline is None:
+    if band is None:
         out.append((False, "no pixels were read back from the framebuffer"))
         return out
-    if len(scanline) < 4 * (3 * FB_BLOCK + 1):
-        out.append((False, f"the pixel dump is {len(scanline)} bytes, too "
-                           "short to hold the bar"))
+    need = (FB_BAR_H + FONT_H) * info["pitch"]
+    if len(band) < need:
+        out.append((False, f"the pixel dump is {len(band)} bytes, want "
+                           f"{need} to cover the bar and one text row"))
         return out
 
     # Every primary, not just one: a renderer that reached memory but packed
     # the channels wrong writes four DIFFERENT wrong words, and a single-colour
     # check passes on any of them that happens to collide.
-    for i, (name, rgb) in enumerate(FB_BAR):
-        off = (i * FB_BLOCK) * 4
-        got, = struct.unpack_from("<I", scanline, off)
-        want = fb_pack(info, *rgb)
-        out.append((got == want,
-                    f"pixel ({i * FB_BLOCK},0) is 0x{got:08X} "
-                    f"(want 0x{want:08X}, {name} packed r@{info['r_pos']} "
-                    f"g@{info['g_pos']} b@{info['b_pos']})"))
+    #
+    # Row 0 AND the last row of the bar. The console lives immediately below
+    # and has scrolled several times by the time this runs, so the bottom row
+    # is where a scroll that reached one row too high would show up -- and it
+    # would show up as ordinary text, not as corruption.
+    for y in (0, FB_BAR_H - 1):
+        row = _row(band, info, y)
+        for i, (name, rgb) in enumerate(FB_BAR):
+            got, = struct.unpack_from("<I", row, (i * FB_BLOCK) * 4)
+            want = fb_pack(info, *rgb)
+            out.append((got == want,
+                        f"pixel ({i * FB_BLOCK},{y}) is 0x{got:08X} "
+                        f"(want 0x{want:08X}, {name} packed r@{info['r_pos']} "
+                        f"g@{info['g_pos']} b@{info['b_pos']})"))
+
+    out.extend(check_signature(info, band, font))
+
+    # roadmap 2.4: the console drew GLYPHS below the bar, in the colours it was
+    # given. Counting foreground pixels rather than "not background" is what
+    # separates rendered text from a band the renderer merely filled.
+    #
+    # A panic build is asserted on the PANIC palette instead. That is the whole
+    # point of the mode: the handler repaints in white on red, so a register
+    # dump that only reached COM1 leaves the band in the console's own green
+    # and is caught here rather than passing as 'there is text on screen'.
+    if expect == "panic":
+        fg, bg = fb_pack(info, *PANIC_FG_RGB), fb_pack(info, *PANIC_BG_RGB)
+        where, src, base_y, span = "the last", tail, 0, PANIC_TAIL_ROWS
+    else:
+        fg, bg = fb_pack(info, *CON_FG_RGB), fb_pack(info, *CON_BG_RGB)
+        where, src, base_y, span = "the first", band, FB_BAR_H, 1
+
+    if src is None or len(src) < (base_y + span * FONT_H) * info["pitch"]:
+        out.append((False, f"{where} console text row was not read back"))
+        return out
+
+    lit = 0
+    ink = 0
+    for y in range(base_y, base_y + span * FONT_H):
+        row = _row(src, info, y)
+        for word, in struct.iter_unpack("<I", row):
+            if word == fg:
+                lit += 1
+            elif word == bg:
+                ink += 1
+    out.append((lit >= CON_MIN_GLYPH_PX,
+                f"{where} console text row has {lit} {expect}-palette "
+                f"foreground pixels (want >= {CON_MIN_GLYPH_PX}: glyphs, not a "
+                "filled band)"))
+    out.append((ink > lit,
+                f"and {ink} {expect}-palette background pixels around them "
+                "(text on a cleared cell, not a solid block)"))
     return out
 
 
-def do_framebuffer(sock_path, elf, timeout, quiet):
+def do_framebuffer(sock_path, elf, timeout, quiet, expect="console"):
     _vaddr, info_paddr = symbol_phys_addr(elf, FB_SYMBOL)
+    _fv, font_paddr = symbol_phys_addr(elf, FONT_SYMBOL)
     tmp = tempfile.NamedTemporaryFile(prefix="fk-fb.", suffix=".bin",
                                       delete=False)
     tmp.close()
@@ -587,23 +728,129 @@ def do_framebuffer(sock_path, elf, timeout, quiet):
         client.handshake()
         client.pmemsave(info_paddr, FB_BYTES, tmp.name)
         info = fb_decode(open(tmp.name, "rb").read())
-        scanline = None
+        band = None
+        tail = None
+        font = None
+        try:
+            # The RUNNING kernel's font, not the ELF's copy of it: the two
+            # agree only if the image in memory is the image on disk.
+            client.pmemsave(font_paddr, FONT_BYTES, tmp.name)
+            font = open(tmp.name, "rb").read()
+        except QmpError:
+            font = None
         # The framebuffer's PHYSICAL address comes from the guest's own handoff
         # block, so nothing here hardcodes where a PCI BAR landed.
         if info["base"] and info["pitch"]:
             try:
-                client.pmemsave(info["base"], min(info["pitch"], 1 << 16),
-                                tmp.name)
-                scanline = open(tmp.name, "rb").read()
+                client.pmemsave(info["base"],
+                                (FB_BAR_H + FONT_H) * info["pitch"], tmp.name)
+                band = open(tmp.name, "rb").read()
             except QmpError:
-                scanline = None
+                band = None
+        if info["base"] and info["pitch"] \
+                and info["height"] > PANIC_TAIL_ROWS * FONT_H:
+            try:
+                last = info["base"] + (info["height"] - PANIC_TAIL_ROWS * FONT_H) \
+                       * info["pitch"]
+                client.pmemsave(last, PANIC_TAIL_ROWS * FONT_H * info["pitch"],
+                                tmp.name)
+                tail = open(tmp.name, "rb").read()
+            except QmpError:
+                tail = None
     finally:
         client.close()
         os.unlink(tmp.name)
-    results = check_framebuffer(info, scanline)
+    results = check_framebuffer(info, band, tail=tail, font=font, expect=expect)
     if not report_hwstate(results, quiet):
         print(f"        {FB_SYMBOL} at guest physical 0x{info_paddr:X}, "
               f"framebuffer at 0x{info['base']:X}")
+        return 1
+    return 0
+
+
+# --- roadmap 4.0: the scheduler and the heap, read out of the guest --------
+
+def check_sched(first, second, heap):
+    """Return a list of (ok, description).
+
+    FIRST and SECOND are (state, runs) pairs read a moment apart while the
+    guest keeps running.  Two reads and not one: a counter that is non-zero
+    proves a thread ran ONCE, which a scheduler that switches away and never
+    comes back also produces -- and that kernel looks identical on COM1,
+    because the boot thread printed its verdict before it was switched out.
+    """
+    out = []
+    st1, runs1 = first
+    st2, runs2 = second
+
+    out.append((st1[0] == SCHED_MAGIC,
+                f"fk_sched_state magic is 0x{st1[0]:016X} "
+                f"(want 0x{SCHED_MAGIC:016X}: sched_init ran)"))
+    out.append((st1[1] >= 3,
+                f"the scheduler has {st1[1]} tasks (want >= 3: the boot thread "
+                "and two spawned ones)"))
+    out.append((st2[3] > st1[3],
+                f"context switches grew {st1[3]} -> {st2[3]} between the two "
+                "reads"))
+    # EVERY spawned task, not the pair as a whole: a round robin that got stuck
+    # on one of them still advances a total.
+    for t in range(1, RUNS_TASKS):
+        if runs1[t] == 0 and runs2[t] == 0:
+            continue
+        out.append((runs2[t] > runs1[t],
+                    f"task {t + 1} ran {runs1[t]} -> {runs2[t]} times "
+                    "(its own loop counter, not the scheduler's)"))
+    live = sum(1 for t in range(1, RUNS_TASKS) if runs2[t] > 0)
+    out.append((live >= 2,
+                f"{live} spawned threads have executed (want >= 2)"))
+
+    if heap is not None:
+        out.append((heap[0] == HEAP_MAGIC,
+                    f"fk_heap_stat magic is 0x{heap[0]:016X} "
+                    f"(want 0x{HEAP_MAGIC:016X}: heap_init ran)"))
+        out.append((heap[4] == 1 and heap[2] == 0,
+                    f"the heap came back to {heap[4]} block(s) with "
+                    f"{heap[2]} bytes in use -- everything freed coalesced"))
+        out.append((heap[5] > 0 and heap[6] > 0,
+                    f"it served {heap[5]} allocations and {heap[6]} frees"))
+        out.append((heap[9] >= 3,
+                    f"and refused {heap[9]} bad frees (want >= 3: the double "
+                    "free, the stray pointer and the interior pointer)"))
+    return out
+
+
+def do_sched(sock_path, elf, timeout, quiet, interval=0.25):
+    _v, st_paddr = symbol_phys_addr(elf, SCHED_SYMBOL)
+    _v, runs_paddr = symbol_phys_addr(elf, RUNS_SYMBOL)
+    _v, heap_paddr = symbol_phys_addr(elf, HEAP_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-sched.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+
+    def read_words(client, paddr, n):
+        client.pmemsave(paddr, n * 8, tmp.name)
+        raw = open(tmp.name, "rb").read()
+        if len(raw) != n * 8:
+            raise QmpError(f"pmemsave wrote {len(raw)} bytes, expected {n * 8}")
+        return list(struct.unpack(f"<{n}Q", raw))
+
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    try:
+        client.handshake()
+        first = (read_words(client, st_paddr, SCHED_WORDS),
+                 read_words(client, runs_paddr, RUNS_TASKS))
+        heap = read_words(client, heap_paddr, HEAP_WORDS)
+        time.sleep(interval)
+        second = (read_words(client, st_paddr, SCHED_WORDS),
+                  read_words(client, runs_paddr, RUNS_TASKS))
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+    results = check_sched(first, second, heap)
+    if not report_hwstate(results, quiet):
+        print(f"        {SCHED_SYMBOL} at 0x{st_paddr:X}, {RUNS_SYMBOL} at "
+              f"0x{runs_paddr:X}, {HEAP_SYMBOL} at 0x{heap_paddr:X}")
         return 1
     return 0
 
@@ -902,18 +1149,44 @@ def do_selftest():
                       bytes=4096 * 768, r_pos=16, r_size=8, g_pos=8, g_size=8,
                       b_pos=0, b_size=8)
 
-    def fb_scanline(info, colours=None, pitch=4096):
-        """A synthetic scanline carrying the bar the kernel is supposed to draw."""
-        buf = bytearray(pitch)
-        for i, (_name, rgb) in enumerate(colours or FB_BAR):
-            word = fb_pack(info, *rgb)
-            for x in range(i * FB_BLOCK, (i + 1) * FB_BLOCK):
-                struct.pack_into("<I", buf, x * 4, word)
+    # A font in which every glyph is solid: enough to render a signature the
+    # checker accepts, and small enough to state in one line.
+    FONT_SOLID = bytes([0xFF]) * FONT_BYTES
+    FONT_MIRROR = bytes([0x0F]) * FONT_BYTES
+
+    def fb_band(info, colours=None, pitch=4096, glyph_px=400, bar_h=FB_BAR_H,
+                text=True, sig_font=FONT_SOLID):
+        """A synthetic band: the bar the kernel draws, then a row of text."""
+        buf = bytearray(pitch * (FB_BAR_H + FONT_H))
+        for y in range(bar_h):
+            for i, (_name, rgb) in enumerate(colours or FB_BAR):
+                word = fb_pack(info, *rgb)
+                for x in range(i * FB_BLOCK, (i + 1) * FB_BLOCK):
+                    struct.pack_into("<I", buf, y * pitch + x * 4, word)
+        if sig_font is not None:
+            sig = fb_pack(info, *FB_SIG_RGB)
+            for i, ch in enumerate(FB_SIG):
+                for row in range(FONT_H):
+                    bits = sig_font[ch * FONT_H + row]
+                    for dx in range(FONT_W):
+                        if (bits >> (7 - dx)) & 1:
+                            x = FB_SIG_X + i * FONT_W + dx
+                            struct.pack_into("<I", buf, row * pitch + x * 4, sig)
+        if text:
+            fg = fb_pack(info, *CON_FG_RGB)
+            bg = fb_pack(info, *CON_BG_RGB)
+            for y in range(FB_BAR_H, FB_BAR_H + FONT_H):
+                for x in range(info["width"]):
+                    struct.pack_into("<I", buf, y * pitch + x * 4, bg)
+            for n in range(glyph_px):
+                y = FB_BAR_H + (n % FONT_H)
+                x = n // FONT_H
+                struct.pack_into("<I", buf, y * pitch + x * 4, fg)
         return bytes(buf)
 
-    def expect_fb(ok_wanted, info, scanline, what):
+    def expect_fb(ok_wanted, info, scanline, what, *, font=FONT_SOLID):
         nonlocal pass_n, fail_n
-        got = all(ok for ok, _ in check_framebuffer(info, scanline))
+        got = all(ok for ok, _ in check_framebuffer(info, scanline, font=font))
         if got == ok_wanted:
             print(f"  \033[32mPASS\033[0m  {what}")
             pass_n += 1
@@ -923,13 +1196,14 @@ def do_selftest():
             fail_n += 1
 
     print("=== framebuffer assertion self-test (no QEMU, no kernel) ===")
-    expect_fb(True, FB_INFO_OK, fb_scanline(FB_INFO_OK),
-              "the four-primary bar packed per the loader's masks is accepted")
-    expect_fb(False, dict(FB_INFO_OK, tag=0), fb_scanline(FB_INFO_OK),
+    expect_fb(True, FB_INFO_OK, fb_band(FB_INFO_OK),
+              "the bar packed per the loader's masks, with text below it, is "
+              "accepted")
+    expect_fb(False, dict(FB_INFO_OK, tag=0), fb_band(FB_INFO_OK),
               "an fb_info block the probe never completed is rejected")
-    expect_fb(False, dict(FB_INFO_OK, virt=0), fb_scanline(FB_INFO_OK),
+    expect_fb(False, dict(FB_INFO_OK, virt=0), fb_band(FB_INFO_OK),
               "a framebuffer the VMM never mapped is rejected")
-    expect_fb(False, FB_INFO_OK, bytes(4096),
+    expect_fb(False, FB_INFO_OK, bytes(4096 * (FB_BAR_H + FONT_H)),
               "a framebuffer that is still all black is rejected")
     expect_fb(False, FB_INFO_OK, None,
               "a framebuffer that could not be read back at all is rejected")
@@ -937,13 +1211,137 @@ def do_selftest():
     # hardcodes RGB draws every block with red and blue exchanged. Both are
     # non-black, both are 'a bar', and only the per-channel comparison sees it.
     RGB = dict(FB_INFO_OK, r_pos=0, b_pos=16)
-    expect_fb(False, FB_INFO_OK, fb_scanline(RGB),
+    expect_fb(False, FB_INFO_OK, fb_band(RGB),
               "a bar packed RGB where the loader asked for BGR is rejected")
     expect_fb(False, FB_INFO_OK,
-              fb_scanline(FB_INFO_OK, colours=[("red", (255, 0, 0))] * 4),
+              fb_band(FB_INFO_OK, colours=[("red", (255, 0, 0))] * 4),
               "four blocks of the SAME colour are rejected")
-    expect_fb(False, FB_INFO_OK, fb_scanline(FB_INFO_OK)[:64],
+    expect_fb(False, FB_INFO_OK, fb_band(FB_INFO_OK)[:64],
               "a truncated pixel dump is rejected rather than ignored")
+    # roadmap 2.4. A console that cleared its band and drew nothing looks
+    # exactly like a working one from the bar's point of view.
+    expect_fb(False, FB_INFO_OK, fb_band(FB_INFO_OK, glyph_px=0),
+              "a console band that was cleared but never written to is rejected")
+    expect_fb(False, FB_INFO_OK, fb_band(FB_INFO_OK, text=False),
+              "a console band still holding the power-on contents is rejected")
+    # And the reverse: a band filled solid with the foreground colour is not
+    # text either, however many 'glyph' pixels it counts.
+    solid = bytearray(fb_band(FB_INFO_OK))
+    fgw = fb_pack(FB_INFO_OK, *CON_FG_RGB)
+    for y in range(FB_BAR_H, FB_BAR_H + FONT_H):
+        for x in range(FB_INFO_OK["width"]):
+            struct.pack_into("<I", solid, y * 4096 + x * 4, fgw)
+    expect_fb(False, FB_INFO_OK, bytes(solid),
+              "a console band filled SOLID with the foreground colour is "
+              "rejected")
+    # The scroll that reached one row too high: the bar's bottom row now holds
+    # console background instead of the bar's own primaries.
+    ate_bar = bytearray(fb_band(FB_INFO_OK))
+    bgw = fb_pack(FB_INFO_OK, *CON_BG_RGB)
+    for x in range(FB_INFO_OK["width"]):
+        struct.pack_into("<I", ate_bar, (FB_BAR_H - 1) * 4096 + x * 4, bgw)
+    expect_fb(False, FB_INFO_OK, bytes(ate_bar),
+              "a console that scrolled one row INTO the status bar is rejected")
+    # THE GLYPH-IDENTITY CASES. A renderer that draws a plausible bar and then
+    # the WRONG character passes every pixel-count check there is.
+    expect_fb(False, FB_INFO_OK, fb_band(FB_INFO_OK, sig_font=None),
+              "a status bar with no signature drawn in it is rejected")
+    expect_fb(False, FB_INFO_OK, fb_band(FB_INFO_OK, sig_font=FONT_MIRROR),
+              "a signature rendered LSB-first -- every glyph mirrored -- is "
+              "rejected")
+    expect_fb(False, FB_INFO_OK, fb_band(FB_INFO_OK),
+              "and a font read back that disagrees with the pixels is rejected, "
+              "whichever of the two is wrong", font=FONT_MIRROR)
+    expect_fb(False, FB_INFO_OK, fb_band(FB_INFO_OK),
+              "a font table that could not be read at all is rejected",
+              font=None)
+
+    def expect_fb_panic(ok_wanted, info, band, tail, what):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_framebuffer(info, band, tail=tail,
+                                                    font=FONT_SOLID,
+                                                    expect="panic"))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} -- assertion said "
+                  f"{'accept' if got else 'reject'}")
+            fail_n += 1
+
+    # The LAST text row of the screen, which is where a panic dump too short to
+    # reach the top always ends up.
+    # Two rows, glyphs in the UPPER one only -- the shape a finished panic
+    # always leaves behind, and the shape a one-row assertion would fail on.
+    def text_row(info, fg_rgb, bg_rgb, glyph_px=400, pitch=4096):
+        buf = bytearray(pitch * FONT_H * PANIC_TAIL_ROWS)
+        fgw, bgw = fb_pack(info, *fg_rgb), fb_pack(info, *bg_rgb)
+        for y in range(FONT_H * PANIC_TAIL_ROWS):
+            for x in range(info["width"]):
+                struct.pack_into("<I", buf, y * pitch + x * 4, bgw)
+        for n in range(glyph_px):
+            struct.pack_into("<I", buf,
+                             (n % FONT_H) * pitch + (n // FONT_H) * 4, fgw)
+        return bytes(buf)
+
+    panic_tail = text_row(FB_INFO_OK, PANIC_FG_RGB, PANIC_BG_RGB)
+    console_tail = text_row(FB_INFO_OK, CON_FG_RGB, CON_BG_RGB)
+    expect_fb_panic(True, FB_INFO_OK, fb_band(FB_INFO_OK), panic_tail,
+                    "a last text row in white on red is accepted as a panic, "
+                    "even though the top of the screen is untouched")
+    # THE ONE THE PANIC MODE EXISTS FOR: the register dump went to COM1 only.
+    # Every serial assertion in that build passes and the screen never changed.
+    expect_fb_panic(False, FB_INFO_OK, fb_band(FB_INFO_OK), console_tail,
+                    "a panic that never reached the screen -- the last row is "
+                    "still in the console palette -- is rejected")
+    expect_fb_panic(False, FB_INFO_OK, fb_band(FB_INFO_OK), None,
+                    "a panic whose last text row could not be read is rejected")
+
+    # --- roadmap 4.0 ---------------------------------------------------------
+    SCHED_OK = ([SCHED_MAGIC, 3, 2, 17], [0, 9, 8, 0])
+    SCHED_ON = ([SCHED_MAGIC, 3, 3, 31], [0, 11, 10, 0])
+    HEAP_OK = [HEAP_MAGIC, 0x42000, 0, 0x42000, 1, 41, 41, 0x42000, 0, 3]
+
+    def expect_sched(ok_wanted, first, second, heap, what):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_sched(first, second, heap))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} -- assertion said "
+                  f"{'accept' if got else 'reject'}")
+            fail_n += 1
+
+    print("=== scheduler assertion self-test (no QEMU, no kernel) ===")
+    expect_sched(True, SCHED_OK, SCHED_ON, HEAP_OK,
+                 "two threads whose own counters both grew, with the switch "
+                 "count growing too, is accepted")
+    expect_sched(False, SCHED_OK, SCHED_OK, HEAP_OK,
+                 "a machine where nothing moved between the two reads is "
+                 "rejected")
+    # THE ONE THIS EXISTS FOR. The kernel switched away from the boot thread
+    # once, both threads ran once, and then the round robin stuck. Every serial
+    # line in that boot is printed BEFORE the sticking and every one passes.
+    expect_sched(False, ([SCHED_MAGIC, 3, 2, 2], [0, 1, 1, 0]),
+                 ([SCHED_MAGIC, 3, 2, 2], [0, 1, 1, 0]), HEAP_OK,
+                 "a scheduler that ran each thread once and then stopped is "
+                 "rejected")
+    expect_sched(False, ([SCHED_MAGIC, 3, 2, 17], [0, 9, 8, 0]),
+                 ([SCHED_MAGIC, 3, 3, 31], [0, 11, 8, 0]), HEAP_OK,
+                 "a round robin stuck on ONE of the two threads is rejected, "
+                 "even though the total advanced")
+    expect_sched(False, ([0, 3, 2, 17], [0, 9, 8, 0]), SCHED_ON, HEAP_OK,
+                 "a scheduler state block sched_init never wrote is rejected")
+    expect_sched(False, ([SCHED_MAGIC, 1, 1, 17], [0, 9, 8, 0]), SCHED_ON,
+                 HEAP_OK, "a kernel that never spawned anything is rejected")
+    expect_sched(False, SCHED_OK, SCHED_ON,
+                 [HEAP_MAGIC, 0x42000, 0x1050, 0x30FB0, 7, 41, 38, 0x30FB0, 0, 3],
+                 "a heap left fragmented -- 7 blocks and bytes still in use -- "
+                 "is rejected")
+    expect_sched(False, SCHED_OK, SCHED_ON,
+                 [HEAP_MAGIC, 0x42000, 0, 0x42000, 1, 41, 41, 0x42000, 0, 0],
+                 "a heap that ACCEPTED the three bad frees is rejected")
 
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
@@ -990,6 +1388,15 @@ def main(argv=None):
     f.add_argument("--elf", required=True)
     f.add_argument("--timeout", type=float, default=10.0)
     f.add_argument("--quiet", action="store_true")
+    f.add_argument("--expect", choices=("console", "panic"), default="console",
+                   help="which palette the console band must be carrying")
+
+    n = sub.add_parser("sched", help="assert the scheduler and heap over QMP")
+    n.add_argument("--qmp", required=True)
+    n.add_argument("--elf", required=True)
+    n.add_argument("--timeout", type=float, default=10.0)
+    n.add_argument("--interval", type=float, default=0.25)
+    n.add_argument("--quiet", action="store_true")
 
     t = sub.add_parser("ticks", help="assert the guest is still ticking")
     t.add_argument("--qmp", required=True)
@@ -1019,7 +1426,11 @@ def main(argv=None):
                               slave=args.slave, master_imr=args.master_imr,
                               slave_imr=args.slave_imr)
         if args.cmd == "fb":
-            return do_framebuffer(args.qmp, args.elf, args.timeout, args.quiet)
+            return do_framebuffer(args.qmp, args.elf, args.timeout, args.quiet,
+                                  expect=args.expect)
+        if args.cmd == "sched":
+            return do_sched(args.qmp, args.elf, args.timeout, args.quiet,
+                            interval=args.interval)
         if args.cmd == "ticks":
             return do_ticks(args.qmp, args.elf, args.timeout, args.quiet,
                             interval=args.interval, min_delta=args.min_delta)

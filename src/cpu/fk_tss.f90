@@ -10,7 +10,7 @@ module fk_tss_m
   use fk_gdt_m, only: FK_GDT_SEL_TSS, gdt_set_tss
   implicit none
   private
-  public :: FK_TSS_IST_DF, tss_init, tss_on_df_stack
+  public :: FK_TSS_IST_DF, tss_init, tss_on_df_stack, tss_set_rsp0
 
   ! The IST index the #DF gate descriptor carries.  1..7 select ist1..ist7; 0
   ! means "keep the faulting stack", which for #DF is the one thing that must
@@ -130,6 +130,21 @@ contains
   ! frame itself is the only thing that can say which stack it was built on.
   ! Signed comparison is correct: kernel addresses all have bit 63 set, so they
   ! order the same either way, and a low address fails the upper bound anyway.
+  !> The stack the CPU switches to on a ring-3 -> ring-0 transition (roadmap
+  !! 4.0).  The scheduler updates it on every switch: RSP0 is per-TASK, not per
+  !! CPU, and a stale one delivers the next syscall or interrupt from user mode
+  !! onto a stack another thread is already using.
+  !!
+  !! Split into two halves for the same reason every other field here is: the
+  !! TSS is a packed byte layout and the type carries no 64-bit members.
+  subroutine tss_set_rsp0(addr) bind(c, name="tss_set_rsp0")
+    implicit none
+    integer(c_int64_t), intent(in), value :: addr
+
+    tss%rsp0_lo = u32(addr)
+    tss%rsp0_hi = u32(ishft(addr, -32))
+  end subroutine tss_set_rsp0
+
   function tss_on_df_stack(addr) result(inside) bind(c, name="tss_on_df_stack")
     implicit none
     integer(c_int64_t), intent(in), value :: addr

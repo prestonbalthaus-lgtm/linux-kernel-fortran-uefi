@@ -20,7 +20,8 @@ module fk_idt_m
                          serial_print_hex
   implicit none
   private
-  public :: idt_init, idt_reload, isr_handler, irq_handler, fk_irq_spurious
+  public :: idt_init, idt_reload, isr_handler, irq_handler, fk_irq_spurious, &
+            idt_set_panic_colors
 
   ! What boot/interrupts.S leaves on the stack, lowest address first.  Every
   ! field is a quadword, so the type needs no padding and the assembly needs no
@@ -74,6 +75,61 @@ module fk_idt_m
   ! that returned it would be treated as side-effect-free by the reader.
   integer(c_int64_t), volatile, bind(c, name="fk_irq_spurious") :: &
        fk_irq_spurious = 0_c_int64_t
+
+  ! The console is reached through bind(c) names rather than USE association,
+  ! deliberately.  A panic handler that USEd fk_console_m would drag the whole
+  ! video stack -- renderer, font, memmove -- into this module's compile-time
+  ! dependency graph and force Makefile.boot to build it before the IDT, for a
+  ! call that must work whether or not there is a screen.  Every one of these
+  ! is a no-op until console_init has run.
+  interface
+    subroutine console_write(s, max_chars) bind(c, name="console_write")
+      import :: c_char, c_int32_t
+      implicit none
+      character(kind=c_char), intent(in)        :: s(*)
+      integer(c_int32_t),     intent(in), value :: max_chars
+    end subroutine console_write
+
+    subroutine console_print_hex(v, digits) bind(c, name="console_print_hex")
+      import :: c_int64_t, c_int32_t
+      implicit none
+      integer(c_int64_t), intent(in), value :: v
+      integer(c_int32_t), intent(in), value :: digits
+    end subroutine console_print_hex
+
+    subroutine console_set_color(fg, bg) bind(c, name="console_set_color")
+      import :: c_int32_t
+      implicit none
+      integer(c_int32_t), intent(in), value :: fg, bg
+    end subroutine console_set_color
+
+    function console_ready() result(v) bind(c, name="console_ready")
+      import :: c_int32_t
+      implicit none
+      integer(c_int32_t) :: v
+    end function console_ready
+
+    ! roadmap 4.0, reached by name for the same reason the console is: the
+    ! router must not have a compile-time dependency on the scheduler, or the
+    ! scheduler could never call anything the router uses.
+    function sched_tick(rsp) result(next) bind(c, name="sched_tick")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t), intent(in), value :: rsp
+      integer(c_int64_t) :: next
+    end function sched_tick
+  end interface
+
+  ! Bound on a panic string.  console_write stops at the NUL; this only caps how
+  ! far it walks if a caller ever loses one.
+  integer(c_int32_t), parameter :: FK_PANIC_MAX = 512_c_int32_t
+
+  ! Packed pixel words, so this module needs nothing from the framebuffer's
+  ! channel masks.  Set by kernel_main once the loader's layout is known; the
+  ! defaults are the BGRX values x86 firmware reports, so a panic before that
+  ! handoff still comes out white on red rather than black on black.
+  integer(c_int32_t), save :: panic_fg = int(z'00FFFFFF', c_int32_t)
+  integer(c_int32_t), save :: panic_bg = int(z'00AA0000', c_int32_t)
 
   type(fk_idt_entry_t), target, save :: idt(0:FK_IDT_ENTRIES - 1)
 
@@ -286,6 +342,27 @@ contains
     call idt_flush(idtr)
   end subroutine idt_reload
 
+  ! Every panic line goes to BOTH consoles.  A machine with no serial cable
+  ! shows the dump on screen; a machine whose framebuffer never came up still
+  ! logs it. Neither is a fallback for the other -- the two are written in the
+  ! same order so a reader can line the two transcripts up.
+  subroutine emit(s)
+    implicit none
+    character(kind=c_char, len=*), intent(in) :: s
+
+    call serial_print_string(s)
+    call console_write(s, FK_PANIC_MAX)
+  end subroutine emit
+
+  subroutine emit_hex(v, digits)
+    implicit none
+    integer(c_int64_t), intent(in) :: v
+    integer(c_int32_t), intent(in) :: digits
+
+    call serial_print_hex(v, digits)
+    call console_print_hex(v, digits)
+  end subroutine emit_hex
+
   ! "<label> = 0x<16 digits>".  Labels are passed pre-padded so the dump lines
   ! up without a format string; Fortran I/O statements are banned in the kernel.
   subroutine print_reg(label, v)
@@ -297,10 +374,32 @@ contains
     do i = 1_c_int32_t, int(len(label), c_int32_t)
        call serial_print_byte(iachar(label(i:i), c_int32_t))
     end do
-    call serial_print_string(FK_EQUALS)
-    call serial_print_hex(v, 16_c_int32_t)
-    call serial_print_string(FK_NL)
+    ! LEN, not FK_PANIC_MAX: a label is padded to width and carries no NUL, so
+    ! a generous bound would walk it into whatever .rodata follows.
+    call console_write(label, int(len(label), c_int32_t))
+    call emit(FK_EQUALS)
+    call emit_hex(v, 16_c_int32_t)
+    call emit(FK_NL)
   end subroutine print_reg
+
+  ! White on red for the duration of the panic.  Not decoration: the dump is
+  ! about to scroll a screen of ordinary boot text off the top, and the colour
+  ! is what says at a glance which of the two the reader is looking at.
+  !> Tell the panic handler what "white" and "red" are on this framebuffer.
+  subroutine idt_set_panic_colors(fg, bg) bind(c, name="idt_set_panic_colors")
+    implicit none
+    integer(c_int32_t), intent(in), value :: fg, bg
+
+    panic_fg = fg
+    panic_bg = bg
+  end subroutine idt_set_panic_colors
+
+  subroutine panic_screen()
+    implicit none
+
+    if (console_ready() == 0_c_int32_t) return
+    call console_set_color(panic_fg, panic_bg)
+  end subroutine panic_screen
 
   ! The catcher.  Called by every trampoline in boot/interrupts.S with the
   ! address of the register frame it just built.  Does not return.
@@ -313,25 +412,26 @@ contains
     ! regs%rsp cannot answer that: it is the RSP the fault happened WITH.
     frame = transfer(c_loc(regs), 0_c_int64_t)
 
-    call serial_print_string(FK_PANIC_HDR)
+    call panic_screen()
+    call emit(FK_PANIC_HDR)
 
-    call serial_print_string(FK_EXC)
-    call serial_print_hex(regs%int_no, 2_c_int32_t)
-    call serial_print_string(FK_ERR)
-    call serial_print_hex(regs%err_code, 16_c_int32_t)
-    call serial_print_string(FK_DASH)
+    call emit(FK_EXC)
+    call emit_hex(regs%int_no, 2_c_int32_t)
+    call emit(FK_ERR)
+    call emit_hex(regs%err_code, 16_c_int32_t)
+    call emit(FK_DASH)
     if (regs%int_no >= 0_c_int64_t .and. regs%int_no < int(FK_IDT_VECTORS, c_int64_t)) then
-       call serial_print_string(FK_FAULT_NAME(int(regs%int_no, c_int32_t)))
+       call emit(FK_FAULT_NAME(int(regs%int_no, c_int32_t)))
     else
-       call serial_print_string(FK_UNKNOWN)
+       call emit(FK_UNKNOWN)
     end if
-    call serial_print_string(FK_NL)
+    call emit(FK_NL)
 
     if (regs%int_no == int(FK_VEC_DF, c_int64_t)) then
        if (tss_on_df_stack(frame) /= 0_c_int32_t) then
-          call serial_print_string(FK_DF_IST)
+          call emit(FK_DF_IST)
        else
-          call serial_print_string(FK_DF_NO_IST)
+          call emit(FK_DF_NO_IST)
        end if
     end if
 
@@ -362,7 +462,7 @@ contains
     call print_reg("R14    ", regs%r14)
     call print_reg("R15    ", regs%r15)
 
-    call serial_print_string(FK_HALTED)
+    call emit(FK_HALTED)
     call fk_cpu_halt()
   end subroutine isr_handler
 
@@ -373,12 +473,23 @@ contains
   !
   ! regs%int_no is the 8259 LINE, 0-15, because that is what the stub pushed;
   ! the vector it arrived on is FK_PIC1_VECTOR + line and no code here needs it.
-  subroutine irq_handler(regs) bind(c, name="irq_handler")
+  !
+  ! IT RETURNS AN RSP, and that is roadmap 4.0's whole hook.  irq_common loads
+  ! the returned value into RSP before POP_GPRS, so returning the frame it was
+  ! given resumes the interrupted thread and returning a DIFFERENT frame -- one
+  ! saved on another task's stack -- resumes that one instead.  A context
+  ! switch is then not a special path through this routine; it is the ordinary
+  ! path with a different answer.
+  function irq_handler(regs) result(resume) bind(c, name="irq_handler")
     implicit none
-    type(fk_regs_t), intent(in) :: regs
+    type(fk_regs_t), intent(in), target :: regs
+    integer(c_int64_t) :: resume
     integer(c_int32_t) :: line
 
-    line = int(regs%int_no, c_int32_t)
+    ! The frame's own address: what irq_common pushed and what it will pop
+    ! unless the scheduler names another one.
+    resume = transfer(c_loc(regs), 0_c_int64_t)
+    line   = int(regs%int_no, c_int32_t)
 
     ! THE SPURIOUS CHECK COMES FIRST, and it is not defensive programming: the
     ! chip did not set an in-service bit for a spurious interrupt, so the EOI at
@@ -398,10 +509,20 @@ contains
 
     if (line == FK_PIT_IRQ) call pit_tick(regs%rip, regs%rflags)
 
-    ! Last, and before the IRETQ rather than after it: the 8259 delivers nothing
-    ! further while it holds an in-service bit, so a missing EOI presents as
-    ! exactly one interrupt ever arriving.
+    ! Before the IRETQ rather than after it: the 8259 delivers nothing further
+    ! while it holds an in-service bit, so a missing EOI presents as exactly one
+    ! interrupt ever arriving.
+    !
+    ! AND BEFORE THE CONTEXT SWITCH, which is the ordering that matters now.
+    ! The switch below returns into a DIFFERENT stack and this routine is not
+    ! reached again on this path; an EOI after it would be an EOI that never
+    ! runs, and the timer would fire exactly once for the whole boot.
     call pic_eoi(line)
-  end subroutine irq_handler
+
+    ! roadmap 4.0.  sched_tick returns the frame to resume on -- its own
+    ! argument if there is nothing to switch to -- so a kernel with no
+    ! scheduler linked behaves exactly as it did before.
+    if (line == FK_PIT_IRQ) resume = sched_tick(resume)
+  end function irq_handler
 
 end module fk_idt_m
