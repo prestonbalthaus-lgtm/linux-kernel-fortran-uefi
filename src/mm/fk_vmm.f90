@@ -391,15 +391,22 @@ contains
 
   ! The leaf entry that describes VIRT, or 0 if nothing does.  Zero is
   ! unambiguous: a present entry always has bit 0 set.
-  function vmm_translate(virt) result(entry) bind(c, name="vmm_translate")
+  ! The leaf entry AND the level it was found at.  vmm_phys_of needs the level:
+  ! a PS entry is 2 MiB at the page-directory level and 1 GiB one level up, and
+  ! masking the wrong number of bits out of VIRT would answer with an address up
+  ! to a gigabyte low.  Nothing in this tree creates a 1 GiB page today -- the
+  ! only PS writer is vmm_map_2m -- so that is a latent wrong answer rather than
+  ! a live one, and it is cheaper to make impossible than to remember.
+  subroutine walk_leaf(virt, entry, sh)
     implicit none
-    integer(c_int64_t), intent(in), value :: virt
-    integer(c_int64_t) :: entry
+    integer(c_int64_t), intent(in)  :: virt
+    integer(c_int64_t), intent(out) :: entry
+    integer(c_int32_t), intent(out) :: sh
     integer(c_int64_t), pointer :: t(:)
     integer(c_int64_t) :: tbl
-    integer(c_int32_t) :: sh
 
     entry = 0_c_int64_t
+    sh    = 12_c_int32_t
     if (pml4_phys == 0_c_int64_t) return
 
     tbl = pml4_phys
@@ -412,10 +419,21 @@ contains
           return
        end if
        if (sh == 12_c_int32_t) return
+       ! Bit 7 is PS below the top level and RESERVED in a PML4 entry, so the
+       ! test is suppressed there rather than trusted to be clear.
        if (sh < 39_c_int32_t .and. iand(entry, FK_PTE_PS) /= 0_c_int64_t) return
        tbl = iand(entry, FK_PTE_ADDR)
        sh  = sh - 9_c_int32_t
     end do
+  end subroutine walk_leaf
+
+  function vmm_translate(virt) result(entry) bind(c, name="vmm_translate")
+    implicit none
+    integer(c_int64_t), intent(in), value :: virt
+    integer(c_int64_t) :: entry
+    integer(c_int32_t) :: sh
+
+    call walk_leaf(virt, entry, sh)
   end function vmm_translate
 
   ! Physical address VIRT resolves to, or -1 if it resolves to nothing.  -1 and
@@ -423,17 +441,18 @@ contains
   function vmm_phys_of(virt) result(phys) bind(c, name="vmm_phys_of")
     implicit none
     integer(c_int64_t), intent(in), value :: virt
-    integer(c_int64_t) :: phys, e
+    integer(c_int64_t) :: phys, e, page
+    integer(c_int32_t) :: sh
 
-    e = vmm_translate(virt)
+    call walk_leaf(virt, e, sh)
     if (e == 0_c_int64_t) then
        phys = -1_c_int64_t
-    else if (iand(e, FK_PTE_PS) /= 0_c_int64_t) then
-       phys = ior(round_down(iand(e, FK_PTE_ADDR), FK_VMM_SIZE_2M), &
-                  iand(virt, FK_VMM_SIZE_2M - 1_c_int64_t))
-    else
-       phys = ior(iand(e, FK_PTE_ADDR), iand(virt, FK_VMM_PAGE_SIZE - 1_c_int64_t))
+       return
     end if
+    ! The leaf's own size, from the level it was found at: 4 KiB, 2 MiB or
+    ! 1 GiB.  Never assumed.
+    page = ishft(1_c_int64_t, sh)
+    phys = ior(round_down(iand(e, FK_PTE_ADDR), page), iand(virt, page - 1_c_int64_t))
   end function vmm_phys_of
 
   function vmm_pml4_phys() result(v) bind(c, name="vmm_pml4_phys")
@@ -474,9 +493,12 @@ contains
 
   ! --- building the kernel's own map ----------------------------------------
 
-  ! The guard page is the ONE address in the image deliberately left with no
+  ! The guard page is the one ADDRESS in the image deliberately left with no
   ! translation, so it is skipped here rather than unmapped afterwards: an
-  ! unmap-after-map leaves a window in which a stack overflow is silent.
+  ! unmap-after-map leaves a window in which a stack overflow is silent.  Its
+  ! FRAME is still reachable through the linear map, like every other frame --
+  ! what the guard protects is the address a falling stack pointer walks into,
+  ! and that resolves to nothing.
   function map_range(vstart, vend, flags) result(status)
     implicit none
     integer(c_int64_t), intent(in) :: vstart, vend, flags

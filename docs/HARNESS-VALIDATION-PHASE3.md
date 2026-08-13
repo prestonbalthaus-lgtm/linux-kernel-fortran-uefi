@@ -708,6 +708,11 @@ panic dump gained a CR2 line in this milestone.
 * `-2` reads `__boot_stack_bottom - 8`. `tools/mutate-phase3.sh` computes the
   expected CR2 with `nm` on the image it just built, so a relayout moves the
   expectation along with the guard page instead of comparing two stale constants.
+* `-4` writes to `__text_start`. This one exists because an adversarial reading
+  of the module found the last claim in the milestone with no witness: a broken
+  CR0.WP changes nothing any other gate can observe. `ERR 0x3` is the assertion
+  — bit 0 present, bit 1 write, i.e. a protection violation and not a missing
+  page. M27 deletes the CR0 store and the write succeeds instead.
 * `-3` reads physical `0x100000` after the unmap. The same address is read
   SUCCESSFULLY four lines earlier in the same boot and its value printed —
   `0x00000000E85250D6`, this image's own Multiboot2 header magic. The pair is a
@@ -715,20 +720,22 @@ panic dump gained a CR2 line in this milestone.
 
 ### 5. Boot mutations
 
-Two baselines and seven defects, run with `tools/mutate-phase3.sh`. The
-baselines are the two new `FK_FAULT_MODE` builds; both PASS, which is what makes
+Three baselines and eight defects, run with `tools/mutate-phase3.sh`. The
+baselines are the three new `FK_FAULT_MODE` builds; all PASS, which is what makes
 the rest of the column meaningful.
 
 | # | defect | result |
 |---|--------|--------|
 | baseline-guard-page | `FK_FAULT_MODE = -2` | **passes** — `#PF`, `CR2 = 0xFFFFFFFF8030CFF8`, the address `nm` predicted from the image |
 | baseline-identity-dead | `FK_FAULT_MODE = -3` | **passes** — `#PF`, `CR2 = 0x0000000000100000` |
+| baseline-text-readonly | `FK_FAULT_MODE = -4` | **passes** — `#PF ERR 0x3`, `CR2 = 0xFFFFFFFF80101000` = `__text_start` |
 | M20 | the `KSYM` macro body returns `0x0` instead of its linker symbol | **caught ONLY by the static gate** — all seventeen accessors mismatch at once |
 | M21 | `.text` given write permission — in the INTENTION table, not the mapping code | **caught by the W^X strings alone** — ` R-X` missing and `RWX` present. `vmm_verify_image` had nothing to say, because it compares the live tables against the very table the mutation edited |
 | M22 | the guard page mapped like any other .bss page | **caught twice** — `VMM section permissions are WRONG` and `VMM guard page is MAPPED.` |
 | M23 | `vmm_drop_identity` never zeroes PML4[0] | **caught** — `PML4[0] is STILL MAPPED.` |
 | M24 | PML4[0] zeroed, CR3 never reloaded | **ESCAPED the boot gate** — see below |
 | M25 | EFER.NXE never set, NX bits written anyway | **caught** — triple fault. Without NXE bit 63 is RESERVED, so the first `.rodata` read faults and the handler faults reading `.rodata` to report it |
+| M27 | CR0.WP never set | **caught ONLY by the `-4` build** — the write to `.text` succeeds, so the `#PF`, its `ERR 0x3` and its CR2 are all missing. Every other gate stays green: `.text` is still mapped R-X and `vmm_verify_image` still returns 0 |
 | M26 | `fk_boot_stack_guard` declared for `__bss_start` | **caught twice** — statically on the naming convention, and at boot by a triple fault: the VMM then skips mapping `.bss`'s first page and maps the guard instead |
 
 M21 is the one worth reading twice. It is the reason two of the gate's patterns

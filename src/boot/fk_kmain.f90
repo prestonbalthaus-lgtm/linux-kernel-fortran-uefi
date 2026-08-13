@@ -202,6 +202,9 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_TRIGGER_IDMAP = &
        "Fortran Kernel: reading physical 0x100000 with no identity map " // &
        "(roadmap 1.2b)." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TRIGGER_WP = &
+       "Fortran Kernel: writing to .text, which only CR0.WP refuses " // &
+       "(roadmap 3.5)." // FK_CRLF // c_null_char
 
   ! Same order as fk_vmm_m's section table, which is the order linker.ld lays
   ! them down.  A mismatch here mislabels a row and nothing else, which is
@@ -270,6 +273,16 @@ module fk_kmain_m
   ! does.  CR2 in the panic dump is what tells them apart.
   integer(c_int32_t), parameter :: FK_FAULT_GUARD = -2_c_int32_t
   integer(c_int32_t), parameter :: FK_FAULT_IDMAP = -3_c_int32_t
+  ! And the one that took an adversarial reading to notice was missing. CR0.WP
+  ! is the bit that makes a read-only PTE mean anything to the only ring this
+  ! kernel has, and it fails SILENTLY: delete the store in fk_mmu_arm and .text
+  ! is still mapped R-X, vmm_verify_image still returns 0, the permission column
+  ! still reads R-X, and a kernel store to .text simply succeeds. Every other
+  ! half of the permission model announces its own failure -- a set NX bit
+  ! without EFER.NXE faults on the first access -- so this is the only one that
+  ! needed a fault of its own. ERR 0x3 is the whole assertion: bit 0 present,
+  ! bit 1 write, i.e. a PROTECTION violation and not a missing page.
+  integer(c_int32_t), parameter :: FK_FAULT_WP = -4_c_int32_t
 
   ! BOTH operands are volatile, and that is not belt and braces: with a literal
   ! numerator gcc rewrites 1/x into a compare against +-1 and emits no DIV at
@@ -319,6 +332,12 @@ module fk_kmain_m
       implicit none
       integer(c_int64_t) :: a
     end function fk_boot_stack_bottom
+
+    function fk_text_start() result(a) bind(c, name="fk_text_start")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t) :: a
+    end function fk_text_start
   end interface
 
 contains
@@ -629,6 +648,16 @@ contains
     call serial_print_hex(hi, 16_c_int32_t)
     call serial_print_string(FK_NL)
 
+    ! The verdict below says "above 4 GiB", so the FLOOR is checked rather than
+    ! assumed. pmm_alloc_page_from is the newest code in the PMM; if its first
+    ! word/bit arithmetic were off by anything it would return a low frame, the
+    ! round trip would still succeed, and this kernel would print a true
+    ! sentence about the wrong frame.
+    if (hi < FK_VMM_HIGH_FLOOR) then
+       call serial_print_string(FK_VMM_HIGH_BAD)
+       return
+    end if
+
     flags = ior(FK_PTE_P, FK_PTE_RW)
     if (vmm_nx_enabled() /= 0_c_int32_t) flags = ior(flags, FK_PTE_NX)
     st = vmm_map_page(FK_VMM_SCRATCH, hi, flags)
@@ -733,6 +762,9 @@ contains
     else if (FK_FAULT_MODE == FK_FAULT_IDMAP) then
        call serial_print_string(FK_TRIGGER_IDMAP)
        fk_probe = fk_peek64(FK_PHYS_1MIB)
+    else if (FK_FAULT_MODE == FK_FAULT_WP) then
+       call serial_print_string(FK_TRIGGER_WP)
+       call fk_poke64(fk_text_start(), 0_c_int64_t)
     else if (FK_FAULT_MODE == 8_c_int32_t) then
        call serial_print_string(FK_TRIGGER_DF)
        call fk_smash_stack()

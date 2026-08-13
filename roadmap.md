@@ -725,6 +725,25 @@ The most critical mathematical and structural phase. Setting up the brain of the
         managed -- the VMM drops NX from every section rather than set a bit it
         was not promised.
 
+        THE TWO HALVES FAIL DIFFERENTLY, AND THAT IS WHY THERE ARE THREE FAULT
+        BUILDS AND NOT TWO. A broken NXE announces itself: the bit is reserved,
+        so the first `.rodata` read faults and the machine dies at the handoff.
+        A broken WP announces NOTHING. `.text` is still mapped R-X,
+        `vmm_verify_image` still returns 0, the permission column still reads
+        R-X, and a kernel store to `.text` simply succeeds. `fk_mmu_arm`'s return
+        value only ever described the NX half, so the console line claiming
+        CR0.WP was, until this was noticed, a claim with no witness anywhere in
+        the tree. `FK_FAULT_MODE = -4` is the witness:
+
+            Fortran Kernel: writing to .text, which only CR0.WP refuses (roadmap 3.5).
+            EXCEPTION 0x0E ERR 0x0000000000000003 -- #PF Page Fault
+            CR2     = 0xFFFFFFFF80101000
+
+        `ERR 0x3` is the assertion and not the vector: bit 0 says the page was
+        PRESENT and bit 1 says the access was a WRITE, so that is a protection
+        violation and not a missing page. CR2 is `__text_start`. Mutation M27
+        deletes the CR0 store and the write succeeds instead.
+
         WHY THERE IS A LINEAR MAP. A page table is written through a VIRTUAL
         address and the PMM hands out physical ones. While the boot stub's
         identity window is live that distinction does not exist; the instant
@@ -766,16 +785,43 @@ The most critical mathematical and structural phase. Setting up the brain of the
         touched, because a kernel that maps its own .text wrong does not report
         it, it triple-faults, and a machine that reboots says nothing at all.
 
-        TWO COSTS, RECORDED RATHER THAN DISCOVERED LATER. While the transient
-        identity window is live -- between `vmm_activate` and `vmm_drop_identity`,
-        which is four console lines -- the kernel image is mapped TWICE: strictly
-        in the higher half, and writable-noexec through the identity alias, since
-        that window is 2 MiB pages covering the low gigabyte. For that interval
-        .text is writable through an address nothing uses. And the two frames
-        that window costs (its PDPT and PD) are never returned to the PMM when
-        PML4[0] is zeroed; there is no unmap path to return them with.
+        THE ALIAS, WHICH IS PERMANENT AND IS NOT WHAT THE PERM COLUMN SAYS.
+        The linear map covers every byte of RAM the loader reported, and the
+        kernel's own frames are RAM -- so this image is mapped TWICE for the life
+        of the kernel: strictly at KERNEL_VMA, and RW+NX at
+        FK_VMM_PHYSMAP + phys. `.text` is therefore writable through the linear
+        alias, permanently. The W^X lines the boot gate asserts are true of the
+        six rows it prints and of nothing else; they say no page of the KERNEL
+        WINDOW is both writable and executable, not that no alias of those frames
+        is writable. This is the same trade Linux's direct map makes, and the
+        same one it later had to spend `set_memory_ro` on. Narrowing it means
+        either excluding the image from the linear map or re-mapping its frames
+        there read-only, and neither is this pass.
 
-        WHAT THIS DOES NOT PROVE. Nothing runs in ring 3, so the U/S bit is
+        Two smaller costs. During the handoff -- the four console lines between
+        `vmm_activate` and `vmm_drop_identity` -- there is a THIRD mapping, the
+        transient identity window, also writable. And the two frames that window
+        costs (its PDPT and PD) are never returned to the PMM when PML4[0] is
+        zeroed; there is no unmap path to return them with.
+
+        WHAT THIS DOES NOT PROVE. The linear map's extent follows the highest
+        AVAILABLE region the loader reported, so MMIO ABOVE the top of RAM is in
+        no window at all once PML4[0] is gone. On this 24 GiB machine the LAPIC
+        at 0xFEE00000, the IOAPIC and any framebuffer BAR below 4 GiB fall inside
+        [0, top) by accident; on a 2 GiB machine none of them do. Nothing
+        dereferences them today -- the UART is port I/O and the GOP renderer is
+        never initialised on the Multiboot2 path -- and 2.2 and 3.3 both land
+        directly on it. The same map covers the PCI hole and the VGA aperture as
+        write-back 2 MiB pages; on real hardware the MTRRs mark those UC and UC
+        wins, so it is very likely benign, but nothing here states it as a
+        requirement.
+
+        The boot gate's "frame above 4 GiB" line also makes the mandated -m 24G
+        allocation load-bearing: on a smaller machine `pmm_alloc_page_from`
+        returns 0, the kernel prints the "no RAM above 4 GiB" line instead, and
+        the gate fails a kernel that is behaving correctly.
+
+        Nothing runs in ring 3, so the U/S bit is
         clear everywhere and untested. CR4.PGE is off and no entry is global, so
         the "reload CR3 flushes everything" assumption is currently exact and
         would stop being so the day global pages arrive. `vmm_map_page` REFUSES

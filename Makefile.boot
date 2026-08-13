@@ -278,7 +278,28 @@ undefcheck-boot: $(KERNEL)
 	   $(NM) --defined-only $(KERNEL) | grep -qE "[[:space:]]T[[:space:]]$$s$$" \
 	     || { echo "  FAIL  the image does not define $$s (roadmap 1.3)"; exit 1; }; \
 	 done; \
-	 echo "  OK    the image defines memset/memcpy/memmove/memcmp itself" 
+	 echo "  OK    the image defines memset/memcpy/memmove/memcmp itself"
+# THE INTRINSIC MUST NOT CALL ITSELF. gcc's loop-distribution pass is enabled
+# again as of roadmap 1.3, and the thing that stops it rewriting fk_memset's own
+# byte loop into a call to memset is that c_f_pointer gives the array a run-time
+# stride the pass cannot recognise -- measured on gfortran 16.1.1, which is a
+# property of a compiler version and not a guarantee. Linux buys the same safety
+# structurally, with -ffreestanding on lib/string.c.
+#
+# So it is checked rather than assumed, and checked where it is unambiguous: the
+# translation unit that IMPLEMENTS the intrinsics may not reference one. If the
+# pass ever fires here, memset -> fk_memset -> memset recurses until the stack
+# walks off the bottom, and this line fails the build instead.
+	@bad=`$(NM) -u -P $(BUILD)/fk_string.o | cut -d' ' -f1 \
+	      | grep -E '^(memcpy|memset|memmove|memcmp)$$'`; \
+	 if [ -n "$$bad" ]; then \
+	   echo "  FAIL  fk_string.o CALLS an intrinsic it implements:"; \
+	   printf '%s\n' "$$bad" | sed 's/^/        /'; \
+	   echo "        the loop-distribution pass has rewritten one of the bodies"; \
+	   echo "        into a call to itself -- it would recurse until the stack"; \
+	   echo "        falls through the guard page."; exit 1; \
+	 fi; \
+	 echo "  OK    fk_string.o implements the intrinsics without calling one" 
 
 # Prove the header gate can FAIL before trusting the fact that it passes.
 selftest-boot: $(KERNEL)

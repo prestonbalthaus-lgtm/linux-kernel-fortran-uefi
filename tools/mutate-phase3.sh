@@ -126,6 +126,25 @@ guard_cr2() {
   EXPECT="$EXPECT"$'\n'"CR2     = 0x$cr2"
 }
 
+# ...and the write to .text that only CR0.WP refuses. ERR 0x3 is the assertion,
+# not the vector: bit 0 says the page was PRESENT and bit 1 says the access was
+# a WRITE, i.e. a protection violation rather than a missing page. A not-present
+# page would report 0x2 and would prove nothing about the write bit.
+mode_wp() {
+  subst src/boot/fk_kmain.f90 \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t" \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = -4_c_int32_t"
+  EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000003 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"
+  REJECT="$COMMON_REJECT"; POST_BUILD=wp_cr2
+}
+wp_cr2() {
+  local t
+  t=$(nm build/boot/kernel.elf | awk '$3=="__text_start"{print $1}')
+  [ -n "$t" ] || { echo "  (cannot read __text_start)"; return; }
+  echo "  wp probe: writing to __text_start 0x$t"
+  EXPECT="$EXPECT"$'\n'"CR2     = 0x$(printf '%016X' $(( 0x$t )))"
+}
+
 # ...and physical 1 MiB, which needs no lookup: it is where linker.ld puts this
 # image, and it resolved a few lines of console output earlier.
 mode_idmap() {
@@ -170,6 +189,7 @@ case_baseline_de()  { mode_de;  run_case baseline-de; }
 case_baseline_oom()   { mode_oom;   run_case baseline-oom; }
 case_baseline_guard() { mode_guard; run_case baseline-guard-page; }
 case_baseline_idmap() { mode_idmap; run_case baseline-identity-dead; }
+case_baseline_wp()    { mode_wp;    run_case baseline-text-readonly; }
 
 # --- the #DE build: roadmap 3.2's frame normalisation ------------------------
 case_M1() {
@@ -339,6 +359,18 @@ case_M25() {
                    "$(printf '\torl\t$EFER_NXE, %%eax')"
   run_case M25-nx-bits-without-nxe
 }
+# CR0.WP never set. This is the defect the whole -4 build exists for: it changes
+# NOTHING that any other gate can see. .text is still mapped R-X, the permission
+# column still says so, vmm_verify_image still returns 0, and the console still
+# claims CR0.WP -- because fk_mmu_arm's return value only ever reported the NX
+# half. Only a store to .text can tell, and only if the CPU refuses it.
+case_M27() {
+  subst boot/mmu.S "$(printf '\tmovq\t%%cr0, %%rax\n\torq\t$CR0_WP, %%rax\n\tmovq\t%%rax, %%cr0')" \
+                   "$(printf '\tmovq\t%%cr0, %%rax')"
+  mode_wp
+  run_case M27-cr0-wp-never-set
+}
+
 # The guard accessor pointed at a different linker symbol. The static gate
 # catches it on the naming convention alone; the boot gate catches it because
 # the VMM then leaves a live .bss page unmapped and maps the guard.
@@ -349,8 +381,8 @@ case_M26() {
 }
 
 ALL="baseline_df baseline_de baseline_oom baseline_guard baseline_idmap \
-     M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 \
-     M12 M13 M14 M15 M16 M17 M18 M19 M20 M21 M22 M23 M24 M25 M26"
+     baseline_wp M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 \
+     M12 M13 M14 M15 M16 M17 M18 M19 M20 M21 M22 M23 M24 M25 M26 M27"
 for c in $ALL; do
   want_case "$c" || continue
   echo "=== $c ==="
