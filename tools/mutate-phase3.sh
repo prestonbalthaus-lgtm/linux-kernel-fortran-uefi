@@ -19,11 +19,19 @@ echo "logs: $OUT"
 
 # Every file any mutation below touches.  A short restore list is how a defect
 # survives into the NEXT case and gets attributed to it.
+# EVERY FILE ANY CASE BELOW MUTATES MUST BE IN THIS LIST. restore() rewinds
+# exactly these, so a case that seds a file not named here leaves its mutation
+# behind: it survives into every later case, is reported against the wrong
+# defect, and -- the way it was actually discovered -- gets committed by the
+# next `git add -A`. Adding a case therefore means checking this list first,
+# which is why fk_heap, fk_sched and fk_console had to be added with M34-M39.
 FILES="boot/interrupts.S boot/gdt_flush.S boot/faultgen.S boot/ksyms.S \
        boot/mmu.S \
        src/cpu/fk_gdt.f90 src/cpu/fk_idt.f90 src/cpu/fk_tss.f90 \
+       src/cpu/fk_sched.f90 \
        src/drivers/pic/fk_pic.f90 src/drivers/pit/fk_pit.f90 \
-       src/mm/fk_pmm.f90 src/mm/fk_vmm.f90 \
+       src/drivers/video/fk_console.f90 \
+       src/mm/fk_pmm.f90 src/mm/fk_vmm.f90 src/mm/fk_heap.f90 \
        src/boot/fk_kmain.f90"
 
 restore() { git checkout -- $FILES 2>/dev/null; }

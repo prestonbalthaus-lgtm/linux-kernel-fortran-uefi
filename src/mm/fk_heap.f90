@@ -403,6 +403,7 @@ contains
     ! Forward first: coalesce_back may move the block, and merging into the
     ! predecessor after the successor is already absorbed is one operation.
     call coalesce_fwd(a)
+    call coalesce_back(a)
   end subroutine kfree
 
   !> The payload size a pointer was given, or 0 if it is not a live block.
