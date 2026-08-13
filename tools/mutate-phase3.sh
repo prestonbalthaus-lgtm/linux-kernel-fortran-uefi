@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0
 #
 # Drives the mutation table in docs/HARNESS-VALIDATION-PHASE3.md: injects one
-# defect at a time into the roadmap 3.1/3.2/3.2.5/3.4 code, rebuilds from clean,
+# defect at a time into the roadmap 3.1/3.2/3.2.5/3.4/3.5 code, rebuilds from clean,
 # boots it and restores the tree.  The baselines must PASS; a MUTATION that
 # passes is an ESCAPE, because the gate accepted a kernel with a known defect.
 #
@@ -20,8 +20,10 @@ echo "logs: $OUT"
 # Every file any mutation below touches.  A short restore list is how a defect
 # survives into the NEXT case and gets attributed to it.
 FILES="boot/interrupts.S boot/gdt_flush.S boot/faultgen.S boot/ksyms.S \
+       boot/mmu.S \
        src/cpu/fk_gdt.f90 src/cpu/fk_idt.f90 src/cpu/fk_tss.f90 \
-       src/drivers/pic/fk_pic.f90 src/mm/fk_pmm.f90 src/boot/fk_kmain.f90"
+       src/drivers/pic/fk_pic.f90 src/mm/fk_pmm.f90 src/mm/fk_vmm.f90 \
+       src/boot/fk_kmain.f90"
 
 restore() { git checkout -- $FILES 2>/dev/null; }
 
@@ -52,12 +54,24 @@ fi
 PMM_EXPECT=$'Fortran Kernel: PMM reserved and ACPI frames are all marked used.\nFortran Kernel: PMM locked the kernel image and the loader map out.\nFortran Kernel: PMM allocated 5 contiguous frames.\nFortran Kernel: PMM freed and reclaimed the same 5 frames.\nFortran Kernel: PMM refused a double, unaligned and locked free.\nFortran Kernel: PMM rewound its scan cursor to a freed frame.'
 PMM_REJECT=$'Fortran Kernel: PMM init FAILED, status 0x\nFortran Kernel: PMM reserved or ACPI frames are STILL FREE.\nFortran Kernel: PMM did NOT lock the kernel image out.\nFortran Kernel: PMM allocation is NOT contiguous.\nFortran Kernel: PMM reclaim FAILED.\nFortran Kernel: PMM guard FAILED.\nFortran Kernel: PMM cursor rewind FAILED.'
 
-DE_EXPECT="EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error"$'\n'"$PMM_EXPECT"
-DF_EXPECT=$'EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault\n*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***\n'"$PMM_EXPECT"
+# roadmap 3.5's verdicts ride on every case for the same reason 3.4's do. The
+# last line of each is not a verdict at all: " R-X" and "RWX" are the W^X
+# property read off the permission column of the LIVE page tables, and they
+# carry no address, so they survive any relayout.
+VMM_EXPECT=$'Fortran Kernel: VMM has EFER.NXE and CR0.WP, so the permissions bite.\nFortran Kernel: VMM mapped every kernel page with the asked-for permission.\nFortran Kernel: VMM left the stack guard page unmapped.\nFortran Kernel: identity window still live, [0x100000] = 0x00000000E85250D6\nFortran Kernel: PML4[0] unmapped; the identity window is dead.\nFortran Kernel: VMM mapped a frame above 4 GiB and read back what it wrote.\n R-X'
+VMM_REJECT=$'Fortran Kernel: VMM init FAILED, status 0x\nFortran Kernel: VMM could not enable NX; .rodata is not no-execute.\nFortran Kernel: VMM section permissions are WRONG, pages 0x\nFortran Kernel: VMM guard page is MAPPED.\nFortran Kernel: PML4[0] is STILL MAPPED.\nFortran Kernel: VMM high-frame mapping FAILED.\nRWX'
+
+DE_EXPECT="EXCEPTION 0x00 ERR 0x0000000000000000 -- #DE Divide-by-Zero Error"$'\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"
+DF_EXPECT=$'EXCEPTION 0x08 ERR 0x0000000000000000 -- #DF Double Fault\n*** #DF ENTERED ON IST1 -- THE EMERGENCY STACK HELD ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"
 # The OOM build's proof is three facts: the allocator refused, it said so, and
 # the panic that followed came from the CPU with a full register dump.
-OOM_EXPECT=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"
-COMMON_REJECT=$'Fortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.\n'"$PMM_REJECT"
+OOM_EXPECT=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"
+COMMON_REJECT=$'Fortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.\n'"$PMM_REJECT"$'\n'"$VMM_REJECT"
+
+# roadmap 3.5's two page-fault builds. The CR2 line is the whole assertion: both
+# faults are vector 14 with error code 0, so without it the two cases are
+# indistinguishable and either would satisfy the other's expectation.
+PF_EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000000 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"
 DF_REJECT="*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***"$'\n'"$COMMON_REJECT"
 
 EXPECT="$DF_EXPECT"; REJECT="$DF_REJECT"
@@ -92,6 +106,55 @@ mode_oom() {
   EXPECT="$OOM_EXPECT"; REJECT="$COMMON_REJECT"
 }
 
+# The guard page, whose address is READ OUT OF THE IMAGE that was just built
+# rather than written down here -- the whole point is that the fault lands on
+# the page linker.ld reserved, and a constant would still match after a
+# relayout moved it. bash arithmetic is signed 64-bit, so 0xFFFFFFFF... wraps
+# negative; printf %X prints the bit pattern, which is what is wanted.
+mode_guard() {
+  subst src/boot/fk_kmain.f90 \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t" \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = -2_c_int32_t"
+  EXPECT="$PF_EXPECT"; REJECT="$COMMON_REJECT"; POST_BUILD=guard_cr2
+}
+guard_cr2() {
+  local b cr2
+  b=$(nm build/boot/kernel.elf | awk '$3=="__boot_stack_bottom"{print $1}')
+  [ -n "$b" ] || { echo "  (cannot read __boot_stack_bottom)"; return; }
+  cr2=$(printf '%016X' $(( 0x$b - 8 )))
+  echo "  guard probe: __boot_stack_bottom 0x$b, expecting CR2 0x$cr2"
+  EXPECT="$EXPECT"$'\n'"CR2     = 0x$cr2"
+}
+
+# ...and the write to .text that only CR0.WP refuses. ERR 0x3 is the assertion,
+# not the vector: bit 0 says the page was PRESENT and bit 1 says the access was
+# a WRITE, i.e. a protection violation rather than a missing page. A not-present
+# page would report 0x2 and would prove nothing about the write bit.
+mode_wp() {
+  subst src/boot/fk_kmain.f90 \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t" \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = -4_c_int32_t"
+  EXPECT=$'EXCEPTION 0x0E ERR 0x0000000000000003 -- #PF Page Fault\n*** HALTED -- CLI/HLT ***\n'"$PMM_EXPECT"$'\n'"$VMM_EXPECT"
+  REJECT="$COMMON_REJECT"; POST_BUILD=wp_cr2
+}
+wp_cr2() {
+  local t
+  t=$(nm build/boot/kernel.elf | awk '$3=="__text_start"{print $1}')
+  [ -n "$t" ] || { echo "  (cannot read __text_start)"; return; }
+  echo "  wp probe: writing to __text_start 0x$t"
+  EXPECT="$EXPECT"$'\n'"CR2     = 0x$(printf '%016X' $(( 0x$t )))"
+}
+
+# ...and physical 1 MiB, which needs no lookup: it is where linker.ld puts this
+# image, and it resolved a few lines of console output earlier.
+mode_idmap() {
+  subst src/boot/fk_kmain.f90 \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t" \
+    "integer(c_int32_t), parameter :: FK_FAULT_MODE = -3_c_int32_t"
+  EXPECT="$PF_EXPECT"$'\n'"CR2     = 0x0000000000100000"
+  REJECT="$COMMON_REJECT"
+}
+
 # Both gates, because they see different things: the static one reads the
 # linked image (a TSS that grew from 104 bytes to 112 is visible there and
 # nowhere else), the boot one reads a running CPU.  Which one caught a defect
@@ -104,6 +167,8 @@ run_case() {
     echo "$name: static=$static, BUILD FAILED (caught at build time)"
     return
   fi
+  # A case whose expectation depends on an address only the fresh image knows.
+  [ -n "${POST_BUILD:-}" ] && "$POST_BUILD"
   FK_EXPECT_SERIAL="$EXPECT" FK_REJECT_SERIAL="$REJECT" FK_CHECK_HW=1 \
     tools/qemu-boot-test.sh >"$OUT/$name.log" 2>&1
   local rc=$? line
@@ -121,7 +186,10 @@ want_case() { [ -z "$SELECT" ] && return 0; case " $SELECT " in *" $1 "*) return
 
 case_baseline_df()  { run_case baseline-df; }
 case_baseline_de()  { mode_de;  run_case baseline-de; }
-case_baseline_oom() { mode_oom; run_case baseline-oom; }
+case_baseline_oom()   { mode_oom;   run_case baseline-oom; }
+case_baseline_guard() { mode_guard; run_case baseline-guard-page; }
+case_baseline_idmap() { mode_idmap; run_case baseline-identity-dead; }
+case_baseline_wp()    { mode_wp;    run_case baseline-text-readonly; }
 
 # --- the #DE build: roadmap 3.2's frame normalisation ------------------------
 case_M1() {
@@ -240,19 +308,85 @@ case_M19() {
 # value of an absolute linker symbol, and a wrong constant marks the wrong
 # frames used while every console verdict still prints PASS.
 case_M20() {
-  # $'...' and not "...": the assembler's $ immediate would otherwise be read by
-  # bash as a variable expansion, and the run dies on `unbound variable`.
-  subst boot/ksyms.S $'\tmovabsq\t$__kernel_phys_start, %rax' \
-                     $'\tmovabsq\t$0x0, %rax'
+  # roadmap 3.5 turned seventeen near-identical accessors into one KSYM macro,
+  # so the defect is now injected into the macro BODY and every accessor in the
+  # image returns zero at once. printf builds both strings: the anchor contains
+  # tabs, a '$' immediate and a '\sym' macro parameter, and no bash quoting
+  # style leaves all three alone.
+  subst boot/ksyms.S "$(printf '\tmovabsq\t$\\sym, %%rax')" \
+                     "$(printf '\tmovabsq\t$0x0, %%rax')"
   run_case M20-ksyms-wrong-constant
 }
 
-ALL="baseline_df baseline_de baseline_oom M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 \
-     M12 M13 M14 M15 M16 M17 M18 M19 M20"
+# --- roadmap 3.5: the VMM and the higher-half handoff ------------------------
+# M21 is the one that says why the boot gate rejects the string "RWX". The
+# kernel's own vmm_verify_image compares the LIVE tables against the table of
+# intentions it built -- so mutating the INTENTION passes that check with
+# nothing to report. What it cannot do is stop the permission column from
+# saying so.
+case_M21() {
+  subst src/mm/fk_vmm.f90 "    sec_flags(2) = perm(.false., .true.)" \
+                          "    sec_flags(2) = perm(.true., .true.)"
+  run_case M21-text-mapped-writable
+}
+case_M22() {
+  subst src/mm/fk_vmm.f90 $'       if (v /= guard_page) then\n          status = vmm_map_page(v, v - kernel_vma, flags)\n          if (status /= FK_VMM_OK) return\n       end if' \
+                          $'       status = vmm_map_page(v, v - kernel_vma, flags)\n       if (status /= FK_VMM_OK) return'
+  run_case M22-guard-page-mapped
+}
+case_M23() {
+  subst src/mm/fk_vmm.f90 $'    t(1) = 0_c_int64_t\n    call fk_write_cr3(pml4_phys)' \
+                          $'    call fk_write_cr3(pml4_phys)'
+  run_case M23-pml4-0-never-zeroed
+}
+# THE ONE THE DEFAULT BUILD CANNOT SEE, and the reason FK_FAULT_MODE grew a
+# third value. Zeroing PML4[0] without reloading CR3 leaves the translation in
+# the TLB: vmm_translate walks the tables in software and correctly reports the
+# window gone, every console verdict prints PASS -- and the CPU goes on
+# resolving physical addresses through a cached entry. Only a real load from
+# 0x100000 disagrees, which is what the idmap build performs.
+case_M24() {
+  subst src/mm/fk_vmm.f90 $'    t(1) = 0_c_int64_t\n    call fk_write_cr3(pml4_phys)' \
+                          $'    t(1) = 0_c_int64_t'
+  mode_idmap
+  run_case M24-unmap-without-tlb-flush
+}
+# EFER.NXE left clear while the tables still carry bit 63. That bit is then
+# RESERVED rather than no-execute, so the first read of a .rodata string faults,
+# the fault handler reads .rodata to say so, and the machine triple-faults.
+case_M25() {
+  subst boot/mmu.S "$(printf '\torl\t$EFER_NXE, %%eax\n\twrmsr')" \
+                   "$(printf '\torl\t$EFER_NXE, %%eax')"
+  run_case M25-nx-bits-without-nxe
+}
+# CR0.WP never set. This is the defect the whole -4 build exists for: it changes
+# NOTHING that any other gate can see. .text is still mapped R-X, the permission
+# column still says so, vmm_verify_image still returns 0, and the console still
+# claims CR0.WP -- because fk_mmu_arm's return value only ever reported the NX
+# half. Only a store to .text can tell, and only if the CPU refuses it.
+case_M27() {
+  subst boot/mmu.S "$(printf '\tmovq\t%%cr0, %%rax\n\torq\t$CR0_WP, %%rax\n\tmovq\t%%rax, %%cr0')" \
+                   "$(printf '\tmovq\t%%cr0, %%rax')"
+  mode_wp
+  run_case M27-cr0-wp-never-set
+}
+
+# The guard accessor pointed at a different linker symbol. The static gate
+# catches it on the naming convention alone; the boot gate catches it because
+# the VMM then leaves a live .bss page unmapped and maps the guard.
+case_M26() {
+  subst boot/ksyms.S "$(printf '\tKSYM\tfk_boot_stack_guard,   __boot_stack_guard')" \
+                     "$(printf '\tKSYM\tfk_boot_stack_guard,   __bss_start')"
+  run_case M26-guard-accessor-wrong-symbol
+}
+
+ALL="baseline_df baseline_de baseline_oom baseline_guard baseline_idmap \
+     baseline_wp M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 \
+     M12 M13 M14 M15 M16 M17 M18 M19 M20 M21 M22 M23 M24 M25 M26 M27"
 for c in $ALL; do
   want_case "$c" || continue
   echo "=== $c ==="
-  EXPECT="$DF_EXPECT"; REJECT="$DF_REJECT"
+  EXPECT="$DF_EXPECT"; REJECT="$DF_REJECT"; POST_BUILD=""
   restore
   "case_$c"
   restore

@@ -126,8 +126,13 @@ for f in $(find "$SRCDIR" -name "fk_*.f90" | sort); do
   # module and not about the image -- so they are supplied as placeholder
   # absolutes.  Their VALUES are checked where they can be: against the real
   # script, by tools/linkscript-test.sh.
-  LDSCRIPT_SYMS="--defsym __bss_start=0 --defsym __bss_end=0 --defsym __boot_stack_top=0 \
-                 --defsym __kernel_phys_start=0 --defsym __kernel_phys_end=0"
+  # DERIVED from linker.ld, not transcribed. This list used to be five names
+  # written out by hand; roadmap 3.5 added twelve more section-bound accessors
+  # to boot/ksyms.S and a hand-list would have failed the link for every module
+  # instead of the one that changed. Reading the script's own definitions is the
+  # same discipline KFLAGS above already follows.
+  LDSCRIPT_SYMS=$(grep -oE '^[[:space:]]*__[A-Za-z0-9_]+[[:space:]]*=' linker.ld \
+                  | tr -d ' =' | sort -u | sed 's/^/--defsym /; s/$/=0/' | tr '\n' ' ')
   if ld -nostdlib $LDSCRIPT_SYMS -e "$ent" -o /dev/null "$obj" $others 2>"$WORK/$n.link"; then
     echo "  OK    $n  (kernel flags, no FP/vector, $ndep in-tree dep(s), links -nostdlib)"
   else

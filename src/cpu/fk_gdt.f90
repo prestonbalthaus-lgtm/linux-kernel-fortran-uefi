@@ -9,7 +9,7 @@ module fk_gdt_m
   implicit none
   private
   public :: FK_GDT_SEL_CODE, FK_GDT_SEL_DATA, FK_GDT_SEL_TSS, gdt_init, &
-            gdt_set_tss
+            gdt_reload, gdt_set_tss
 
   integer(c_int16_t), parameter :: FK_GDT_SEL_CODE = int(z'08', c_int16_t)
   integer(c_int16_t), parameter :: FK_GDT_SEL_DATA = int(z'10', c_int16_t)
@@ -65,6 +65,18 @@ contains
 
   subroutine gdt_init() bind(c, name="gdt_init")
     implicit none
+
+    call gdt_reload()
+  end subroutine gdt_init
+
+  ! Rebuilds the pseudo-descriptor from the table's current address and issues
+  ! LGDT and the far return that reloads CS.  roadmap 3.5 runs it a second time,
+  ! after CR3 has changed and before the identity window is unmapped: the base
+  ! stored here is already a higher-half address, and the far return is what
+  ! makes the CPU discard the hidden segment state the boot stub loaded from a
+  ! physically-based descriptor.
+  subroutine gdt_reload() bind(c, name="gdt_reload")
+    implicit none
     integer(c_int64_t) :: base
     integer(c_int32_t) :: i
 
@@ -77,7 +89,7 @@ contains
     end do
 
     call gdt_flush(gdtr, FK_GDT_SEL_CODE, FK_GDT_SEL_DATA)
-  end subroutine gdt_init
+  end subroutine gdt_reload
 
   ! The two quadwords of the TSS descriptor, built by fk_tss_m because only it
   ! knows where the TSS is.  Safe to run after LGDT: the CPU re-reads the table

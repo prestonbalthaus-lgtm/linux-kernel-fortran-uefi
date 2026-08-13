@@ -22,7 +22,15 @@ module fk_kmain_m
                          pmm_total_pages, pmm_free_pages, pmm_ignored_bytes, &
                          pmm_region_count, pmm_region_base, pmm_region_len, &
                          pmm_region_type, pmm_verify_reserved, &
-                         pmm_verify_kernel_locked
+                         pmm_verify_kernel_locked, pmm_alloc_page_from
+  use fk_vmm_m,    only: FK_VMM_OK, FK_VMM_SECTIONS, FK_VMM_SCRATCH, &
+                         FK_PTE_P, FK_PTE_RW, FK_PTE_NX, &
+                         vmm_init, vmm_activate, vmm_drop_identity, &
+                         vmm_map_page, vmm_translate, vmm_phys_of, &
+                         vmm_pml4_phys, vmm_table_frames, vmm_physmap_top, &
+                         vmm_nx_enabled, vmm_verify_image, vmm_read_cr3, &
+                         vmm_section_start, vmm_section_end, vmm_section_flags, &
+                         vmm_guard_page, vmm_phys_to_virt
   implicit none
   private
   public :: kernel_main
@@ -139,6 +147,96 @@ module fk_kmain_m
        "Fortran Kernel: draining the PMM to force an OOM panic (roadmap 3.4)." // &
        FK_CRLF // c_null_char
 
+  ! roadmap 3.5 and 1.2b.  Same discipline as 3.4's: every verdict printed here
+  ! has a FAIL twin the boot gate REJECTS, and the numbers beside it are read
+  ! back out of the live page tables rather than remembered from what was asked
+  ! for.
+  character(kind=c_char, len=*), parameter :: FK_VMM_START = &
+       "Fortran Kernel: VMM building 4-level page tables (roadmap 3.5)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_INIT_FAILED = &
+       "Fortran Kernel: VMM init FAILED, status 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_HDR = &
+       "VMM  SECTION  VIRT               PHYS               PERM" // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_ROW   = "VMM  " // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_ARROW = " " // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_TOTALS = &
+       "Fortran Kernel: VMM PML4/table-frames/physmap-top 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_NX_ON = &
+       "Fortran Kernel: VMM has EFER.NXE and CR0.WP, so the permissions bite." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_NX_OFF = &
+       "Fortran Kernel: VMM could not enable NX; .rodata is not no-execute." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_MAP_OK = &
+       "Fortran Kernel: VMM mapped every kernel page with the asked-for " // &
+       "permission." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_MAP_BAD = &
+       "Fortran Kernel: VMM section permissions are WRONG, pages 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_GUARD_OK = &
+       "Fortran Kernel: VMM left the stack guard page unmapped." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_GUARD_BAD = &
+       "Fortran Kernel: VMM guard page is MAPPED." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_CR3 = &
+       "Fortran Kernel: higher-half handoff done, CR3 = 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_ID_LIVE = &
+       "Fortran Kernel: identity window still live, [0x100000] = 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_ID_DEAD_OK = &
+       "Fortran Kernel: PML4[0] unmapped; the identity window is dead." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_ID_DEAD_BAD = &
+       "Fortran Kernel: PML4[0] is STILL MAPPED." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_HIGH_OK = &
+       "Fortran Kernel: VMM mapped a frame above 4 GiB and read back what it " // &
+       "wrote." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_HIGH_BAD = &
+       "Fortran Kernel: VMM high-frame mapping FAILED." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VMM_HIGH_NONE = &
+       "Fortran Kernel: this machine reports no RAM above 4 GiB; high-frame " // &
+       "probe skipped." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TRIGGER_GUARD = &
+       "Fortran Kernel: reading the guard page below the boot stack " // &
+       "(roadmap 3.5)." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TRIGGER_IDMAP = &
+       "Fortran Kernel: reading physical 0x100000 with no identity map " // &
+       "(roadmap 1.2b)." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_TRIGGER_WP = &
+       "Fortran Kernel: writing to .text, which only CR0.WP refuses " // &
+       "(roadmap 3.5)." // FK_CRLF // c_null_char
+
+  ! Same order as fk_vmm_m's section table, which is the order linker.ld lays
+  ! them down.  A mismatch here mislabels a row and nothing else, which is
+  ! exactly why the row carries the addresses too.
+  character(kind=c_char, len=8), parameter :: FK_VMM_SEC_NAME(FK_VMM_SECTIONS) = &
+       [ character(kind=c_char, len=8) :: &
+         ".mbhdr " // c_null_char, ".text  " // c_null_char, &
+         ".rodata" // c_null_char, ".data  " // c_null_char, &
+         ".bss   " // c_null_char, ".bootpt" // c_null_char ]
+
+  ! Physical 1 MiB: the first byte of this image, and the Multiboot2 header
+  ! magic, so the value read back through the identity window is checkable by
+  ! eye rather than merely non-zero.
+  integer(c_int64_t), parameter :: FK_PHYS_1MIB = 1048576_c_int64_t
+
+  ! The floor for the high-frame probe, and the value written through it.
+  integer(c_int64_t), parameter :: FK_VMM_HIGH_FLOOR = 4294967296_c_int64_t
+  integer(c_int64_t), parameter :: FK_VMM_MAGIC = int(z'564D4D50524F4F46', c_int64_t)
+
+  ! Decoded from the LIVE entry, so "RW-" in a row means the CPU will refuse to
+  ! execute there, not that somebody asked for that.
+  character(kind=c_char, len=*), parameter :: FK_PERM_RWX  = "RWX" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PERM_RW   = "RW-" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PERM_RX   = "R-X" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PERM_RO   = "R--" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PERM_NONE = "unmapped" // c_null_char
+
+  ! Where the deliberate loads land.  VOLATILE and at module scope so the value
+  ! is stored to memory somebody could read: a result nothing consumes is a
+  ! result gcc may decide not to produce.
+  integer(c_int64_t), volatile :: fk_probe = 0_c_int64_t
+
   ! Multiboot2 3.6 types, indexed by the type code; 0 catches anything the
   ! specification does not name, all of which is treated as reserved.
   character(kind=c_char, len=16), parameter :: FK_MEM_TYPE_NAME(0:5) = &
@@ -169,6 +267,22 @@ module fk_kmain_m
   ! tools/mutate-phase3.sh seds this line and rebuilds to run the other gates.
   integer(c_int32_t), parameter :: FK_FAULT_MODE = 8_c_int32_t
   integer(c_int32_t), parameter :: FK_FAULT_PMM_OOM = -1_c_int32_t
+  ! roadmap 3.5's two.  Both are page faults, and they are NOT one test twice:
+  ! the guard page proves an address INSIDE the image resolves to nothing, and
+  ! the identity probe proves an address that resolved a moment ago no longer
+  ! does.  CR2 in the panic dump is what tells them apart.
+  integer(c_int32_t), parameter :: FK_FAULT_GUARD = -2_c_int32_t
+  integer(c_int32_t), parameter :: FK_FAULT_IDMAP = -3_c_int32_t
+  ! And the one that took an adversarial reading to notice was missing. CR0.WP
+  ! is the bit that makes a read-only PTE mean anything to the only ring this
+  ! kernel has, and it fails SILENTLY: delete the store in fk_mmu_arm and .text
+  ! is still mapped R-X, vmm_verify_image still returns 0, the permission column
+  ! still reads R-X, and a kernel store to .text simply succeeds. Every other
+  ! half of the permission model announces its own failure -- a set NX bit
+  ! without EFER.NXE faults on the first access -- so this is the only one that
+  ! needed a fault of its own. ERR 0x3 is the whole assertion: bit 0 present,
+  ! bit 1 write, i.e. a PROTECTION violation and not a missing page.
+  integer(c_int32_t), parameter :: FK_FAULT_WP = -4_c_int32_t
 
   ! BOTH operands are volatile, and that is not belt and braces: with a literal
   ! numerator gcc rewrites 1/x into a compare against +-1 and emits no DIV at
@@ -196,6 +310,34 @@ module fk_kmain_m
     subroutine fk_raise_bp() bind(c, name="fk_raise_bp")
       implicit none
     end subroutine fk_raise_bp
+
+    ! A load and a store the optimiser is not allowed to see.  boot/faultgen.S.
+    function fk_peek64(addr) result(v) bind(c, name="fk_peek64")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t), intent(in), value :: addr
+      integer(c_int64_t) :: v
+    end function fk_peek64
+
+    subroutine fk_poke64(addr, v) bind(c, name="fk_poke64")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t), intent(in), value :: addr, v
+    end subroutine fk_poke64
+
+    ! linker.ld's __boot_stack_bottom; boot/ksyms.S.  The guard page is the
+    ! frame directly below it, so this is where the deliberate #PF aims.
+    function fk_boot_stack_bottom() result(a) bind(c, name="fk_boot_stack_bottom")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t) :: a
+    end function fk_boot_stack_bottom
+
+    function fk_text_start() result(a) bind(c, name="fk_text_start")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t) :: a
+    end function fk_text_start
   end interface
 
 contains
@@ -387,6 +529,152 @@ contains
     call fk_raise_bp()
   end subroutine pmm_drain_to_oom
 
+  subroutine print_perm(e)
+    implicit none
+    integer(c_int64_t), intent(in) :: e
+
+    if (e == 0_c_int64_t) then
+       call serial_print_string(FK_PERM_NONE)
+    else if (iand(e, FK_PTE_RW) /= 0_c_int64_t) then
+       if (iand(e, FK_PTE_NX) /= 0_c_int64_t) then
+          call serial_print_string(FK_PERM_RW)
+       else
+          call serial_print_string(FK_PERM_RWX)
+       end if
+    else if (iand(e, FK_PTE_NX) /= 0_c_int64_t) then
+       call serial_print_string(FK_PERM_RO)
+    else
+       call serial_print_string(FK_PERM_RX)
+    end if
+  end subroutine print_perm
+
+  ! roadmap 3.5's verification, and it runs BEFORE anything reaches CR3.  Every
+  ! address and every permission below is read back out of the hierarchy that
+  ! is about to become live, so a row states what the CPU will do rather than
+  ! what this kernel asked for -- and a kernel that mapped its own .text wrong
+  ! gets to SAY so, instead of triple-faulting into a silent reboot.
+  subroutine vmm_report()
+    implicit none
+    integer(c_int32_t) :: i
+    integer(c_int64_t) :: v, bad
+
+    call serial_print_string(FK_VMM_HDR)
+    do i = 1_c_int32_t, FK_VMM_SECTIONS
+       v = vmm_section_start(i)
+       call serial_print_string(FK_VMM_ROW)
+       call serial_print_string(FK_VMM_SEC_NAME(i))
+       call serial_print_string(FK_PMM_SP)
+       call serial_print_string(FK_PMM_0X)
+       call serial_print_hex(v, 16_c_int32_t)
+       call serial_print_string(FK_PMM_SP)
+       call serial_print_string(FK_PMM_0X)
+       call serial_print_hex(vmm_phys_of(v), 16_c_int32_t)
+       call serial_print_string(FK_PMM_SP)
+       call print_perm(vmm_translate(v))
+       call serial_print_string(FK_NL)
+    end do
+
+    call serial_print_string(FK_VMM_TOTALS)
+    call serial_print_hex(vmm_pml4_phys(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(vmm_table_frames(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(vmm_physmap_top(), 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    if (vmm_nx_enabled() /= 0_c_int32_t) then
+       call serial_print_string(FK_VMM_NX_ON)
+    else
+       call serial_print_string(FK_VMM_NX_OFF)
+    end if
+
+    ! Every page of the image, not just the first of each section: a section
+    ! whose second page was skipped has a perfectly good first row above.
+    bad = vmm_verify_image()
+    if (bad == 0_c_int64_t) then
+       call serial_print_string(FK_VMM_MAP_OK)
+    else
+       call serial_print_string(FK_VMM_MAP_BAD)
+       call serial_print_hex(bad, 16_c_int32_t)
+       call serial_print_string(FK_NL)
+    end if
+
+    if (vmm_translate(vmm_guard_page()) == 0_c_int64_t) then
+       call serial_print_string(FK_VMM_GUARD_OK)
+    else
+       call serial_print_string(FK_VMM_GUARD_BAD)
+    end if
+  end subroutine vmm_report
+
+  ! roadmap 1.2b, in the one order that works: CR3, then the descriptor-table
+  ! reload while the identity window is still live, then the unmap, then the
+  ! TLB flush that makes the unmap take effect.  The read of physical 1 MiB in
+  ! the middle is the evidence the window WAS live in the new hierarchy -- the
+  ! value is this image's own Multiboot2 magic -- so the verdict below it is a
+  ! before-and-after and not just an absence.
+  subroutine vmm_handoff()
+    implicit none
+    integer(c_int64_t) :: hi, back, flags
+    integer(c_int32_t) :: st
+
+    call vmm_activate()
+
+    call serial_print_string(FK_VMM_CR3)
+    call serial_print_hex(vmm_read_cr3(), 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_VMM_ID_LIVE)
+    call serial_print_hex(fk_peek64(FK_PHYS_1MIB), 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call vmm_drop_identity()
+    if (vmm_translate(FK_PHYS_1MIB) == 0_c_int64_t) then
+       call serial_print_string(FK_VMM_ID_DEAD_OK)
+    else
+       call serial_print_string(FK_VMM_ID_DEAD_BAD)
+    end if
+
+    ! roadmap 3.4's closing debt: a frame the old 1 GiB window could not reach,
+    ! mapped at a scratch address and then read back through the linear map at
+    ! a DIFFERENT one.  Two virtual addresses agreeing on one physical frame is
+    ! what makes this a mapping rather than a store to whatever was there.
+    hi = pmm_alloc_page_from(FK_VMM_HIGH_FLOOR)
+    if (hi == 0_c_int64_t) then
+       call serial_print_string(FK_VMM_HIGH_NONE)
+       return
+    end if
+    call serial_print_string(FK_VMM_ROW)
+    call serial_print_string(FK_PMM_ALLOC)
+    call serial_print_hex(hi, 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! The verdict below says "above 4 GiB", so the FLOOR is checked rather than
+    ! assumed. pmm_alloc_page_from is the newest code in the PMM; if its first
+    ! word/bit arithmetic were off by anything it would return a low frame, the
+    ! round trip would still succeed, and this kernel would print a true
+    ! sentence about the wrong frame.
+    if (hi < FK_VMM_HIGH_FLOOR) then
+       call serial_print_string(FK_VMM_HIGH_BAD)
+       return
+    end if
+
+    flags = ior(FK_PTE_P, FK_PTE_RW)
+    if (vmm_nx_enabled() /= 0_c_int32_t) flags = ior(flags, FK_PTE_NX)
+    st = vmm_map_page(FK_VMM_SCRATCH, hi, flags)
+    if (st /= FK_VMM_OK) then
+       call serial_print_string(FK_VMM_HIGH_BAD)
+       return
+    end if
+
+    call fk_poke64(FK_VMM_SCRATCH, FK_VMM_MAGIC)
+    back = fk_peek64(vmm_phys_to_virt(hi))
+    if (back == FK_VMM_MAGIC .and. vmm_phys_of(FK_VMM_SCRATCH) == hi) then
+       call serial_print_string(FK_VMM_HIGH_OK)
+    else
+       call serial_print_string(FK_VMM_HIGH_BAD)
+    end if
+  end subroutine vmm_handoff
+
   ! Entry point called by boot/boot.S once the CPU is in 64-bit long mode.
   ! Does not return.  magic and mbi arrive by value per the SysV AMD64 C ABI,
   ! in EDI and RSI.
@@ -447,9 +735,36 @@ contains
        call serial_print_string(FK_NL)
     end if
 
+    ! The VMM (roadmap 3.5) and the higher-half handoff (roadmap 1.2b).  AFTER
+    ! the PMM, which dereferences the loader's structure through the identity
+    ! window this step takes away, and after pmm_verify, which hands the
+    ! allocator back exactly as pmm_init produced it.
+    call serial_print_string(FK_VMM_START)
+    status = vmm_init()
+    if (status == FK_VMM_OK) then
+       call vmm_report()
+       call vmm_handoff()
+    else
+       call serial_print_string(FK_VMM_INIT_FAILED)
+       call serial_print_hex(int(status, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       ! Not a fall-through: every fault below is raised at an address whose
+       ! mapping this kernel no longer knows anything about.
+       call fk_cpu_halt()
+    end if
+
     ! The deliberate fault.  Raised by the CPU, never simulated by a call.
     if (FK_FAULT_MODE == FK_FAULT_PMM_OOM) then
        call pmm_drain_to_oom()
+    else if (FK_FAULT_MODE == FK_FAULT_GUARD) then
+       call serial_print_string(FK_TRIGGER_GUARD)
+       fk_probe = fk_peek64(fk_boot_stack_bottom() - 8_c_int64_t)
+    else if (FK_FAULT_MODE == FK_FAULT_IDMAP) then
+       call serial_print_string(FK_TRIGGER_IDMAP)
+       fk_probe = fk_peek64(FK_PHYS_1MIB)
+    else if (FK_FAULT_MODE == FK_FAULT_WP) then
+       call serial_print_string(FK_TRIGGER_WP)
+       call fk_poke64(fk_text_start(), 0_c_int64_t)
     else if (FK_FAULT_MODE == 8_c_int32_t) then
        call serial_print_string(FK_TRIGGER_DF)
        call fk_smash_stack()

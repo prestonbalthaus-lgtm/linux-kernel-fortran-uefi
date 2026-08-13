@@ -330,35 +330,70 @@ else
   bad "     the same memory as the one whose corruption caused the #DF"
 fi
 
-# REPORTED, deliberately not asserted. The boot stack grows DOWN out of
-# __boot_stack_bottom into whatever .bss put underneath it, and there is no
-# guard page until the VMM at roadmap 3.5. Which object is underneath is worth
-# printing every build, because today it is the TSS itself -- so a boot-stack
-# overflow destroys IST1 before the #DF that would have used it. Asserting a
-# particular neighbour would only freeze an arbitrary link order.
-python3 - "$K" <<'PY'
+echo
+echo "=== roadmap 3.5: the guard page below the boot stack ==="
+# What this block used to print as a NOTE is now a property. Until 3.5 the boot
+# stack grew DOWN out of __boot_stack_bottom into whatever .bss happened to put
+# underneath it -- first the TSS, then the PMM's bitmap with ZERO bytes of
+# slack -- and which object that was could only be reported, never asserted,
+# because link order decided it rather than anybody. linker.ld now reserves a
+# page for the fall to land in, and the VMM leaves it unmapped.
+#
+# The ASSERTs inside linker.ld already fail the LINK on alignment and size, so
+# what is left for this gate is the thing a linker script cannot see: that the
+# guard frame is EMPTY. A .bss object sharing that frame would be unmapped
+# along with the guard, and the fault would land on the object rather than on
+# the overflow.
+gp=$(sym __boot_stack_guard); sb=$(sym __boot_stack_bottom)
+if [ -z "$gp" ]; then
+  bad "__boot_stack_guard missing: linker.ld reserves no guard page"
+else
+  ok "__boot_stack_guard exported = $gp"
+  if [ $(( (gp & 0xfff) == 0 )) -eq 1 ]; then
+    ok "the guard page is 4 KiB aligned, so it is a page frame of its own"
+  else
+    bad "the guard page is not 4 KiB aligned and cannot be unmapped by itself"
+  fi
+  if [ $(( sb - gp == 4096 )) -eq 1 ]; then
+    ok "the guard page is exactly the 4096 bytes below __boot_stack_bottom"
+  else
+    bad "__boot_stack_bottom is $(( sb - gp )) bytes above the guard, not 4096"
+  fi
+fi
+if python3 - "$K" <<'GUARDPY'
 import subprocess, sys
-bb = None
+gp = None
 syms = []
 for line in subprocess.run(["nm", "-S", "-n", sys.argv[1]],
                            capture_output=True, text=True).stdout.splitlines():
     f = line.split()
-    if len(f) == 3 and f[2] == "__boot_stack_bottom":
-        bb = int(f[0], 16)
+    if len(f) == 3 and f[2] == "__boot_stack_guard":
+        gp = int(f[0], 16)
     elif len(f) == 4 and f[2] in "Bb":
         syms.append((int(f[0], 16), int(f[1], 16), f[3]))
-if bb is None:
-    print("  NOTE  __boot_stack_bottom not found")
+if gp is None:
+    print("__boot_stack_guard not found"); sys.exit(1)
+clash = [(a, n, nm) for a, n, nm in syms if a < gp + 4096 and a + n > gp]
+for a, n, nm in clash:
+    print("%s [0x%x,0x%x) lies inside the guard frame [0x%x,0x%x)"
+          % (nm, a, a + n, gp, gp + 4096))
+if clash:
+    sys.exit(1)
+below = [x for x in syms if x[0] < gp]
+if below:
+    a, n, nm = max(below)
+    print("no .bss object is inside the guard frame [0x%x,0x%x); below it sits %s,"
+          % (gp, gp + 4096, nm))
+    print("        ending 0x%x, and an overflow must now cross the guard to reach it"
+          % (a + n))
 else:
-    below = [x for x in syms if x[0] < bb]
-    if below:
-        a, n, name = max(below)
-        print("  NOTE  directly below __boot_stack_bottom (0x%x): %s, ending 0x%x"
-              % (bb, name, a + n))
-        print("        %d byte(s) of slack, and no guard page until roadmap 3.5 --"
-              % (bb - (a + n)))
-        print("        a boot-stack overflow lands in it")
-PY
+    print("no .bss object is inside the guard frame [0x%x,0x%x)" % (gp, gp + 4096))
+GUARDPY
+then
+  :
+else
+  bad "an object shares the guard page frame (see above)"
+fi
 
 echo
 echo "=== the PMM bitmap and the linker symbols it is built from (roadmap 3.4) ==="
@@ -425,8 +460,35 @@ fi
 # immediate. Nothing else in the tree can check that the immediate is the right
 # one: a wrong constant marks the wrong frames used and every verdict the PMM
 # prints still says PASS.
-for pair in "fk_kernel_phys_start __kernel_phys_start" "fk_kernel_phys_end __kernel_phys_end"; do
-  set -- $pair
+# The pairs are PARSED OUT OF boot/ksyms.S rather than listed here: roadmap 3.5
+# took that file from two accessors to seventeen, and a gate carrying its own
+# copy of the list checks only the ones somebody remembered to add to it.
+# Process substitution, not a pipe: `while read` on the right of a pipe runs in
+# a SUBSHELL, and every bad() it called would increment a $fail that dies with
+# it -- the gate would print FAIL and exit 0.
+ksym_pairs=$(sed -n 's/^[[:space:]]*KSYM[[:space:]]\+\([A-Za-z0-9_]\+\),[[:space:]]*\([A-Za-z0-9_]\+\).*/\1 \2/p' boot/ksyms.S)
+nksym=$(printf '%s\n' "$ksym_pairs" | grep -c .)
+if [ "$nksym" -lt 2 ]; then
+  bad "boot/ksyms.S declares $nksym KSYM accessors -- has the macro been renamed?"
+  bad "     This gate would then silently check nothing."
+else
+  ok "boot/ksyms.S declares $nksym accessors, all checked below"
+fi
+# The NAME is the third fact, and it is what keeps this gate honest. Reading
+# the (accessor, symbol) pairing out of the same file the gate is testing means
+# a defect that edits the pairing moves the expectation with it -- the check
+# would follow the mutation and pass. Every accessor in this tree is spelled
+# fk_<X> for the linker symbol __<X>, so the expected symbol is DERIVED from the
+# accessor's own name and the KSYM argument is then checked against it. A
+# mutation now has to break one of two independent things to go unnoticed.
+while read -r fn sy; do
+  [ -n "$fn" ] || continue
+  wantsym="__${fn#fk_}"
+  if [ "$sy" != "$wantsym" ]; then
+    bad "$fn is declared for $sy, but the naming convention makes it $wantsym"
+    continue
+  fi
+  set -- "$fn" "$wantsym"
   imm=$(objdump -d --disassemble="$1" "$K" 2>/dev/null \
         | sed -n 's/.*movabs[[:space:]]*\$\(0x[0-9a-f]*\),%rax.*/\1/p' | head -1)
   real=$(sym "$2")
@@ -437,7 +499,33 @@ for pair in "fk_kernel_phys_start __kernel_phys_start" "fk_kernel_phys_end __ker
   else
     bad "$1 returns $imm but the linker puts $2 at $real"
   fi
-done
+done < <(printf '%s\n' "$ksym_pairs")
+
+echo
+echo "=== roadmap 3.5: the TLB flush no boot can observe ==="
+# vmm_drop_identity zeroes PML4[0] and then reloads CR3. The reload is
+# ARCHITECTURALLY required -- a translation the CPU has cached outlives the
+# table write that invalidated it -- and it is invisible to every boot gate in
+# this tree. Mutation M24 removes it and the machine still takes the page fault
+# the gate is looking for: by the time the deliberate read happens, the entry
+# has been evicted by the console output and the page-table walk in between, so
+# a kernel that never flushes behaves exactly like one that does. On this CPU,
+# today, with this much work in between.
+#
+# So it is checked where it can be: in the instruction stream. This is the same
+# situation as M20 -- a defect that leaves every console verdict printing PASS
+# -- and it gets the same answer.
+dis=$(objdump -d --disassemble=vmm_drop_identity "$K" 2>/dev/null)
+if [ -z "$dis" ]; then
+  bad "vmm_drop_identity is not in the image -- has the VMM been renamed?"
+elif printf '%s' "$dis" | grep -qE '(call|jmp).*<fk_write_cr3>'; then
+  # jmp as well as call: the reload is the last statement in the subroutine, so
+  # gcc tail-calls it. Matching only `call` would fail on correct code.
+  ok "vmm_drop_identity still reloads CR3 after zeroing PML4[0]"
+else
+  bad "vmm_drop_identity does NOT call fk_write_cr3: PML4[0] is zeroed but the"
+  bad "     cached translation survives, and no boot gate can tell"
+fi
 
 echo
 echo "=== no 2 MiB segment padding (the -z max-page-size flag is doing its job) ==="

@@ -37,7 +37,8 @@ module fk_pmm_m
             FK_PMM_E_NO_RAM, FK_PMM_E_NOT_READY, FK_PMM_E_UNALIGNED, &
             FK_PMM_E_RANGE, FK_PMM_E_NOT_RAM, FK_PMM_E_DOUBLE_FREE, &
             FK_PMM_E_LOCKED, &
-            pmm_init, pmm_alloc_page, pmm_free_page, pmm_page_is_free, &
+            pmm_init, pmm_alloc_page, pmm_alloc_page_from, pmm_free_page, &
+            pmm_page_is_free, &
             pmm_total_pages, pmm_free_pages, pmm_used_pages, &
             pmm_ignored_bytes, pmm_region_count, pmm_region_base, &
             pmm_region_len, pmm_region_type, pmm_verify_reserved, &
@@ -546,6 +547,45 @@ contains
     ! asking does not rescan the whole bitmap for each refusal.
     cursor = FK_PMM_WORDS + 1_c_int32_t
   end function pmm_alloc_page
+
+  ! The same first-fit scan, floored at a physical address.  roadmap 3.5 needs
+  ! it: everything a plain pmm_alloc_page hands out during boot is low memory,
+  ! so the one thing the VMM exists to prove -- that a frame ABOVE the old 1 GiB
+  ! identity window becomes writable memory rather than a number -- cannot be
+  ! asked for without it.  The cursor is NOT moved: this is a targeted request,
+  ! and rewinding the ordinary allocator's scan to a high floor would make every
+  ! subsequent allocation start there.
+  function pmm_alloc_page_from(min_phys) result(phys) &
+       bind(c, name="pmm_alloc_page_from")
+    implicit none
+    integer(c_int64_t), intent(in), value :: min_phys
+    integer(c_int64_t) :: phys
+    integer(c_int32_t) :: w, b, first_w, first_b
+
+    phys = 0_c_int64_t
+    if (.not. ready) return
+    if (min_phys < 0_c_int64_t .or. min_phys >= FK_PMM_MAX_PHYS) return
+
+    ! Round the floor UP to a frame, then split it into the word holding it and
+    ! the bit within that word: the first candidate word may be partly below
+    ! the floor, so its low bits have to be masked off rather than scanned.
+    first_w = int(ishft(min_phys + (FK_PMM_PAGE_SIZE - 1_c_int64_t), &
+                        -(FK_PMM_PAGE_SHIFT + 6)), c_int32_t) + 1_c_int32_t
+    first_b = int(iand(ishft(min_phys + (FK_PMM_PAGE_SIZE - 1_c_int64_t), &
+                             -FK_PMM_PAGE_SHIFT), 63_c_int64_t), c_int32_t)
+
+    do w = first_w, FK_PMM_WORDS
+       if (bitmap(w) == FK_PMM_WORD_FULL) cycle
+       do b = merge(first_b, 0_c_int32_t, w == first_w), 63_c_int32_t
+          if (btest(bitmap(w), b)) cycle
+          bitmap(w) = ibset(bitmap(w), b)
+          free_count = free_count - 1_c_int64_t
+          phys = ishft(ishft(int(w - 1_c_int32_t, c_int64_t), 6) + &
+                       int(b, c_int64_t), FK_PMM_PAGE_SHIFT)
+          return
+       end do
+    end do
+  end function pmm_alloc_page_from
 
   function pmm_free_page(phys) result(status) bind(c, name="pmm_free_page")
     implicit none

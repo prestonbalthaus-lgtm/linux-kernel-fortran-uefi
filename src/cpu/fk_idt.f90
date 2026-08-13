@@ -11,7 +11,7 @@ module fk_idt_m
                          serial_print_hex
   implicit none
   private
-  public :: idt_init, isr_handler
+  public :: idt_init, idt_reload, isr_handler
 
   ! What boot/interrupts.S leaves on the stack, lowest address first.  Every
   ! field is a quadword, so the type needs no padding and the assembly needs no
@@ -137,6 +137,14 @@ module fk_idt_m
     subroutine fk_cpu_halt() bind(c, name="fk_cpu_halt")
       implicit none
     end subroutine fk_cpu_halt
+
+    ! The linear address that caused a #PF.  boot/mmu.S; CR2 is not part of the
+    ! frame the trampoline builds, and only the CPU has it.
+    function fk_read_cr2() result(v) bind(c, name="fk_read_cr2")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t) :: v
+    end function fk_read_cr2
   end interface
 
 contains
@@ -202,7 +210,6 @@ contains
   subroutine idt_init() bind(c, name="idt_init")
     implicit none
     integer(c_int32_t) :: v
-    integer(c_int64_t) :: base
 
     do v = 0_c_int32_t, FK_IDT_ENTRIES - 1_c_int32_t
        if (v < FK_IDT_VECTORS) then
@@ -211,6 +218,15 @@ contains
           call idt_clear_gate(v)
        end if
     end do
+    call idt_reload()
+  end subroutine idt_init
+
+  ! LIDT only, against the table already built.  roadmap 3.5's handoff reloads
+  ! it alongside the GDT; the base is a higher-half address either way.
+  subroutine idt_reload() bind(c, name="idt_reload")
+    implicit none
+    integer(c_int32_t) :: v
+    integer(c_int64_t) :: base
 
     base = transfer(c_loc(idt), 0_c_int64_t)
     idtr(1) = u16(int(16 * FK_IDT_ENTRIES - 1, c_int64_t))
@@ -219,7 +235,7 @@ contains
     end do
 
     call idt_flush(idtr)
-  end subroutine idt_init
+  end subroutine idt_reload
 
   ! "<label> = 0x<16 digits>".  Labels are passed pre-padded so the dump lines
   ! up without a format string; Fortran I/O statements are banned in the kernel.
@@ -271,6 +287,10 @@ contains
     end if
 
     call print_reg("RIP    ", regs%rip)
+    ! CR2 unconditionally, not only for vector 14: it is a machine register the
+    ! dump is quoting, and suppressing it for other vectors would mean a reader
+    ! could not tell "no page fault" from "the handler chose not to look".
+    call print_reg("CR2    ", fk_read_cr2())
     call print_reg("CS     ", regs%cs)
     call print_reg("RFLAGS ", regs%rflags)
     call print_reg("RSP    ", regs%rsp)

@@ -97,16 +97,75 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
         The EFI half of this box is NOT done. There is no BOOTX64.EFI, and the framebuffer
         tag is deliberately absent (see 2.2).
 
-  *  [ ] 1.2b Long-mode entry hardening (deferred, not started)
+  *  [x] 1.2b Long-mode entry hardening
 
-        The identity map built by boot.S covers the low 1 GiB only, and PML4[0] is left
-        mapped after the higher-half jump because GDTR still holds a physical base. Both
-        are 3.5's to clean up: unmapping the identity window requires reloading GDTR with
-        the higher-half address first.
+        DONE, with 3.5, and the ordering hazard this box was opened for turned out to be
+        already paid for. GDTR does NOT still hold a physical base by the time it matters:
+        `gdt_init` builds the pseudo-descriptor from `c_loc(gdt)` of a Fortran module
+        variable, so it has held a higher-half base since roadmap 3.1, and `idt_init` the
+        same since 3.2. Only boot.S's throwaway `gdt64_pointer` is physical, and nothing
+        reads it after the first LGDT.
 
-  *  [ ] 1.3 Custom Fortran Runtime Stubs
+        The sequence `vmm_activate` / `vmm_drop_identity` runs anyway, in this order:
+        CR3, then LGDT + the far return in `gdt_flush`, then LIDT, then zero PML4[0],
+        then reload CR3. The far return is the part that is not belt-and-braces -- it is
+        what makes the CPU discard the hidden segment state loaded from the boot stub's
+        physically-based descriptor, and it is cheap enough that proving it unnecessary
+        was not worth a triple fault.
+
+        The identity window is no longer boot.S's. `vmm_init` rebuilds it inside the new
+        hierarchy, so it exists for exactly the length of the handoff and dies by having
+        one quadword zeroed. What replaces it for every other purpose is the linear map
+        at 0xFFFF800000000000 -- see 3.5.
+
+        PROVEN BY FAULTING: a build with `FK_FAULT_MODE = -3` reads physical 0x100000
+        after the unmap and the CPU answers
+
+            EXCEPTION 0x0E ERR 0x0000000000000000 -- #PF Page Fault
+            CR2     = 0x0000000000100000
+
+        The same address is READ SUCCESSFULLY a few lines earlier, in the same boot, and
+        the console carries the value: `[0x100000] = 0x00000000E85250D6`, which is this
+        image's own Multiboot2 header magic. Before and after, on one machine, from one
+        hierarchy.
+
+  *  [x] 1.3 Custom Fortran Runtime Stubs
 
         Validation: Missing compiler intrinsics (like memcpy, memset) are implemented in Fortran using iso_c_binding to prevent linker failures.
+
+        DONE. `src/lib/fk_string.f90` translates memset, memcpy, memmove and memcmp from
+        vendor `lib/string.c`, and `mk/kflags.mk` no longer carries
+        `-fno-tree-loop-distribute-patterns`: gcc's loop-distribution pass is now allowed
+        to rewrite an array fill into a call to memset, and the link resolves it. `nm`
+        on the built objects shows the whole mechanism working -- `fk_pmm.o` has
+        `U memset` for its 262144-word bitmap fill, and the image has `T memset`.
+
+        THE ONE THAT WOULD HAVE BEEN AN INFINITE LOOP, looked for before it was written
+        rather than after: gcc is entitled to rewrite the byte loop INSIDE memset into a
+        call to memset. Linux avoids it by compiling lib/string.c `-ffreestanding`
+        (lib/Makefile). Measured on gfortran 16.1.1, the Fortran version does not need
+        that: `c_f_pointer` builds an array descriptor whose stride is a run-time value,
+        which the pass does not recognise as a fill, and the objects come out with zero
+        undefined symbols with the pass both on and off.
+
+        WHY THERE ARE TWO FILES. The differential harness links the Fortran against the C
+        original in one binary, so the Fortran cannot define `memset` -- the oracle
+        already does. Renaming the ORACLE instead does not work either: lib/string.c
+        contains `#undef memcmp`, which defeats a -D on the command line. So
+        `fk_string.f90` exports fk_memset..fk_memcmp and is the file under test, and
+        `fk_string_abi.f90` -- kernel-image only -- exports the four C names and forwards.
+
+        `tests/lib/test_string.c` diffs them against the vendor source over a guarded
+        arena: 36747535 checks, 0 mismatches, and the same count under `kflags-test`.
+        `mk/string.mk` selects the four functions out of lib/string.c using that file's
+        OWN `__HAVE_ARCH_*` guards -- 27 of them defined, four left alone -- so the
+        bodies being diffed are untouched vendor code. The test checks the returned
+        pointer and the bytes OUTSIDE [dest, dest+n) as well as the copy itself, and
+        memcmp's exact int rather than its sign, because lib/string.c returns the
+        difference of two UNSIGNED chars: 0x80 against 0x00 is +128.
+
+        The string HALF of roadmap 1.1's debt is still open. strlen, strcpy and friends
+        are not translated; 1.3 needed the four memory intrinsics and delivered those.
 
   *  [ ] 1.4 The Kernel Panic Handler
 
@@ -622,19 +681,158 @@ The most critical mathematical and structural phase. Setting up the brain of the
         cannot map until 3.5. And no page is a page yet: these are frame numbers
         until the VMM gives them virtual addresses.
 
-  *  [ ] 3.5 Virtual Memory Manager (VMM)
+  *  [x] 3.5 Virtual Memory Manager (VMM)
 
         Validation: 4-level Page Tables (PML4) are constructed in Fortran, mapping virtual addresses to physical addresses.
 
-        WHAT 3.4 HANDS IT, AND WHAT IT OWES 3.4 BACK. `pmm_alloc_page()` is the
+        WHAT 3.4 HANDED IT, AND WHAT IT OWED 3.4 BACK. `pmm_alloc_page()` is the
         page-table allocator: every PML4/PDPT/PD/PT this milestone builds comes
-        out of it. In return the VMM has to unblock three things 3.4 wrote down
+        out of it. In return the VMM had to unblock three things 3.4 wrote down
         as limits -- a mapping for frames above the 1 GiB identity window, so an
         allocation up there becomes memory rather than a number; a guard page
-        below the boot stack, which now abuts the PMM bitmap with zero slack; and
+        below the boot stack, which abutted the PMM bitmap with zero slack; and
         the unmapping of PML4[0], after which `pmm_init` can no longer read the
         MBI at its physical address (it must run first, and it checks that it
-        can).
+        can). All three are paid.
+
+        DONE. `src/mm/fk_vmm.f90`, and this is what the machine printed off its
+        own tables before it loaded one of them into CR3:
+
+            VMM  SECTION  VIRT               PHYS               PERM
+            VMM  .mbhdr  0xFFFFFFFF80100000 0x0000000000100000 R--
+            VMM  .text   0xFFFFFFFF80101000 0x0000000000101000 R-X
+            VMM  .rodata 0xFFFFFFFF80105000 0x0000000000105000 R--
+            VMM  .data   0xFFFFFFFF80107000 0x0000000000107000 RW-
+            VMM  .bss    0xFFFFFFFF80108000 0x0000000000108000 RW-
+            VMM  .bootpt 0xFFFFFFFF80311000 0x0000000000311000 RW-
+            Fortran Kernel: VMM PML4/table-frames/physmap-top 0x1000/0x21/0x640000000
+
+        Every field in that table is read back out of the hierarchy by
+        `vmm_translate`, not remembered from what was asked for, and the PERM
+        column is decoded from the live entry's RW and NX bits. 0x21 = 33 frames
+        is not a round number, it is the exact one: 1 PML4, plus 1 PDPT + 1 PD +
+        2 PTs for a 2.08 MiB image that straddles one 2 MiB boundary, plus 1 PDPT
+        + 25 PDs for a 25 GiB linear map, plus 1 PDPT + 1 PD for the transient
+        identity window. Boot the same image at a different -m and the 25 moves.
+
+        THE PERMISSIONS BITE, and that is a separate fact from setting them.
+        CR0.WP is what makes a read-only PTE mean anything to ring 0 -- without
+        it a kernel store ignores the bit entirely and .text mapped R-X is
+        decoration. EFER.NXE is what makes bit 63 mean no-execute rather than
+        RESERVED; set the bit without the MSR and every access to .rodata faults,
+        which is mutation M25 and which triple-faults the machine. `boot/mmu.S`
+        does both, checks CPUID.80000001H:EDX.NX first, and RETURNS whether it
+        managed -- the VMM drops NX from every section rather than set a bit it
+        was not promised.
+
+        THE TWO HALVES FAIL DIFFERENTLY, AND THAT IS WHY THERE ARE THREE FAULT
+        BUILDS AND NOT TWO. A broken NXE announces itself: the bit is reserved,
+        so the first `.rodata` read faults and the machine dies at the handoff.
+        A broken WP announces NOTHING. `.text` is still mapped R-X,
+        `vmm_verify_image` still returns 0, the permission column still reads
+        R-X, and a kernel store to `.text` simply succeeds. `fk_mmu_arm`'s return
+        value only ever described the NX half, so the console line claiming
+        CR0.WP was, until this was noticed, a claim with no witness anywhere in
+        the tree. `FK_FAULT_MODE = -4` is the witness:
+
+            Fortran Kernel: writing to .text, which only CR0.WP refuses (roadmap 3.5).
+            EXCEPTION 0x0E ERR 0x0000000000000003 -- #PF Page Fault
+            CR2     = 0xFFFFFFFF80101000
+
+        `ERR 0x3` is the assertion and not the vector: bit 0 says the page was
+        PRESENT and bit 1 says the access was a WRITE, so that is a protection
+        violation and not a missing page. CR2 is `__text_start`. Mutation M27
+        deletes the CR0 store and the write succeeds instead.
+
+        WHY THERE IS A LINEAR MAP. A page table is written through a VIRTUAL
+        address and the PMM hands out physical ones. While the boot stub's
+        identity window is live that distinction does not exist; the instant
+        PML4[0] is zeroed, a VMM with no other window can never touch a page
+        table again -- it maps one set of pages, once, and is then bricked.
+        FK_VMM_PHYSMAP at 0xFFFF800000000000 covers every byte of RAM the loader
+        reported, in 2 MiB pages, and `vmm_phys_to_virt` is the single place that
+        knows which window is current. It is also 3.4's debt closing: a frame at
+        0x100000000 is allocated, mapped at a scratch address with
+        `vmm_map_page`, written through THAT address and read back through the
+        LINEAR one. Two virtual addresses agreeing on one physical frame is a
+        mapping; one address agreeing with itself is a store.
+
+        THE GUARD PAGE IS RESERVED IN linker.ld, not carved out of a neighbour,
+        and 3.2.5's note about the PMM bitmap being "strictly better and nobody's
+        design" is why: there was no slack to carve. `__boot_stack_guard` is a
+        4 KiB frame of its own between the bitmap and the stack, and
+        `tools/linkscript-test.sh` asserts that no .bss object overlaps it --
+        the one property a linker script cannot check about itself.
+
+        PROVEN BY FAULTING, with the address taken from the ELF rather than
+        written down. A build with `FK_FAULT_MODE = -2` reads
+        `__boot_stack_bottom - 8`:
+
+            Fortran Kernel: reading the guard page below the boot stack (roadmap 3.5).
+            EXCEPTION 0x0E ERR 0x0000000000000000 -- #PF Page Fault
+            CR2     = 0xFFFFFFFF8030CFF8
+
+        `tools/mutate-phase3.sh` computes that CR2 with `nm` on the image it just
+        built, so a relayout moves the expectation with the guard rather than
+        turning the assertion into a comparison of two stale constants. CR2 is in
+        the panic dump for this milestone; before 3.5 the dump could name the
+        instruction that faulted but not the address it faulted on.
+
+        VERIFIED BEFORE IT WAS TRUSTED. `vmm_verify_image` walks every page of
+        the image in the hierarchy that is about to become live and compares
+        BOTH the permission bits and the frame -- a page mapped read-only to the
+        wrong physical address passes a flags-only check. It runs before CR3 is
+        touched, because a kernel that maps its own .text wrong does not report
+        it, it triple-faults, and a machine that reboots says nothing at all.
+
+        THE ALIAS, WHICH IS PERMANENT AND IS NOT WHAT THE PERM COLUMN SAYS.
+        The linear map covers every byte of RAM the loader reported, and the
+        kernel's own frames are RAM -- so this image is mapped TWICE for the life
+        of the kernel: strictly at KERNEL_VMA, and RW+NX at
+        FK_VMM_PHYSMAP + phys. `.text` is therefore writable through the linear
+        alias, permanently. The W^X lines the boot gate asserts are true of the
+        six rows it prints and of nothing else; they say no page of the KERNEL
+        WINDOW is both writable and executable, not that no alias of those frames
+        is writable. This is the same trade Linux's direct map makes, and the
+        same one it later had to spend `set_memory_ro` on. Narrowing it means
+        either excluding the image from the linear map or re-mapping its frames
+        there read-only, and neither is this pass.
+
+        Two smaller costs. During the handoff -- the four console lines between
+        `vmm_activate` and `vmm_drop_identity` -- there is a THIRD mapping, the
+        transient identity window, also writable. And the two frames that window
+        costs (its PDPT and PD) are never returned to the PMM when PML4[0] is
+        zeroed; there is no unmap path to return them with.
+
+        WHAT THIS DOES NOT PROVE. The linear map's extent follows the highest
+        AVAILABLE region the loader reported, so MMIO ABOVE the top of RAM is in
+        no window at all once PML4[0] is gone. On this 24 GiB machine the LAPIC
+        at 0xFEE00000, the IOAPIC and any framebuffer BAR below 4 GiB fall inside
+        [0, top) by accident; on a 2 GiB machine none of them do. Nothing
+        dereferences them today -- the UART is port I/O and the GOP renderer is
+        never initialised on the Multiboot2 path -- and 2.2 and 3.3 both land
+        directly on it. The same map covers the PCI hole and the VGA aperture as
+        write-back 2 MiB pages; on real hardware the MTRRs mark those UC and UC
+        wins, so it is very likely benign, but nothing here states it as a
+        requirement.
+
+        The boot gate's "frame above 4 GiB" line also makes the mandated -m 24G
+        allocation load-bearing: on a smaller machine `pmm_alloc_page_from`
+        returns 0, the kernel prints the "no RAM above 4 GiB" line instead, and
+        the gate fails a kernel that is behaving correctly.
+
+        Nothing runs in ring 3, so the U/S bit is
+        clear everywhere and untested. CR4.PGE is off and no entry is global, so
+        the "reload CR3 flushes everything" assumption is currently exact and
+        would stop being so the day global pages arrive. `vmm_map_page` REFUSES
+        to shatter a large page rather than doing it, so nothing may be mapped at
+        4 KiB inside the linear map's 2 MiB range. There is no unmap and no
+        reference counting: a page table, once allocated, is never freed. The
+        framebuffer is still not mapped -- 2.2 asked for write-combining
+        attributes and this milestone deliberately did not touch it. And the
+        linear map covers MMIO holes as ordinary write-back memory because it
+        maps [0, top) rather than the AVAILABLE regions; nothing dereferences
+        those addresses today, and the day something does, it wants PCD/PWT.
 
 ## 🔌 Phase 4: The Bus & Subsystems
 

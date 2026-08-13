@@ -23,18 +23,16 @@
 # A-4. The -mno-sse/-mno-80387 family keeps the compiler out of FPU and vector
 # state that the long-mode entry path in boot/boot.S never initialises.
 #
-# -fno-tree-loop-distribute-patterns is the Fortran half of what -ffreestanding
-# does for C, and it is here because roadmap 3.4 arrived: gcc's loop-distribution
-# pass rewrites a DO loop that stores one value across an array into a call to
-# memset, which is an undefined symbol until roadmap 1.3 supplies one. Measured
-# on gfortran 16.1.1 -- the PMM's 262144-word bitmap fill emits `U memset`
-# without this flag and nothing at all with it. Linux passes the same flag for
-# the same reason and gets away with the pass only because it defines its own
-# memset. Small loops escaped the pass, which is why the tree got this far
-# without it; see the scalar-stores comment in src/boot/fk_kmain.f90.
+# -fno-tree-loop-distribute-patterns WAS here from roadmap 3.4 until 1.3: gcc's
+# loop-distribution pass rewrites a DO loop that fills or copies an array into a
+# call to memset or memcpy, which was an undefined symbol in a kernel with no
+# libc. src/lib/fk_string_abi.f90 now defines those symbols, so the pass is
+# allowed to fire and the link resolves it -- which is what Linux does, and the
+# reason Linux can pass the flag and still get a working memset either way.
+# The intrinsics themselves cannot recurse into the pass: c_f_pointer builds a
+# run-time-strided descriptor that it does not recognise (measured, 16.1.1).
 KFLAGS := -O2 -fwrapv -fno-underscoring \
           -mcmodel=kernel -mno-red-zone -fno-pic -fno-stack-protector \
           -fno-asynchronous-unwind-tables -fno-common -fno-strict-aliasing \
-          -fno-tree-loop-distribute-patterns \
           -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a \
           -mno-80387 -mno-fp-ret-in-387

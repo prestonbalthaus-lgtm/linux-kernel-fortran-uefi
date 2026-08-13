@@ -76,6 +76,9 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/cpu/fk_idt.f90 \
                src/drivers/pic/fk_pic.f90 \
                src/mm/fk_pmm.f90 \
+               src/lib/fk_string.f90 \
+               src/lib/fk_string_abi.f90 \
+               src/mm/fk_vmm.f90 \
                src/boot/fk_kmain.f90
 
 # Assembly sources. NAMED ONE BY ONE, deliberately not $(wildcard boot/*.S):
@@ -99,7 +102,8 @@ ASRC_KERNEL := boot/boot.S \
                boot/gdt_flush.S \
                boot/interrupts.S \
                boot/faultgen.S \
-               boot/ksyms.S
+               boot/ksyms.S \
+               boot/mmu.S
 
 AOBJ := $(patsubst boot/%.S,$(BUILD)/%.o,$(ASRC_KERNEL))
 FOBJ := $(foreach s,$(FSRC_KERNEL),$(BUILD)/$(basename $(notdir $(s))).o)
@@ -122,10 +126,23 @@ endif
 # Undefined symbols that mean a libgfortran or libc runtime crept in.
 # _gfortran_ is matched as a substring (the prefix is the whole tell); the libc
 # names are matched whole-line so that e.g. "free_page" is not a hit.
-BADSYM_RE := _gfortran_|^(memcpy|memset|memmove|malloc|free|printf|puts)$$
+#
+# The mem* half of that list changed meaning at roadmap 1.3 and the gate had to
+# change with it. gcc's loop-distribution pass rewrites an array fill into a
+# call to memset BY NAME, so `U memset` in fk_pmm.o is now the pass working as
+# intended rather than a libc creeping in -- provided this image defines memset
+# itself, which src/lib/fk_string_abi.f90 does. So the rule is no longer "these
+# names may not appear" but "these names may not appear UNRESOLVED", and the
+# distinction is checked against what the image actually defines rather than
+# against a list somebody keeps up to date. malloc/free/printf/puts stay
+# unconditional: nothing in a kernel with no allocator and no console
+# formatting may define them either.
+BADSYM_RE       := _gfortran_|^(memcpy|memset|memmove|memcmp)$$
+NEVERSYM_RE     := ^(malloc|free|printf|puts|calloc|realloc|abort|exit)$$
 
 .DEFAULT_GOAL := kernel
-.PHONY: kernel iso mbcheck symcheck-boot bootgate selftest-boot clean-boot
+.PHONY: kernel iso mbcheck symcheck-boot undefcheck-boot bootgate selftest-boot \
+        clean-boot
 # A failed post-link gate must not leave a bogus kernel.elf behind for the QEMU
 # boot test to pick up and "boot".
 .DELETE_ON_ERROR:
@@ -219,18 +236,70 @@ mbcheck: $(KERNEL)
 # anchored ^(...)$ around whole symbol names, so only those seven exact names
 # hit. Nothing here proves those two symbols RESOLVE -- the link does, and an
 # unresolved fk_outb fails $(KERNEL) loudly rather than silently.
-symcheck-boot: $(FOBJ)
-	@fail=0; for o in $^; do \
-	  bad=`$(NM) -u -P $$o | cut -d' ' -f1 | grep -E '$(BADSYM_RE)'`; \
+symcheck-boot: $(OBJS)
+	@provided=`for o in $(OBJS); do $(NM) -g --defined-only -P $$o 2>/dev/null \
+	             | cut -d' ' -f1; done | sort -u`; \
+	 fail=0; for o in $(FOBJ); do \
+	  bad=""; \
+	  for u in `$(NM) -u -P $$o | cut -d' ' -f1`; do \
+	    case "$$u" in \
+	      *_gfortran_*) bad="$$bad $$u(libgfortran)"; continue ;; \
+	    esac; \
+	    if printf '%s\n' "$$u" | grep -qE '$(NEVERSYM_RE)'; then \
+	      bad="$$bad $$u(libc)"; continue; \
+	    fi; \
+	    if printf '%s\n' "$$u" | grep -qE '$(BADSYM_RE)'; then \
+	      printf '%s\n' "$$provided" | grep -qx -- "$$u" \
+	        || bad="$$bad $$u(no definition in this image)"; \
+	    fi; \
+	  done; \
 	  if [ -n "$$bad" ]; then \
 	    echo "  FAIL  $$o references a userspace runtime:"; \
-	    printf '%s\n' "$$bad" | sed 's/^/        /'; fail=1; \
+	    for b in $$bad; do echo "        $$b"; done; fail=1; \
 	  else \
 	    echo "  OK    $$o  (`$(NM) -u $$o | wc -l` undefined symbols)"; \
 	  fi; \
 	done; \
 	[ $$fail -eq 0 ] && echo "  === no libgfortran/libc dependency in the kernel objects ==="; \
 	exit $$fail
+
+# The other half of the same question, asked of the IMAGE rather than of an
+# object: an undefined symbol in a -nostdlib link is a symbol nothing will ever
+# supply. `ld` itself does not refuse one for a non-PIE static link, so a typo'd
+# bind(c) name reaches the CPU as a call to address zero.
+undefcheck-boot: $(KERNEL)
+	@u=`$(NM) -u $(KERNEL) | sed 's/^ *//'`; \
+	 if [ -n "$$u" ]; then \
+	   echo "  FAIL  $(KERNEL) has undefined symbols:"; \
+	   printf '%s\n' "$$u" | sed 's/^/        /'; exit 1; \
+	 fi; \
+	 echo "  OK    $(KERNEL) has no undefined symbols"
+	@for s in memset memcpy memmove memcmp; do \
+	   $(NM) --defined-only $(KERNEL) | grep -qE "[[:space:]]T[[:space:]]$$s$$" \
+	     || { echo "  FAIL  the image does not define $$s (roadmap 1.3)"; exit 1; }; \
+	 done; \
+	 echo "  OK    the image defines memset/memcpy/memmove/memcmp itself"
+# THE INTRINSIC MUST NOT CALL ITSELF. gcc's loop-distribution pass is enabled
+# again as of roadmap 1.3, and the thing that stops it rewriting fk_memset's own
+# byte loop into a call to memset is that c_f_pointer gives the array a run-time
+# stride the pass cannot recognise -- measured on gfortran 16.1.1, which is a
+# property of a compiler version and not a guarantee. Linux buys the same safety
+# structurally, with -ffreestanding on lib/string.c.
+#
+# So it is checked rather than assumed, and checked where it is unambiguous: the
+# translation unit that IMPLEMENTS the intrinsics may not reference one. If the
+# pass ever fires here, memset -> fk_memset -> memset recurses until the stack
+# walks off the bottom, and this line fails the build instead.
+	@bad=`$(NM) -u -P $(BUILD)/fk_string.o | cut -d' ' -f1 \
+	      | grep -E '^(memcpy|memset|memmove|memcmp)$$'`; \
+	 if [ -n "$$bad" ]; then \
+	   echo "  FAIL  fk_string.o CALLS an intrinsic it implements:"; \
+	   printf '%s\n' "$$bad" | sed 's/^/        /'; \
+	   echo "        the loop-distribution pass has rewritten one of the bodies"; \
+	   echo "        into a call to itself -- it would recurse until the stack"; \
+	   echo "        falls through the guard page."; exit 1; \
+	 fi; \
+	 echo "  OK    fk_string.o implements the intrinsics without calling one" 
 
 # Prove the header gate can FAIL before trusting the fact that it passes.
 selftest-boot: $(KERNEL)
@@ -239,7 +308,7 @@ selftest-boot: $(KERNEL)
 # Everything the boot path must survive inside the container. The remaining
 # gate -- does it actually boot -- needs a VM and therefore runs on the host:
 # tools/qemu-boot-test.sh.
-bootgate: $(KERNEL) mbcheck symcheck-boot selftest-boot
+bootgate: $(KERNEL) mbcheck symcheck-boot undefcheck-boot selftest-boot
 	@echo "=== boot path gates clean: header valid, image enterable, no runtime ==="
 
 # --- ISO ---------------------------------------------------------------------
