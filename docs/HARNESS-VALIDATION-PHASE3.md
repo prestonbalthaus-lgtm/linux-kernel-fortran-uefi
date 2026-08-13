@@ -1019,7 +1019,14 @@ and restored, on the same terms as M1-M33.
 | M36 | `coalesce_back` removed from `kfree` | **caught twice** — `heap did NOT coalesce; it is fragmented` on COM1, and `the heap came back to 5 block(s)` from the QMP read |
 | M37 | a spawned task's RFLAGS with IF clear | **caught by the QMP channel** — `0 spawned threads have executed`, and the tick counter stops too: the round robin reaches the first task and the machine never leaves it |
 | M38 | `movq %rax, %rsp` deleted from `irq_common` | **caught twice** — `a spawned thread NEVER ran; the switch did not happen.` and `0 spawned threads have executed`. Every task is created and the scheduler's own counters advance; not one instruction of either thread executes, which is exactly why `fk_task_runs` is incremented by the THREAD |
-| M39 | `sched_start()` never called | **caught** — same signature as M38 |
+| M39 | `sched_start()` never called | **caught three ways by the QMP channel** — `context switches grew 0 -> 0`, `0 spawned threads have executed`, and `TSS RSP0 is 0x0000000000000000`, which is the only mutation in the table that the RSP0 assertion catches on its own |
+
+M39's first run reported `BUILD FAILED (caught at build time)` and that result
+was **discarded rather than believed**: the log said `make: Makefile: Permission
+denied`, which is a podman `:Z` relabel race with a second container running the
+host suite at the same time, not a defect the static gate found. Re-run alone it
+is caught by the boot gate as above. A mutation harness that accepts a build
+failure as a catch will happily report a catch for a full disk.
 
 **M34 and M35 are the two no picture would show.** A framebuffer mapped
 write-back renders identically — every pixel lands, just after a
