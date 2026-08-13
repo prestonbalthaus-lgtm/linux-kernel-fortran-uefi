@@ -514,10 +514,6 @@ proves it, and only because the host suite can put the MBI where it likes.
 
 ### 5. Boot mutations
 
-`M14`-`M20` re-run defects the host suite already catches, on a real machine,
-because the host suite parses a map this tree wrote and the boot gate parses one
-GRUB wrote.
-
 Every row in BOTH tables was re-measured against the committed branch after the
 sixth verdict was added, so what is quoted here is what
 `tools/mutate-phase3.sh` prints from the image in the tree — 23 boots. M1-M13
@@ -627,8 +623,10 @@ long.
     FK_EXPECT_SERIAL=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint' \
       tools/qemu-boot-test.sh                     # after sedding FK_FAULT_MODE to -1
 
-    tools/mutate-phase3.sh                        # the whole table, ~23 boots
+    tools/mutate-phase3.sh                        # the whole table, ~31 boots
     tools/mutate-phase3.sh M10 M13                # or just these
+    tools/mutate-phase3.sh baseline_guard         # roadmap 3.5's two #PF builds
+    tools/mutate-phase3.sh baseline_idmap
 
 `tools/mutate-phase3.sh` edits the tree in place and restores it with
 `git checkout`, so it REFUSES to run when any file it mutates is untracked or has
@@ -637,3 +635,131 @@ the first mutation survived into every later case and got reported against the
 wrong defect. Each substitution also aborts the run if its text was not found:
 a sed that quietly matches nothing rebuilds the pristine kernel, the gate passes,
 and the table records an escape that never happened.
+
+
+## Roadmap 3.5: the VMM and the higher-half handoff
+
+Three channels again, and this milestone adds a fourth kind of evidence that the
+earlier ones could not produce: **the kernel reads its own page tables back and
+prints what it finds, before it loads any of them into CR3.**
+
+### 1. The static gate (`tools/linkscript-test.sh`, 145 checks)
+
+Two things moved here.
+
+`boot/ksyms.S` went from two accessors to seventeen, so the gate stopped
+carrying a hand-written list of (accessor, linker symbol) pairs and started
+parsing the `KSYM` macro invocations out of the file. That change had to be made
+carefully, because reading the pairing out of the file under test means a defect
+that edits the pairing moves the expectation with it — the check would follow the
+mutation and pass. The fix is a third, independent fact: every accessor in this
+tree is spelled `fk_<X>` for the linker symbol `__<X>`, so the expected symbol is
+DERIVED from the accessor's own name, and the `KSYM` argument is then checked
+against that. M26 is the case that exists to keep this honest.
+
+The guard page turned a NOTE into a property. Until 3.5 this gate PRINTED which
+.bss object sat directly below `__boot_stack_bottom` and refused to assert it,
+because link order decided it rather than anybody — first the TSS, then the PMM
+bitmap with zero bytes of slack. `linker.ld` now reserves `__boot_stack_guard`,
+and the ASSERTs inside the script fail the LINK on alignment and size. What is
+left for the gate is the one thing a linker script cannot check about itself:
+that no .bss object overlaps the guard frame. A guard page sharing a frame with
+live data cannot be unmapped, and unmapping it anyway moves the fault from the
+overflow onto the neighbour.
+
+### 2. The boot gate: what the kernel prints off its own tables
+
+The section table in `roadmap.md` 3.5 is produced by `vmm_translate`, which walks
+the hierarchy in software. Every address and every permission in it is READ BACK,
+not remembered. That matters because the alternative — printing the flags that
+were passed to `vmm_map_page` — would be a kernel agreeing with itself.
+
+`vmm_verify_image` then walks EVERY page of the image, not just the first of each
+section, and compares both the permission bits and the frame number. A page
+mapped read-only to the wrong physical address passes a flags-only check, and a
+section whose second page was skipped has a perfectly good first row.
+
+It all runs BEFORE `vmm_activate`. A kernel that maps its own .text wrong does
+not get to report it after the fact; it triple-faults, and a machine that reboots
+says nothing at all.
+
+### 3. The two things the kernel cannot certify about itself
+
+`vmm_verify_image` compares the live tables against the table of INTENTIONS the
+same module built. Mutate the intention and it has nothing to report. Two gate
+lines exist for exactly that gap, and neither contains an address, so a relayout
+does not touch them:
+
+* the boot gate REQUIRES the string ` R-X` — some section is executable and not
+  writable, which on this image can only be `.text`;
+* the boot gate REJECTS the string `RWX` — no page in the table may be both.
+
+That is W^X asserted on the permission column of the live page tables.
+`linkscript-test.sh` asks the same question of the ELF's segment flags, and the
+two are different facts: an image with RE/R/RW program headers can still be
+mapped writable by a VMM that ignores them.
+
+### 4. Faulting on purpose, at an address the ELF predicts
+
+`FK_FAULT_MODE` grew two values, and they are not one test twice. Both are
+vector 14 with error code 0, so CR2 is the entire distinction — which is why the
+panic dump gained a CR2 line in this milestone.
+
+* `-2` reads `__boot_stack_bottom - 8`. `tools/mutate-phase3.sh` computes the
+  expected CR2 with `nm` on the image it just built, so a relayout moves the
+  expectation along with the guard page instead of comparing two stale constants.
+* `-3` reads physical `0x100000` after the unmap. The same address is read
+  SUCCESSFULLY four lines earlier in the same boot and its value printed —
+  `0x00000000E85250D6`, this image's own Multiboot2 header magic. The pair is a
+  before and after on one machine, not an absence.
+
+### 5. Boot mutations
+
+Two baselines and seven defects, run with `tools/mutate-phase3.sh`. The
+baselines are the two new `FK_FAULT_MODE` builds; both PASS, which is what makes
+the rest of the column meaningful.
+
+| # | defect | result |
+|---|--------|--------|
+| baseline-guard-page | `FK_FAULT_MODE = -2` | **passes** — `#PF`, `CR2 = 0xFFFFFFFF8030CFF8`, the address `nm` predicted from the image |
+| baseline-identity-dead | `FK_FAULT_MODE = -3` | **passes** — `#PF`, `CR2 = 0x0000000000100000` |
+| M20 | the `KSYM` macro body returns `0x0` instead of its linker symbol | **caught ONLY by the static gate** — all seventeen accessors mismatch at once |
+| M21 | `.text` given write permission — in the INTENTION table, not the mapping code | **caught by the W^X strings alone** — ` R-X` missing and `RWX` present. `vmm_verify_image` had nothing to say, because it compares the live tables against the very table the mutation edited |
+| M22 | the guard page mapped like any other .bss page | **caught twice** — `VMM section permissions are WRONG` and `VMM guard page is MAPPED.` |
+| M23 | `vmm_drop_identity` never zeroes PML4[0] | **caught** — `PML4[0] is STILL MAPPED.` |
+| M24 | PML4[0] zeroed, CR3 never reloaded | **ESCAPED the boot gate** — see below |
+| M25 | EFER.NXE never set, NX bits written anyway | **caught** — triple fault. Without NXE bit 63 is RESERVED, so the first `.rodata` read faults and the handler faults reading `.rodata` to report it |
+| M26 | `fk_boot_stack_guard` declared for `__bss_start` | **caught twice** — statically on the naming convention, and at boot by a triple fault: the VMM then skips mapping `.bss`'s first page and maps the guard instead |
+
+M21 is the one worth reading twice. It is the reason two of the gate's patterns
+are ` R-X` and `RWX` rather than a verdict line: a kernel checking its own tables
+against its own list of intentions cannot detect a wrong intention, and the only
+thing left that can is a property stated from outside — no page is both writable
+and executable.
+
+#### M24: the flush no boot in this tree can observe
+
+Zeroing PML4[0] without reloading CR3 is a defect by the SDM: a translation the
+CPU has cached outlives the table write that invalidated it. The `-3` build
+exists precisely to catch it, and it did not. The machine took the page fault
+anyway, at the right CR2, and every assertion passed.
+
+The reason is timing, not correctness. Between the unmap and the deliberate read
+the kernel prints four console lines, allocates a frame, walks and populates
+three levels of page table, `memset`s a 4 KiB page and does a store and a load
+through the linear map. x86 never promises to RETAIN a cached translation, only
+that it may keep one until told otherwise, and after that much work the entry was
+gone. A kernel that never flushes behaved exactly like one that does — on this
+CPU, today, with this much in between.
+
+Nothing was contorted to make the boot catch it. Instead it is checked where it
+is visible, in the instruction stream: `tools/linkscript-test.sh` disassembles
+`vmm_drop_identity` and asserts it still reaches `fk_write_cr3` (as a `jmp` —
+the reload is the last statement, so gcc tail-calls it). M24 now reports
+`static=CAUGHT, boot gate PASSED`, which is the same shape as M20 and is the
+honest description: a defect this tree can only see statically.
+
+That leaves the escape recorded rather than closed. Catching it on a running CPU
+would need the deliberate read placed immediately after the unmap with nothing
+between, and even then it would be asserting a behaviour the architecture permits
+but does not require.
