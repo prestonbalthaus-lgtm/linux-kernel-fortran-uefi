@@ -21,6 +21,7 @@ module fk_kmain_m
   use fk_panic_m,  only: panic_code
   use fk_lapic_m,  only: lapic_init, lapic_msr_base, lapic_msr_enabled, &
                          lapic_lint0_extint, lapic_lint1_nmi, &
+                         LVT_DM_EXTINT, LVT_DM_NMI, &
                          lapic_id, lapic_version, lapic_svr, &
                          lapic_lvt_lint0, lapic_lvt_lint1
   use fk_gdt_m,    only: gdt_init
@@ -145,8 +146,8 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_LAPIC_MAP_BAD = &
        "Fortran Kernel: LAPIC mapping FAILED, status 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_LAPIC_HOLES = &
-       "Fortran Kernel: LAPIC and framebuffer both punched out of the " // &
-       "linear map, holes 0x" // c_null_char
+       "Fortran Kernel: MMIO apertures punched out of the linear map, " // &
+       "holes 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_LAPIC_LIVE = &
        "Fortran Kernel: LAPIC id/version/SVR 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_LAPIC_LINT = &
@@ -1625,8 +1626,8 @@ contains
 
     ! LINT1 masked is still the assertion; LINT0 must now read ExtINT.
     if (iand(lapic_svr(FK_VMM_LAPIC), 256_c_int32_t) /= 0_c_int32_t .and. &
-        lapic_lvt_lint0(FK_VMM_LAPIC) == 1792_c_int32_t .and. &
-        lapic_lvt_lint1(FK_VMM_LAPIC) == 1024_c_int32_t) then
+        lapic_lvt_lint0(FK_VMM_LAPIC) == LVT_DM_EXTINT .and. &
+        lapic_lvt_lint1(FK_VMM_LAPIC) == LVT_DM_NMI) then
        call serial_print_string(FK_LAPIC_MASKED)
     else
        call serial_print_string(FK_LAPIC_BAD)
