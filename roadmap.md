@@ -1,55 +1,85 @@
 
 # PROPOSED NEXT MILESTONE -- AWAITING LEAD ARCHITECT APPROVAL
 
-Updated 2026-08-13. **3.2b was approved and has LANDED** -- its row is gone from
-the table below and its box is ticked. What remains is the rest of that proposal,
-unchanged, plus the one item that still needs a decision rather than a
-preference.
+Updated 2026-08-17. **0.3, 3.3 and 1.4 were approved and have LANDED** -- all
+three rows are gone from the table below. 1.4 is ticked. 0.3 and 3.3 are ticked
+only as far as their own validation text reaches, and what remains of each is
+written into its box rather than left in this header.
 
 That grep now answers differently, which is the whole of the milestone:
 
-    $ grep -rn "iretq" boot/
-    boot/interrupts.S:  iretq
+    $ grep -rln "MB2_TAG_EFI_MMAP" src/
+    src/mm/fk_pmm.f90
+
+    $ grep -r "pflash" tools/qemu-boot-test.sh
+    tools/qemu-boot-test.sh:    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
+    tools/qemu-boot-test.sh:    -drive "if=pflash,format=raw,file=$VARS_COPY"
+
+**THE HEADLINE, because this file said it had never happened: the kernel boots
+under UEFI.** OVMF, through the EFI half of a hybrid ISO, with the PMM parsing
+the `EFI_MEMORY_DESCRIPTOR` array `GetMemoryMap()` returned rather than a
+Multiboot2 tag-6 summary of it. Both firmware paths are gated, on every run.
 
 **Next, in order, with what each is really waiting on:**
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 3.3 | the Local APIC | 3.2b made an interrupt survivable, and this is the controller everything after Phase 4 actually uses | an IST slot for NMI, and a mapping for 0xFEE00000 -- NOT the MADT, see that box |
-| 0.3 | OVMF / the UEFI path | the target hardware is UEFI and NOTHING here has ever booted that way | a decision -- the PMM parses Multiboot2 tags only and needs a second front end |
-| 1.4 | the panic handler's own box | the handler exists and now prints to both consoles; the box is still open on what a panic should DO besides halt | nothing |
+| 4.1 | ACPI and the MADT | 3.3 got the BSP's own LAPIC without ACPI, and everything past that -- the IOAPIC's address, the other five cores, the interrupt source overrides -- needs the tables | nothing; `fk_memcmp` exists for the signature match |
+| 1.2 | the EFI half of the entry stub | 0.3 proved the UEFI PATH; it did NOT write a `BOOTX64.EFI`. Today GRUB is the EFI application and this kernel is its Multiboot2 payload | a decision on whether a native EFI stub is wanted at all, given the above works |
+| 2.2 | a framebuffer on the UEFI path | there is none: GRUB answers "no suitable video mode found" under OVMF, so tag 8 is absent and the screen does not exist there | GRUB's video modules in the ISO, or a GOP probe through the EFI system table (tag 12, which IS present) |
+| 1.1 | the string half of the core library | still owed, unchanged: no strlen, strcpy, strcmp or strncmp. 4.1 does not need them; 6.1 and 6.4 cannot start without them | nothing |
 
-2.2, 2.4, 3.6 and the new 3.7 came off this list in one pass; the screen, the
-heap and preemptive multitasking all landed together.
+**THE ONE THAT SHOULD NOT BE READ AS FINISHED: 3.3.** The Local APIC is mapped
+and software-enabled, but the 8259 is NOT disabled and that is deliberate --
+LINT0 is deliberately left in ExtINT so the legacy chip keeps delivering IRQ0,
+because nothing else can yet. Its box says so. Disabling it is 4.1's to finish,
+once the IOAPIC exists to take the interrupts instead.
 
-**The one I want a decision on rather than a preference: 0.3.** It is the largest
-unknown in the project, and the cost is not just a second entry stub -- see the
-note added to that box.
+**What 0.3 and 3.3 cost, and every item was found by BOOTING rather than by a
+gate reading the source.** These are recorded because the tree's standard is
+that the expensive ones get written down:
 
-**One thing 3.2b changed that is not in its own box.** The shipped image no
-longer ends in a deliberate panic: `FK_FAULT_MODE` defaults to `-5`, kernel_main
-parks in `fk_cpu_idle` with IF set, and every fault build is now something
-`tools/mutate-phase3.sh` seds in rather than the default it seds out. Anything
-that assumed a register dump on every boot -- and the boot gate did -- had to be
-told which build it was looking at.
+  * Software-enabling the LAPIC STOPPED THE TIMER. Once SVR bit 8 is set the
+    8259 no longer reaches the CPU's own INTR pin -- it arrives through LINT0 --
+    so masking LINT0 killed IRQ0, and the scheduler stopped with it. The kernel
+    hung after "preemption is on" and the boot gate caught it.
+  * Masking LINT1 made 3.2.5's own IST slot UNREACHABLE. The same milestone
+    armed IST2 for NMI and masked the line that delivers one. `inject-nmi`
+    produced nothing at all, and a blocked NMI is indistinguishable from
+    hardware that never raised one -- only a live injection finds this.
+  * `vmm_reserve_mmio` held EXACTLY ONE span. Enough while the framebuffer was
+    the sole aperture; the LAPIC is the second caller and silently OVERWROTE the
+    first, leaving a write-back alias of whichever device lost. It is a list now.
+  * `lapic_init` wrote CMCI unconditionally. That register exists only where
+    VERSION bits 23:16 report at least 6 LVT entries, and this machine reports
+    5. QEMU tolerates the write; a real part need not.
 
-**Corrections made to this file in an earlier pass**, all of them things that were
-stated here and are no longer true: 1.1's string debt is now half paid; 1.4's
-validation text is already satisfied; 2.2's above-4-GiB hazard was removed by 3.5
-and replaced by a narrower one; 3.3's "needs the MADT to find the APIC base" is
-wrong for the BSP's own LAPIC.
+**And TWO VERDICTS THAT WERE ASSERTING THE FIRMWARE rather than the code**, both
+the same mistake and both exposed by the UEFI map's shape. "PMM cursor rewind"
+freed 96 frames at addresses COMPUTED from a base, justified by a contiguity
+check that only ever covered 5. "PMM allocated 5 contiguous frames" required
+first-fit to return adjacent frames at all. Neither is true where LoaderData
+sits at 0x1000 and again across 0x3000..0xC000, so the first five frames the
+UEFI map yields are 2, 12, 13, 14, 15. Both now assert what `pmm_alloc_page`
+actually promises: distinct, page-aligned, previously-free frames.
 
-**Corrections made when 2.2/2.4/3.6/3.7 landed.** 2.2's box said the Multiboot2
-header "deliberately does NOT request a framebuffer" and that the item was
-"STILL HALF DONE" -- the tag is there now and the box was rewritten around what
-the loader actually answers with. 2.4's said the renderer "has never drawn a
-pixel"; it has. The narrower above-4-GiB hazard 3.5 left behind is gone in turn:
-`vmm_map_mmio` maps an arbitrary physical range wherever the kernel wants it, so
-a BAR above the linear map's top needs no new code. And the header's numbering
-should be read literally: the Lead Architect's directive calls the framebuffer
-work "Phase 3.3" and the heap/scheduler work "Phase 4.0"; in THIS file those are
-2.2 + 2.4 and 3.6 + 3.7. The roadmap's own 3.3 is the Local APIC and is
-untouched.
+**Corrections made to this file in this pass**, all of them things that were
+stated here and are no longer true: 0.3's "NOTHING here has ever booted that
+way"; 0.3's "the MISSING half is `-bios OVMF.fd`"; 1.4's "there is no general
+`panic(message)` any Fortran caller can reach"; 3.2.5's "ist2..ist7 are zero and
+no other vector asks for one"; 3.3's "it is not mapped, its spurious-vector
+register is untouched"; 3.5's "the LAPIC at 0xFEE00000 ... falls inside [0, top)
+by accident" -- it is reserved out of the physmap and mapped strong-UC on
+purpose now.
+
+**Corrections made in an earlier pass**, kept because they are still the reason
+several boxes read the way they do: 1.1's string debt is half paid; 1.4's
+validation text was already satisfied before 1.4 was worked on; 2.2's
+above-4-GiB hazard was removed by 3.5; 3.3's "needs the MADT to find the APIC
+base" is wrong for the BSP's own LAPIC. And the header's numbering should be
+read literally: the Lead Architect's directive calls the framebuffer work
+"Phase 3.3" and the heap/scheduler work "Phase 4.0"; in THIS file those are
+2.2 + 2.4 and 3.6 + 3.7. The roadmap's own 3.3 is the Local APIC.
 
 ---
 
@@ -88,34 +118,61 @@ Before any Fortran is written, the autonomous build environment must be establis
         define. KFLAGS now lives in `mk/kflags.mk` so the harness, the kernel build and
         the layout gate cannot drift apart.
 
-  *  [ ] 0.3 Configure QEMU Test Harness
+  *  [x] 0.3 Configure QEMU Test Harness
 
         Validation: A script (run.sh) exists that packages the kernel into an ISO and launches qemu-system-x86_64 -m 24G -smp 6 -bios OVMF.fd.
 
-        HALF DONE by 1.2. `tools/qemu-boot-test.sh` packages the kernel into a GRUB
-        rescue ISO and launches `qemu-system-x86_64 -smp 6 -m 24G` headless, then asserts
-        the boot in guest physical memory over QMP (see 1.2). The name collision was
-        heeded: `tools/run.sh` is untouched and still the podman wrapper.
+        DONE, and the half this box waited on for four milestones is the half that
+        landed: the kernel BOOTS UNDER UEFI. `tools/qemu-boot-test.sh` takes
+        `FK_FIRMWARE=uefi` and runs the same assertions against OVMF that it runs
+        against SeaBIOS. Both are gated on every run.
 
-        2.1 EXTENDED IT, still without closing it: the harness now also attaches a
-        serial chardev (`-serial file:`) and asserts what COM1 carried, so the VM is
-        interrogated on two independent channels rather than one. `-bios OVMF.fd` is
-        untouched by that, and remains what this box is waiting on.
+        ONE WORDING DEVIATION, and it is the modern spelling rather than a
+        shortcut: `-bios OVMF.fd` is not passed. OVMF arrives as two pflash
+        drives -- CODE read-only, VARS as a writable copy, because the packaged
+        VARS file is not writable and OVMF writes to it. `-bios` with OVMF is the
+        deprecated form and gives the firmware nowhere to keep its variables.
 
-        The MISSING half is `-bios OVMF.fd`. Today's harness boots the BIOS/GRUB path,
-        which is what Multiboot2 is; the UEFI path that the Minisforum actually uses is a
-        different first stage (linker.ld's header describes it) and is not exercised by
-        anything yet. Do not read the current PASS as evidence about UEFI.
+        WHAT MADE IT TRACTABLE, and it is the architectural decision of this
+        milestone: a loader that came up on UEFI passes the EFI memory map
+        THROUGH, as Multiboot2 tag 17. So the UEFI path needed no `BOOTX64.EFI`
+        of its own. `grub2-mkrescue` writes a HYBRID ISO -- one El Torito entry
+        for BIOS and one for UEFI -- once `grub2-efi-x64-modules` is in the dev
+        container, so the firmware is chosen at BOOT time and not at build time,
+        and the two paths are comparable by construction rather than by argument.
 
-        AND THE COST IS NOT ONLY A SECOND ENTRY STUB, which is the part that is easy to
-        underestimate. `src/mm/fk_pmm.f90` parses MULTIBOOT2 TAGS and nothing else: it
-        walks the tag list for type 6, validates the entry size, and refuses an MBI
-        outside the identity window. A UEFI first stage has no tag list -- it hands over
-        the array of EFI_MEMORY_DESCRIPTORs that `GetMemoryMap` returned, with different
-        type codes and a runtime-supplied descriptor stride. So the PMM needs a SECOND
-        front end feeding the same bitmap, and every milestone built on the current one
-        inherits that fork. Deciding when to pay it is a Lead Architect call; discovering
-        it at 5.3 would be the expensive version.
+        THE SECOND FRONT END IS PAID, which is what this box warned would be the
+        expensive part. `src/mm/fk_efi_mmap.f90` decodes the
+        EFI_MEMORY_DESCRIPTOR array (1222 checks) and `fk_pmm` gained
+        `collect_efi`/`collect_mb2` either side of ONE shared region table -- the
+        two front ends differ only in how they read firmware's map; the
+        asymmetric rounding, the accounting, the reserved-wins pass and the three
+        locks stay one decision. Tag 17 wins where both exist: tag 6 is GRUB's
+        summary of the EFI map and the EFI map is the original.
+
+        THE NUMBER THAT JUSTIFIES THE WHOLE DESIGN, read out of a running guest
+        rather than out of a specification: `descriptor_size` is 48 against 40
+        bytes of fields. A parser that used `sizeof(descriptor)` desynchronises
+        on descriptor 1 and reads the Pad word as a type. The stride is read.
+
+        ONLY EfiConventionalMemory IS FREE. LoaderData holds the kernel and the
+        boot info; BootServices memory is reclaimable in principle and not by a
+        kernel that never called ExitBootServices itself. That conservatism is
+        visible in the count: free comes back at total-1 on the UEFI path,
+        because the kernel's own frames were never released and locking them
+        flips no bits. Frame 0 is the only change.
+
+        WHAT THIS IS NOT. It is not a native EFI entry stub -- GRUB is the EFI
+        application here and this kernel is its Multiboot2 payload. That remains
+        1.2's open half, and whether it is worth writing at all is now a real
+        question rather than an assumed requirement.
+
+        AND THE UEFI PATH HAS NO SCREEN. GRUB answers "no suitable video mode
+        found" under OVMF, so tag 8 is absent and `fk_fbinfo` correctly REJECTS
+        the probe. Explicit `-vga std`, `-device VGA` and `-device virtio-vga`
+        do not change it. The video assertions are dropped for that firmware and
+        the gate ANNOUNCES that it dropped them, because a gate that silently
+        narrows what it checks reads exactly like one that passed. See 2.2.
 
 ## ⚙️ Phase 1: The Boot Layer & Bare-Metal Runtime
 
@@ -165,8 +222,22 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
         refused with "entry point isn't in a segment", BEFORE the Multiboot2 entry-address
         tag is consulted. Both are now emitted and must agree; the gate asserts it.
 
-        The EFI half of this box is NOT done. There is no BOOTX64.EFI, and the framebuffer
-        tag is deliberately absent (see 2.2).
+        The EFI half of this box is STILL NOT DONE, and 0.3 changed what that
+        sentence means rather than closing it. There is no BOOTX64.EFI: the
+        kernel now boots under UEFI, but GRUB is the EFI application and this
+        image is its Multiboot2 payload, entered through the SAME `_start` the
+        BIOS path uses. Nothing in boot/ knows what firmware it came from.
+
+        So the open question is no longer "when do we write the EFI stub" but
+        "is one wanted at all". What a native stub would buy is a handover that
+        does not depend on GRUB and access to boot services before
+        ExitBootServices -- notably GOP, which is exactly what the UEFI path is
+        missing (see 2.2). What it costs is a PE32+ image, a second entry path
+        and a second set of gates. That is a Lead Architect call and this box is
+        where it should be recorded.
+
+        The framebuffer tag is no longer absent -- 2.2 added it. On the UEFI
+        path GRUB declines to satisfy it; see that box.
 
   *  [x] 1.2b Long-mode entry hardening
 
@@ -238,27 +309,55 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
         The string HALF of roadmap 1.1's debt is still open. strlen, strcpy and friends
         are not translated; 1.3 needed the four memory intrinsics and delivered those.
 
-  *  [ ] 1.4 The Kernel Panic Handler
+  *  [x] 1.4 The Kernel Panic Handler
 
         Validation: A Fortran subroutine exists to halt the CPU (hlt) safely when an unrecoverable error occurs.
 
-        THIS BOX'S VALIDATION TEXT IS ALREADY SATISFIED, and has been since 3.2 --
-        left unticked deliberately, because closing a box is the Lead Architect's
-        call and this one was satisfied incidentally rather than worked on.
-        `fk_cpu_halt` (boot/boot.S) is the CLI/HLT park, `isr_handler`
-        (src/cpu/fk_idt.f90) is the Fortran subroutine that reaches it, and the
-        register dump it prints on the way has been quoted from a running CPU at
-        3.2, 3.2.5, 3.4 and 3.5.
+        DONE, and ticked on the harder reading rather than the wording. The
+        wording was satisfied at 3.2; what this box was actually open on was
+        stated in it: "there is no general `panic(message)` any Fortran caller
+        can reach ... a subsystem cannot report 'this is unrecoverable and here
+        is why' without inventing a fault." `src/cpu/fk_panic.f90` is that
+        route. The PMM's out-of-memory path keeps its INT3 deliberately -- it
+        WANTS a register dump and the only honest way to get real registers is
+        to make the CPU push them.
 
-        WHAT IS ACTUALLY MISSING, if the box is meant to mean more than its
-        wording: there is no general `panic(message)` any Fortran caller can
-        reach. Today the only route into the dump is a CPU exception, and
-        software conditions have to BORROW one -- roadmap 3.4's out-of-memory
-        path raises INT3 through `boot/faultgen.S` to get a register dump at all.
-        That works and is honest about where the registers came from, but it
-        means a subsystem cannot report "this is unrecoverable and here is why"
-        without inventing a fault. Rewording the box to ask for that, or ticking
-        it as written, are both reasonable; it should not stay ambiguous.
+        WHAT A PANIC DOES, which is the part of this box that was never a
+        subroutine but a policy. Five stages, and the ORDER is the content:
+
+          quiesce   `fk_cli` -- new, and separate from `fk_cpu_halt` on purpose.
+                    The panic path must mask interrupts and then still run far
+                    enough to report, which the existing CLI/HLT park cannot do.
+          latch     `fk_panic_state`, a bind(c) volatile record in .bss: magic,
+                    nesting depth, the caller's code, and the first 8 message
+                    bytes. Written BEFORE anything that can itself fault.
+          guard     depth > 1 halts immediately. A panic raised by the reporting
+                    path must not re-enter it; the second report faults in the
+                    same place and recurses until the stack walks through 3.5's
+                    guard page. The depth is latched first, so the record still
+                    carries how deep it got.
+          report    both consoles, reached through bind(c) names rather than USE
+                    for the reason fk_idt already documents.
+          park      `fk_cpu_halt`.
+
+        THE LATCH IS THE POINT, and it is this tree's own argument applied to
+        the panic path: every line the reporter prints stops being evidence the
+        moment the thing being reported IS the console. Read out of a running
+        guest over QMP, from `FK_FAULT_MODE = -6`:
+
+            magic = 0x00000050414E4943   ("PANIC")
+            depth = 1
+            code  = 0x0000000000001400
+            head  = 'unrecove'
+
+        while COM1 independently carried the banner, the message and the code.
+        A panic that reached neither console would still be provable from
+        outside.
+
+        WHAT IS NOT DONE. There is no reboot policy, no crash-dump, and nothing
+        survives the halt -- the record lives in RAM and is readable only while
+        the machine is stopped. Nothing here unwinds or attempts recovery, which
+        is correct for a kernel with one address space and no supervisor.
 
 ## 🖥️ Phase 2: Modern Display & Debugging
 
@@ -368,6 +467,17 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
         asserts the hole:
 
             GOP framebuffer has no write-back alias in the linear map.
+
+        AND THERE IS NO FRAMEBUFFER AT ALL ON THE UEFI PATH, which 0.3 found and
+        which this box now owns. Booted through OVMF, GRUB answers
+        "no suitable video mode found" and emits no tag 8, so `fb_probe`
+        correctly REJECTS the probe and the kernel runs headless but for COM1.
+        `-vga std`, `-device VGA` and `-device virtio-vga` change nothing: the
+        mode is GRUB's to set and it declines. Two ways out, neither taken yet --
+        get GRUB's video modules into the EFI half of the ISO, or read GOP out
+        of the EFI system table directly, which is Multiboot2 tag 12 and IS
+        present on that boot. The boot gate drops its video assertions for
+        FK_FIRMWARE=uefi and SAYS SO on every run.
 
         The above-4-GiB hazard this box used to describe is gone rather than
         avoided: `vmm_map_mmio` maps an arbitrary physical range at a virtual
@@ -630,9 +740,11 @@ The most critical mathematical and structural phase. Setting up the brain of the
         written, and the fault trigger is assembly precisely so no optimiser can
         fold it away the way it folded `1/x`.
 
-        WHAT IT DOES NOT PROVE. IST1 only; ist2..ist7 are zero and no other vector
-        asks for one, so NMI and #MC still arrive on the faulting stack -- fine
-        while nothing raises them, and 3.3's problem the moment the APIC is live.
+        WHAT IT DOES NOT PROVE. IST1 only, when this was written. SUPERSEDED IN
+        PART BY 3.3: IST2 is armed for NMI now, with its own 8 KiB stack, and an
+        injected NMI has been observed landing on it. ist3..ist7 are still zero,
+        so #MC continues to arrive on the faulting stack -- fine while nothing
+        raises one, and the next entry in this list to be paid.
         There is no guard page below the emergency stack; that needs the VMM at
         3.5, and until then a runaway panic handler walks into whatever .bss put
         underneath.
@@ -805,39 +917,95 @@ The most critical mathematical and structural phase. Setting up the brain of the
 
         Validation: Legacy 8259 PIC is disabled. Local APIC is mapped and active.
 
-        HALF DONE by 3.2.5. The legacy 8259s are remapped clear of the exception
-        range and fully masked, which is the "disabled" half and is asserted from
-        the device model (`pic0/pic1: imr=ff irq_base=20/28`). Masking is not the
-        same as the ICW3-less shutdown a system with a working IOAPIC does, and
-        that is deliberate: it is reversible, and nothing yet exists to take the
-        interrupts instead.
+        THE LAPIC HALF IS DONE. The 8259 half is NOT, and leaving it undone is a
+        decision rather than an omission -- see the box below this text. The box
+        stays open on the strength of its own second sentence.
 
-        The MISSING half is the Local APIC: it is not mapped, its spurious-vector
-        register is untouched, and `info lapic` still shows LVT0 as ExtINT.
+        `src/cpu/fk_lapic.f90` (10322 checks). Off the running chip, through the
+        mapping, and not remembered from what was written:
 
-        CORRECTION (2026-08-13): the claim that this "needs the MADT (4.1) to find
-        the APIC base" is wrong for the BSP's own LAPIC, and it made this box look
-        more blocked than it is. `IA32_APIC_BASE` (MSR 0x1B) carries the base
-        address in bits 51:12 and the enable bit in bit 11, with no ACPI involved.
-        The MADT IS needed -- for the IOAPIC's address, for the other five cores,
-        and for the interrupt source overrides that say which ISA IRQ landed on
-        which GSI -- but the LAPIC's spurious-vector register and LVT0 could be
-        dealt with today, on this machine, without parsing a single table.
+            Fortran Kernel: LAPIC MSR base/enabled 0x00000000FEE00000/0x00000001
+            Fortran Kernel: LAPIC id/version/SVR 0x00000000/0x00050014/0x000001FF
+            Fortran Kernel: LAPIC LINT0/LINT1 0x00000700/0x00000400
+            Fortran Kernel: LAPIC software-enabled, LINT0 ExtINT, LINT1 NMI.
 
-        Two real prerequisites remain, and neither is 4.1. An IST slot for NMI
-        (3.2.5 armed IST1 for #DF only, and ist2..ist7 are zero) before anything
-        can be unmasked safely. And a mapping for 0xFEE00000, which on this 24 GiB
-        box happens to fall inside the VMM's linear map by accident and on a
-        smaller machine does not -- so it wants `vmm_map_page` with caching
-        DISABLED, not the physmap. See the note in 3.5.
+        SVR 0x1FF is the assertion: vector 0xFF in bits 7:0 AND bit 8, the
+        software enable. An APIC that was mapped but never enabled reads 0x0FF
+        and passes any looser pattern.
+
+        NO ACPI, and this box's earlier correction was right: `IA32_APIC_BASE`
+        (MSR 0x1B) carries the base in bits 51:12 and the enable in bit 11. The
+        MADT is needed for the IOAPIC, the other five cores and the interrupt
+        source overrides -- none of which is the BSP's own LAPIC. `boot/mmu.S`
+        gained `fk_rdmsr`/`fk_wrmsr`; nothing was waited on.
+
+        THE MAPPING IS STRONG UC AND THE ALIAS IS PUNCHED OUT. `FK_VMM_LAPIC`
+        with `FK_VMM_UC` -- PAT index 3, PCD and PWT together, which boot/mmu.S
+        leaves at 0x00. UC- at index 2 would let an MTRR promote it to something
+        weaker. And `vmm_reserve_mmio` takes 0xFEE00000 out of the linear map
+        BEFORE the physmap is built, because on this 24 GiB machine it is below
+        top-of-RAM and would otherwise be covered write-back -- two memory types
+        for one physical page, SDM Vol.3 11.12.4, the same trade 2.2 made for the
+        framebuffer.
+
+        THE IST SLOT THIS BOX ASKED FOR IS ARMED AND IS REACHED. `FK_TSS_IST_NMI`
+        is IST2 with its own 8 KiB stack, and vector 2's gate selects it. Proven
+        by QMP `inject-nmi` against the SHIPPED image -- no mutation build:
+
+            *** NMI ENTERED ON IST2 -- THE EMERGENCY STACK HELD ***
+            RSP     = 0xFFFFFFFF80118110
+            FRAME   = 0xFFFFFFFF80123150
+
+        `fk_nmi_stack` ends at 0xFFFFFFFF80123200, so the frame is 0xB0 below its
+        top -- one 22-quadword frame, the exact size boot/interrupts.S builds --
+        while RSP was still on the interrupted stack. Read them together, as
+        3.2.5 says: separately neither proves a stack switch.
+
+        WHY THE 8259 IS STILL ALIVE, AND WHY THAT IS THE RIGHT ANSWER TODAY.
+        Once SVR bit 8 is set the CPU no longer takes the 8259 on its own INTR
+        pin -- the chip arrives through LINT0. So `lapic_init`'s masked LINT0
+        stopped IRQ0 dead, the timer stopped, and the scheduler stopped with it;
+        the kernel hung after "preemption is on" and the boot gate caught it.
+        LINT0 is deliberately put BACK into ExtINT, which is what Linux does for
+        the BSP over exactly this window. Until an IOAPIC exists at 4.1 the 8259
+        is the only interrupt source this kernel has, and disabling it would be
+        disabling interrupts.
+
+        AND LINT1 IS THE NMI SOURCE for the same class of reason, found the same
+        way: masking every LVT made 3.2.5's own IST slot unreachable, and
+        `inject-nmi` produced nothing at all. A blocked NMI is indistinguishable
+        from hardware that never raised one, so only a live injection finds it.
+        The rule the two together produced, and which this module now follows:
+        `lapic_init` masks what nothing is ready to take, and every line this
+        kernel DOES depend on is programmed back BY NAME afterwards.
+
+        WHAT IS NOT DONE, and 4.1 owns most of it. No IOAPIC, so no interrupt
+        can yet be routed anywhere except through the legacy chip. No LAPIC
+        timer -- the 8254 still drives preemption. The spurious vector 0xFF is
+        written into SVR but is NOT installed in the IDT: every LVT is masked
+        and nothing routes through the LAPIC, so it cannot be delivered, and
+        unmasking anything here before installing it is a #GP. No IPIs and no
+        second core. `lapic_eoi` exists and has never been called, because
+        nothing yet arrives that the LAPIC must acknowledge.
+
+        ONE HAZARD FOUND AND CLOSED. `lapic_init` wrote CMCI (0x2F0)
+        unconditionally; that register exists only where VERSION bits 23:16
+        report at least 6 LVT entries, and this machine reports 5. QEMU tolerates
+        the write and a real part need not. Guarded on `lapic_max_lvt`, and the
+        guard was watched failing: removing it produces 2 mismatches.
 
   *  [x] 3.4 Physical Memory Manager (PMM)
 
         Validation: Fortran parses the UEFI memory map and tracks free/used memory pages (e.g., via a bitmap).
 
-        DONE for the MULTIBOOT2 map, which is the map this kernel is handed
-        today; the UEFI wording is 0.3's outstanding half, not this box's. On
-        COM1, from the shipped image with the mandated 6 vCPU / 24 GB VM:
+        DONE for BOTH maps as of 0.3. This box's own wording -- "parses the UEFI
+        memory map" -- is satisfied literally now: `collect_efi` reads the
+        EFI_MEMORY_DESCRIPTOR array and feeds the same bitmap this box's
+        Multiboot2 path always did, through the same region table and the same
+        asymmetric rounding. The trace below is the tag-6 path on the BIOS boot;
+        the tag-17 path prints the same shape with a different map and reports
+        which front end ran. On COM1, from the shipped image with the mandated
+        6 vCPU / 24 GB VM:
 
             PMM  ID BASE               END                TYPE
             PMM  01 0x0000000000000000 0x000000000009FC00 AVAILABLE
@@ -1115,12 +1283,19 @@ The most critical mathematical and structural phase. Setting up the brain of the
 
         WHAT THIS DOES NOT PROVE. The linear map's extent follows the highest
         AVAILABLE region the loader reported, so MMIO ABOVE the top of RAM is in
-        no window at all once PML4[0] is gone. On this 24 GiB machine the LAPIC
-        at 0xFEE00000, the IOAPIC and any framebuffer BAR below 4 GiB fall inside
-        [0, top) by accident; on a 2 GiB machine none of them do. Nothing
-        dereferences them today -- the UART is port I/O and the GOP renderer is
-        never initialised on the Multiboot2 path -- and 2.2 and 3.3 both land
-        directly on it. The same map covers the PCI hole and the VGA aperture as
+        no window at all once PML4[0] is gone. THE LAPIC IS NO LONGER AN EXAMPLE
+        OF THIS: 3.3 reserves 0xFEE00000 out of the physmap before it is built
+        and maps it strong-UC at FK_VMM_LAPIC, so it is deliberate rather than
+        accidental on any size of machine. The IOAPIC is not, and 4.1 lands
+        directly on it -- it wants `vmm_map_mmio` with caching disabled and NOT
+        the physmap, for exactly the reason the LAPIC did.
+
+        AND vmm_reserve_mmio HELD ONLY ONE SPAN UNTIL 3.3, which is a defect
+        this box shipped and did not know about. The framebuffer was the sole
+        aperture, so one was enough; the LAPIC is the second caller and silently
+        OVERWROTE the first, leaving a write-back alias of whichever device lost.
+        It is a list of four now, refusing beyond the last slot rather than
+        dropping one silently, and the boot prints how many holes were punched. The same map covers the PCI hole and the VGA aperture as
         write-back 2 MiB pages; on real hardware the MTRRs mark those UC and UC
         wins, so it is very likely benign, but nothing here states it as a
         requirement.
