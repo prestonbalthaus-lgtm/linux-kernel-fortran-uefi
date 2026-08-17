@@ -1,85 +1,74 @@
 
 # PROPOSED NEXT MILESTONE -- AWAITING LEAD ARCHITECT APPROVAL
 
-Updated 2026-08-17. **0.3, 3.3 and 1.4 were approved and have LANDED** -- all
-three rows are gone from the table below. 1.4 is ticked. 0.3 and 3.3 are ticked
-only as far as their own validation text reaches, and what remains of each is
-written into its box rather than left in this header.
+Updated 2026-08-17. **4.1 was approved and has LANDED and is ticked.** Landing
+beside it, from a separate branch: the PCIe, xHCI and NVMe REGISTER LAYOUTS and
+the DMA allocator's INTERFACE -- types and declarations only, no procedures and
+no driver logic, recorded in 4.2, 5.1, 5.3 and 3.6 rather than given boxes of
+their own. Neither change ticks a driver box and neither pretends to.
 
 That grep now answers differently, which is the whole of the milestone:
 
-    $ grep -rln "MB2_TAG_EFI_MMAP" src/
-    src/mm/fk_pmm.f90
+    $ grep -rl "MADT" src/ | sort
+    src/acpi/fk_acpi.f90
+    src/acpi/fk_madt.f90
+    src/boot/fk_kmain.f90
 
-    $ grep -r "pflash" tools/qemu-boot-test.sh
-    tools/qemu-boot-test.sh:    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
-    tools/qemu-boot-test.sh:    -drive "if=pflash,format=raw,file=$VARS_COPY"
+**THE NUMBER 4.1 EXISTS FOR, off real firmware on both boot paths:**
 
-**THE HEADLINE, because this file said it had never happened: the kernel boots
-under UEFI.** OVMF, through the EFI half of a hybrid ISO, with the PMM parsing
-the `EFI_MEMORY_DESCRIPTOR` array `GetMemoryMap()` returned rather than a
-Multiboot2 tag-6 summary of it. Both firmware paths are gated, on every run.
+    Fortran Kernel: MADT overrides/IRQ0-GSI 0x0005/0x0002
+
+IRQ0 is overridden to GSI 2. No IOAPIC redirection entry for the timer can be
+written without it, and 4.2 is where it gets used.
 
 **Next, in order, with what each is really waiting on:**
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 4.1 | ACPI and the MADT | 3.3 got the BSP's own LAPIC without ACPI, and everything past that -- the IOAPIC's address, the other five cores, the interrupt source overrides -- needs the tables | nothing; `fk_memcmp` exists for the signature match |
-| 1.2 | the EFI half of the entry stub | 0.3 proved the UEFI PATH; it did NOT write a `BOOTX64.EFI`. Today GRUB is the EFI application and this kernel is its Multiboot2 payload | a decision on whether a native EFI stub is wanted at all, given the above works |
-| 2.2 | a framebuffer on the UEFI path | there is none: GRUB answers "no suitable video mode found" under OVMF, so tag 8 is absent and the screen does not exist there | GRUB's video modules in the ISO, or a GOP probe through the EFI system table (tag 12, which IS present) |
-| 1.1 | the string half of the core library | still owed, unchanged: no strlen, strcpy, strcmp or strncmp. 4.1 does not need them; 6.1 and 6.4 cannot start without them | nothing |
+| 4.2 | PCIe enumeration | the layouts are in and 4.1 found the MCFG; this is the last thing between here and any real device | parsing the MCFG for the ECAM base, and an uncached mapping of it -- both are 3.3's `vmm_map_mmio` path on a bigger region |
+| 3.3 | the 8259's other half | 4.1 delivered the IOAPIC's address and firmware's own PCAT_COMPAT statement; only the doing is left | 4.2, for a mapped IOAPIC to route interrupts to instead |
+| 3.x | the DMA allocator's BODY | declared beside heap_sbrk and defined nowhere; 5.1 and 5.3 both stop here | nothing -- it is a thin thing over `pmm_alloc_page`, and 3.5's linear map already makes virt-to-phys a subtraction |
+| 2.2 | a framebuffer on the UEFI path | still none: GRUB sets no video mode under OVMF, so tag 8 is absent | GRUB's video modules in the EFI half of the ISO, or GOP through the EFI system table (tag 12, which IS present) |
+| 1.1 | the string half of the core library | unchanged and still owed | nothing; 6.1 and 6.4 cannot start without it |
 
-**THE ONE THAT SHOULD NOT BE READ AS FINISHED: 3.3.** The Local APIC is mapped
-and software-enabled, but the 8259 is NOT disabled and that is deliberate --
-LINT0 is deliberately left in ExtINT so the legacy chip keeps delivering IRQ0,
-because nothing else can yet. Its box says so. Disabling it is 4.1's to finish,
-once the IOAPIC exists to take the interrupts instead.
+**TWO THINGS 4.1 CONFIRMED THAT HAD ONLY BEEN REASONED.** Type 4 of the MADT
+puts NMI on LINT1 for every processor -- which is exactly what 3.3 configured,
+by argument, after an injected NMI went nowhere. And MADT flags bit 0,
+PCAT_COMPAT, is SET: firmware stating that the 8259s are present and must be
+disabled before the IOAPIC is used, which is the sentence 3.3's box is open on.
+Two milestones reasoned their way to a conclusion and the tables then agreed.
 
-**What 0.3 and 3.3 cost, and every item was found by BOOTING rather than by a
-gate reading the source.** These are recorded because the tree's standard is
-that the expensive ones get written down:
+**WHAT 4.1 COST, and this is the pattern the last three milestones share.**
+Six independent adversarial lenses over two modules found a REAL DEFECT that
+the implementer's own 25133-check suite did not: the MADT entry-walk guards
+were `off + elen > hlen` in signed 32-bit, and with a length near huge(int32)
+the sum wraps NEGATIVE under -fwrapv, the guard passes, and the walk reads
+about 2 GiB BELOW the table. Two lenses found it independently and both
+reproduced it as a SIGSEGV. They also proved THREE TEST GAPS by mutation --
+including that no fixture sat above 4 GiB, so truncating the RSDP's 64-bit
+XsdtAddress to 32 bits passed the whole suite, which is the entire reason tag
+15 is preferred over tag 14. A suite that passes is not a suite that can fail.
 
-  * Software-enabling the LAPIC STOPPED THE TIMER. Once SVR bit 8 is set the
-    8259 no longer reaches the CPU's own INTR pin -- it arrives through LINT0 --
-    so masking LINT0 killed IRQ0, and the scheduler stopped with it. The kernel
-    hung after "preemption is on" and the boot gate caught it.
-  * Masking LINT1 made 3.2.5's own IST slot UNREACHABLE. The same milestone
-    armed IST2 for NMI and masked the line that delivers one. `inject-nmi`
-    produced nothing at all, and a blocked NMI is indistinguishable from
-    hardware that never raised one -- only a live injection finds this.
-  * `vmm_reserve_mmio` held EXACTLY ONE span. Enough while the framebuffer was
-    the sole aperture; the LAPIC is the second caller and silently OVERWROTE the
-    first, leaving a write-back alias of whichever device lost. It is a list now.
-  * `lapic_init` wrote CMCI unconditionally. That register exists only where
-    VERSION bits 23:16 report at least 6 LVT entries, and this machine reports
-    5. QEMU tolerates the write; a real part need not.
+**AND THE STANDARD THAT MADE 4.1's NUMBERS EVIDENCE.** Every value the kernel
+prints was FIRST read out of guest memory by an independent host-side walk of
+the same tables, written in Python and sharing no code with the Fortran. Two
+implementations agreeing is worth more than one implementation asserting. The
+same argument the PMM makes by booting at a different -m, 4.1 makes by booting
+at -smp 2: two CPUs and a 128-byte MADT instead of six and 160.
 
-**And TWO VERDICTS THAT WERE ASSERTING THE FIRMWARE rather than the code**, both
-the same mistake and both exposed by the UEFI map's shape. "PMM cursor rewind"
-freed 96 frames at addresses COMPUTED from a base, justified by a contiguity
-check that only ever covered 5. "PMM allocated 5 contiguous frames" required
-first-fit to return adjacent frames at all. Neither is true where LoaderData
-sits at 0x1000 and again across 0x3000..0xC000, so the first five frames the
-UEFI map yields are 2, 12, 13, 14, 15. Both now assert what `pmm_alloc_page`
-actually promises: distinct, page-aligned, previously-free frames.
+**Corrections made to this file in this pass**: 3.3's "WHAT IS NOT DONE, and
+4.1 owns most of it" -- 4.1 has landed, and what remains is 4.2's doing rather
+than 4.1's parsing; and 3.6's "DMA memory ... is still not smuggled into this
+box" -- its interface is declared there now, though still not defined.
 
-**Corrections made to this file in this pass**, all of them things that were
-stated here and are no longer true: 0.3's "NOTHING here has ever booted that
-way"; 0.3's "the MISSING half is `-bios OVMF.fd`"; 1.4's "there is no general
-`panic(message)` any Fortran caller can reach"; 3.2.5's "ist2..ist7 are zero and
-no other vector asks for one"; 3.3's "it is not mapped, its spurious-vector
-register is untouched"; 3.5's "the LAPIC at 0xFEE00000 ... falls inside [0, top)
-by accident" -- it is reserved out of the physmap and mapped strong-UC on
-purpose now.
-
-**Corrections made in an earlier pass**, kept because they are still the reason
-several boxes read the way they do: 1.1's string debt is half paid; 1.4's
-validation text was already satisfied before 1.4 was worked on; 2.2's
-above-4-GiB hazard was removed by 3.5; 3.3's "needs the MADT to find the APIC
-base" is wrong for the BSP's own LAPIC. And the header's numbering should be
-read literally: the Lead Architect's directive calls the framebuffer work
-"Phase 3.3" and the heap/scheduler work "Phase 4.0"; in THIS file those are
-2.2 + 2.4 and 3.6 + 3.7. The roadmap's own 3.3 is the Local APIC.
+**Corrections made in the previous pass**, kept because they are why several
+boxes read the way they do: 0.3's "NOTHING here has ever booted that way";
+0.3's "the MISSING half is `-bios OVMF.fd`"; 1.4's "there is no general
+`panic(message)`"; 3.2.5's "ist2..ist7 are zero"; 3.3's "it is not mapped";
+3.5's "the LAPIC ... falls inside [0, top) by accident". And the header's
+numbering should be read literally: the Lead Architect's directive calls the
+framebuffer work "Phase 3.3" and the heap/scheduler work "Phase 4.0"; in THIS
+file those are 2.2 + 2.4 and 3.6 + 3.7.
 
 ---
 
@@ -979,8 +968,13 @@ The most critical mathematical and structural phase. Setting up the brain of the
         `lapic_init` masks what nothing is ready to take, and every line this
         kernel DOES depend on is programmed back BY NAME afterwards.
 
-        WHAT IS NOT DONE, and 4.1 owns most of it. No IOAPIC, so no interrupt
-        can yet be routed anywhere except through the legacy chip. No LAPIC
+        WHAT IS NOT DONE. 4.1 has since landed and answered the table half of
+        this: the IOAPIC's address is KNOWN (0xFEC00000, GSI base 0), IRQ0's
+        override to GSI 2 is known, and the MADT's PCAT_COMPAT bit is firmware
+        AGREEING that the 8259s must be disabled before the IOAPIC is used. What
+        is still missing is the doing, and it is 4.2's: the IOAPIC is not mapped
+        and not written, so no interrupt can yet be routed anywhere except
+        through the legacy chip. No LAPIC
         timer -- the 8254 still drives preemption. The spurious vector 0xFF is
         written into SVR but is NOT installed in the IDT: every LVT is masked
         and nothing routes through the LAPIC, so it cannot be delivered, and
@@ -1380,6 +1374,23 @@ The most critical mathematical and structural phase. Setting up the brain of the
         address is a subtraction -- so the DMA allocator is a thin thing over
         `pmm_alloc_page`, not a second heap.
 
+        ITS INTERFACE IS NOW DECLARED HERE, AND ONLY DECLARED.
+        `pmm_alloc_contiguous(pages)` answers with a physical base or 0, and it
+        sits beside `heap_sbrk` because that is the other boundary this file
+        draws and fk_heap_m is the module a driver already USEs when it wants
+        memory. Page granularity is the whole alignment argument: a frame is
+        4096-byte aligned and every structure that will ask for this wants less
+        -- 64 bytes for an xHCI ring segment, its DCBAA and its ERST, one page
+        for an NVMe queue. What it does NOT promise is a run clear of a 64 KiB
+        boundary, which a TRB's data buffer may not cross
+        (vendor/linux-7.1.8/drivers/usb/host/xhci.h:1265).
+
+        DECLARED AND NOT DEFINED, deliberately: an interface body with no caller
+        emits no reference, so `nm -u` on fk_heap.o still prints heap_sbrk and
+        nothing else and the tree links exactly as it did. The first driver to
+        call it fails at LINK time rather than by reading a page of firmware
+        leftovers. Filling it in is the PMM's job and nobody has done it.
+
   *  [x] 3.7 Tasks, context switching and a round-robin scheduler
 
         Validation: two kernel threads run alternately, switched by the 8254
@@ -1447,13 +1458,125 @@ The most critical mathematical and structural phase. Setting up the brain of the
 
 Discovering what hardware actually exists on the Minisforum motherboard.
 
-   * [ ] 4.1 ACPI & MADT Parsing
+   * [x] 4.1 ACPI & MADT Parsing
 
         Validation: Fortran parses ACPI tables to find all CPU cores and APIC addresses.
+
+        DONE, on both firmware paths, and the milestone exists for one number:
+
+            Fortran Kernel: MADT overrides/IRQ0-GSI 0x0005/0x0002
+
+        IRQ0 IS overridden, to GSI 2. Nothing can program an IOAPIC redirection
+        entry for the timer without knowing that, and 4.2 is where it gets used.
+
+        `src/acpi/fk_acpi.f90` (554 checks) finds the RSDP in Multiboot2 tag 15
+        and falls back to tag 14, validates both checksums, and walks the XSDT
+        or the RSDT. `src/acpi/fk_madt.f90` (25133 checks) decodes entry types
+        0, 1, 2, 4 and 5, COUNTS what it skips rather than ignoring it, and
+        answers `madt_gsi_for_irq`. Neither locates itself: both take a VIRTUAL
+        address and read through it, which is the split that made fk_lapic
+        testable at 3.3 and lets the host suite point them at ordinary memory.
+
+        The whole topology, and the root differs by firmware exactly the way the
+        PMM's front end does:
+
+            ACPI root is the RSDT (Multiboot2 tag 14).   BIOS, 0x7FFE2525, rev 0
+            ACPI root is the XSDT (Multiboot2 tag 15).   UEFI, 0x7FB7D0E8, rev 2
+            MADT cpus total/enabled/skipped 0x0006/0x0006/0x0000
+            MADT ioapics/first-addr/gsi-base 0x0001/0x00000000FEC00000/0x0000
+            MADT overrides/IRQ0-GSI 0x0005/0x0002
+            MADT NMI entries/LINT 0x0001/0x01
+            MADT and IA32_APIC_BASE agree on 0x00000000FEE00000
+
+        THAT LAST LINE IS THE ONLY ONE HERE THAT IS NOT THE KERNEL AGREEING WITH
+        ITSELF: one address out of the MADT's header, one out of the MSR 3.3
+        reads, checked against each other.
+
+        AND TWO THINGS THE TABLES CONFIRMED THAT WERE ONLY REASONED BEFORE.
+        Type 4 puts NMI on LINT1 for every processor -- which is exactly what
+        3.3 configured, by argument, after an injected NMI went nowhere. And
+        MADT flags bit 0, PCAT_COMPAT, is SET: firmware's own statement that the
+        8259s are present and must be disabled before the IOAPIC is used, which
+        is the sentence 3.3's box is still open on.
+
+        NO TEMPORARY MAPPING, which is a deviation from the directive and a
+        simplification rather than a shortcut. 3.5's linear map already covers
+        every byte of RAM the loader reported and the tables sit inside it on
+        every configuration measured, so `acpi_init` reads through
+        `vmm_phys_to_virt` and REFUSES anything at or above `vmm_physmap_top()`.
+        That refusal is load-bearing and not decoration: at -m 2G the RSDT lands
+        about 7 KiB below the top. It also avoids inventing an unmap path the
+        VMM does not have.
+
+        EVERY MULTI-BYTE FIELD IS ASSEMBLED BYTE-WISE, and that is forced.
+        On the BIOS path the RSDT sits at physical 0x7FFE2525 -- not even
+        4-byte aligned -- so its 32-bit table pointers are unaligned too, and
+        MADT type 4 carries a u16 at ODD OFFSET 3. A typed array descriptor or a
+        bind(c) derived type bakes in alignment that is not there. ACPI itself
+        promises only 4-byte alignment for the XSDT's 64-bit entries.
+
+        WHAT ADVERSARIAL REVIEW COST, six independent lenses over two modules:
+
+          * A REAL DEFECT in fk_madt, found by TWO of them independently and
+            reproduced as a SIGSEGV. The entry-walk guards were
+            `off + elen > hlen` in signed 32-bit; hlen was accepted up to
+            huge(int32), so the sum wrapped NEGATIVE under -fwrapv, the guard
+            passed, and off indexed about 2 GiB BELOW the table. The guards
+            SUBTRACT now -- off < hlen is the loop condition, so hlen - off is
+            positive and no sum is formed -- and a 64 KiB length cap keeps every
+            table-controlled offset far from the wrap point.
+          * THREE TEST GAPS, each proved by a mutant that passed the suite
+            unchanged: acpi_find's skip-past-an-unreachable-entry was never
+            exercised, because every far pointer sat AFTER the last findable
+            table; the ACCEPT side of the window bound was never checked, so
+            widening the test from > to >= passed; and no fixture sat above
+            4 GiB, so truncating the RSDP's 64-bit XsdtAddress to 32 bits
+            passed -- which is the entire reason tag 15 is preferred over tag
+            14. All three now fail on the mutant that used to pass.
+
+        WHY THE NUMBERS ARE EVIDENCE. Every value above was FIRST read out of
+        guest memory by an independent host-side walk of the same tables,
+        written in Python and sharing no code with the Fortran: same roots, same
+        MADT, same six CPUs, same IOAPIC, same five overrides, same type-4 NMI.
+        Two implementations agreeing is worth more than one asserting.
+
+        AND THE TABLES ARE LIVE. The same image at -smp 2 reports two CPUs and a
+        128-byte MADT rather than six and 160 -- this is read, not remembered.
+        `fk_acpi_topo` is a bind(c) record, so the topology is checkable from
+        OUTSIDE the guest too: magic 'ACPIT', root 0x7FFE2525, 6 cpus, IOAPIC
+        0xFEC00000, GSI-for-IRQ0 2, read back over QMP.
+
+        WHAT IS NOT DONE. Nothing is programmed: this box ends at parse, store
+        and print. The IOAPIC is not mapped and not written -- that is 4.2's,
+        and it is what finally lets 3.3 close. Only the FADT's signature is
+        seen; nothing reads it. There is no AML interpreter and no _PRT, so PCI
+        interrupt routing at 4.2 has only the ISO table to work from.
 
    * [ ] 4.2 PCIe Bus Enumeration
 
         Validation: Kernel recursively scans the PCIe bus and prints a list of all connected devices (Vendor IDs / Device IDs) to the GOP display.
+
+        THE LAYOUTS ARE IN, THE SCAN IS NOT. `src/drivers/bus/fk_pcie_types.f90`
+        carries the Type 0 and Type 1 configuration headers, the capability list
+        header, the MSI-X capability and one table entry, the ECAM shifts, BAR
+        decode, and the class/subclass/prog-if triples that identify an xHCI and
+        an NVMe. No procedures and no module state: nothing scans anything yet.
+
+        Those offsets are a fact rather than a claim -- each taken from the
+        specification, cross-checked against vendor/linux-7.1.8's pci_regs.h
+        with the path and line beside it, and then MEASURED: a generated probe
+        takes c_loc of every component of every type, subtracts the address of
+        the type and diffs against the hand-computed table. Every reserved gap
+        is a NAMED component, because padding the compiler chooses is padding
+        the hardware does not have.
+
+        WHAT IT IS STILL BLOCKED ON, and neither is a table: the ECAM base comes
+        from the MCFG, which 4.1 can already FIND (it is in the root's table
+        list on both firmware paths) but does not parse; and reaching config
+        space needs an uncached mapping of that base, which is `vmm_map_mmio`
+        with FK_VMM_UC -- the LAPIC's path at 3.3, on a much larger region.
+        Interrupt routing for whatever is found has only 4.1's ISO table to work
+        from: there is no AML interpreter and therefore no _PRT.
 
 ## 🛠️ Phase 5: Modern Drivers (The Crucible)
 
@@ -1463,6 +1586,25 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
 
         Validation: Kernel initializes the xHCI controller found on the PCIe bus and establishes Ring Buffers in physical memory.
 
+        THE REGISTER BLOCKS ARE IN, THE CONTROLLER IS UNTOUCHED.
+        `src/drivers/usb/fk_xhci_types.f90` carries the capability, operational,
+        port, runtime and interrupter blocks, the Event Ring Segment Table
+        entry, and the 16-byte TRB in its generic form plus the six variants
+        whose fields decompose differently. A command TRB IS the generic one --
+        only the type field in the control dword distinguishes it -- so there
+        are deliberately no per-command types. Measured the same way 4.2's were.
+
+        Bit fields are POS/LEN pairs and single _BIT indices, never masks:
+        `ibits(reg, POS, LEN)` already does the job, and a mask literal wide
+        enough to cover bit 31 does not fit the signed c_int32_t the value is
+        carried in. That is the unsigned rule this tree has applied since 1.1,
+        arrived at from the register side.
+
+        BLOCKED ON THREE THINGS, all real: 4.2, to find the controller at all;
+        a DMA allocator, because a ring is read by a bus master that does not
+        walk the CPU's page tables (the interface is declared -- see 3.6); and
+        an IOAPIC or MSI-X route for its interrupt, which is 4.2's other half.
+
    * [ ] 5.2 USB HID Keyboard Driver
 
         Validation: Physical keystrokes on a USB keyboard generate APIC interrupts, which Fortran translates to ASCII characters on the screen.
@@ -1470,6 +1612,12 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
    * [ ] 5.3 NVMe Storage Controller
 
         Validation: Kernel identifies the NVMe drive, establishes Submission/Completion Queues, and successfully reads Sector 0 into a Fortran array.
+
+        THE REGISTER BLOCKS ARE IN, THE DRIVE IS UNTOUCHED.
+        `src/drivers/storage/fk_nvme_types.f90` carries the controller register
+        block, the persistent-memory region block, the 64-byte submission queue
+        entry and the 16-byte completion queue entry. Measured, like the others.
+        Blocked on the same three things 5.1 is.
 
 ## 🌉 Phase 6: The User-Space Bridge (Distro Maker)
 
