@@ -32,7 +32,7 @@ module fk_heap_m
             FK_HS_ALLOCS, FK_HS_FREES, FK_HS_LARGEST, FK_HS_FAILED, &
             FK_HS_BADFREE, &
             fk_heap_stat, heap_init, kmalloc, kfree, kzalloc, heap_check, &
-            heap_base, heap_top, heap_size_of
+            heap_base, heap_top, heap_size_of, pmm_alloc_contiguous
 
   ! SysV AMD64's max_align_t is 16, and the header is one alignment unit, so a
   ! payload is aligned exactly when the block is.
@@ -97,6 +97,33 @@ module fk_heap_m
       integer(c_int64_t), intent(in), value :: bytes
       integer(c_int64_t) :: virt
     end function heap_sbrk
+  end interface
+
+  ! DMA memory, which the block allocator above cannot serve and does not try
+  ! to.  PAGES contiguous 4 KiB frames, or 0.  It answers with the PHYSICAL
+  ! base because that is the address the DEVICE uses: a bus master does not
+  ! walk the CPU's page tables, and the ring an xHCI controller reads is
+  ! described to it by physical address alone.
+  !
+  ! A frame is 4096-byte aligned, so a run of them satisfies every alignment
+  ! these structures ask for -- 64 bytes for an xHCI ring segment, its DCBAA
+  ! and its ERST, one page for an NVMe queue.  What page granularity does NOT
+  ! promise is a run clear of a 64 KiB boundary, which a TRB's data buffer may
+  ! not cross (vendor/linux-7.1.8/drivers/usb/host/xhci.h:1265); a caller that
+  ! needs that must ask for the size that guarantees it.
+  !
+  ! DECLARED HERE, DEFINED NOWHERE YET (roadmap 3.x debt, the PMM's to fill).
+  ! An interface with no caller emits no reference, so the tree still links
+  ! today, and the first driver to call it fails at LINK time rather than by
+  ! reading a page of firmware leftovers.
+  interface
+    function pmm_alloc_contiguous(pages) result(phys) &
+         bind(c, name="pmm_alloc_contiguous")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t), intent(in), value :: pages
+      integer(c_int64_t) :: phys
+    end function pmm_alloc_contiguous
   end interface
 
 contains
