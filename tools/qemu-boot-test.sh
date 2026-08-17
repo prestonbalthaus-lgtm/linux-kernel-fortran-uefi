@@ -118,6 +118,21 @@ RWX'
 #   line in the boot still passes.
 #
 # The rest are prefixes because they carry an address or a live count.
+# roadmap 4.1.  Every number here is the firmware's, cross-checked against an
+# independent host-side walk of the same tables.  The IRQ0 override is the one
+# that decides how the IOAPIC must be programmed at 4.2, and the agree line is
+# the only fact in this run derived from TWO sources -- the MADT's own header
+# and the IA32_APIC_BASE readback from 3.3.
+FK_ACPI_PASS_LINES=$'Fortran Kernel: MADT cpus total/enabled/skipped 0x0006/0x0006/0x0000
+Fortran Kernel: MADT ioapics/first-addr/gsi-base 0x0001/0x00000000FEC00000/0x0000
+Fortran Kernel: MADT overrides/IRQ0-GSI 0x0005/0x0002
+Fortran Kernel: MADT NMI entries/LINT 0x0001/0x01
+Fortran Kernel: MADT and IA32_APIC_BASE agree on 0x00000000FEE00000'
+FK_ACPI_FAIL_LINES=$'Fortran Kernel: ACPI init FAILED, status 0x
+Fortran Kernel: ACPI found no MADT.
+Fortran Kernel: MADT parse FAILED, status 0x
+Fortran Kernel: MADT and IA32_APIC_BASE DISAGREE.'
+
 # roadmap 3.3.  The SVR value is spelled out: 0x1FF is the spurious vector in
 # bits 7:0 with bit 8, the software-enable, set -- an APIC that was mapped but
 # never enabled reads 0x0FF and passes a looser pattern. LINT0 masked is the
@@ -220,7 +235,8 @@ if [[ "${FK_FIRMWARE:-bios}" == uefi ]]; then
   # Tag 17 exists only where the loader came up on UEFI, so this line is what
   # separates "booted through OVMF" from "parsed the EFI map".
   FK_PMM_PASS_LINES="$FK_PMM_PASS_LINES
-Fortran Kernel: PMM front end is the UEFI GetMemoryMap array (Multiboot2 tag 17)."
+Fortran Kernel: PMM front end is the UEFI GetMemoryMap array (Multiboot2 tag 17).
+Fortran Kernel: ACPI root is the XSDT (Multiboot2 tag 15)."
   FK_FB_PASS_LINES=""
   FK_CON_PASS_LINES=""
   FK_FB_FAIL_LINES=""
@@ -233,7 +249,8 @@ Fortran Kernel: PMM front end is the UEFI GetMemoryMap array (Multiboot2 tag 17)
 fi
 
 [[ "${FK_FIRMWARE:-bios}" == uefi ]] || FK_PMM_PASS_LINES="$FK_PMM_PASS_LINES
-Fortran Kernel: PMM front end is the Multiboot2 memory map (tag 6)."
+Fortran Kernel: PMM front end is the Multiboot2 memory map (tag 6).
+Fortran Kernel: ACPI root is the RSDT (Multiboot2 tag 14)."
 
 EXPECT_SERIAL="${FK_EXPECT_SERIAL:-Fortran Kernel: UART Serial Initialized.
 $FK_PMM_PASS_LINES
@@ -243,6 +260,7 @@ $FK_CON_PASS_LINES
 $FK_HEAP_PASS_LINES
 $FK_SCHED_PASS_LINES
 $FK_LAPIC_PASS_LINES
+$FK_ACPI_PASS_LINES
 $FK_IRQ_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
@@ -252,6 +270,7 @@ $FK_CON_FAIL_LINES
 $FK_HEAP_FAIL_LINES
 $FK_SCHED_FAIL_LINES
 $FK_LAPIC_FAIL_LINES
+$FK_ACPI_FAIL_LINES
 $FK_IRQ_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
