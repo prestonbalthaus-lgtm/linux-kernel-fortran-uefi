@@ -105,6 +105,8 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/lib/fk_string_abi.f90 \
                src/mm/fk_vmm.f90 \
                src/mm/fk_heap.f90 \
+               src/acpi/fk_acpi.f90 \
+               src/acpi/fk_madt.f90 \
                src/cpu/fk_sched.f90 \
                src/boot/fk_kmain.f90
 

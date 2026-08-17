@@ -19,6 +19,17 @@ module fk_kmain_m
   use fk_serial_m, only: FK_SERIAL_COM1, serial_init, serial_print_string, &
                          serial_print_hex
   use fk_panic_m,  only: panic_code
+  use fk_acpi_m,   only: FK_ACPI_OK, FK_ACPI_ROOT_XSDT, acpi_set_window, &
+                         acpi_set_limit, acpi_init, acpi_root_kind, &
+                         acpi_root_phys, acpi_revision, acpi_table_count, &
+                         acpi_find, acpi_table_length
+  use fk_madt_m,   only: FK_MADT_OK, madt_parse, madt_lapic_addr, &
+                         madt_pcat_compat, madt_cpu_count, madt_cpu_enabled, &
+                         madt_cpu_apic_id, madt_ioapic_count, &
+                         madt_ioapic_addr, madt_ioapic_gsi_base, &
+                         madt_iso_count, madt_iso_src, madt_iso_gsi, &
+                         madt_gsi_for_irq, madt_nmi_count, madt_nmi_lint, &
+                         madt_skipped
   use fk_lapic_m,  only: lapic_init, lapic_msr_base, lapic_msr_enabled, &
                          lapic_lint0_extint, lapic_lint1_nmi, &
                          LVT_DM_EXTINT, LVT_DM_NMI, &
@@ -57,6 +68,7 @@ module fk_kmain_m
                          vmm_guard_page, vmm_phys_to_virt, &
                          FK_VMM_MMIO, FK_VMM_HEAP, FK_VMM_WC, &
                          FK_VMM_UC, FK_VMM_LAPIC, vmm_reserved_holes, &
+                         vmm_physmap_top, FK_VMM_PHYSMAP, &
                          vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, &
                          vmm_read_pat
   use fk_sched_m,  only: FK_SCHED_MAX, fk_task_runs, fk_sched_switches, &
@@ -135,6 +147,58 @@ module fk_kmain_m
   ! LVT is masked and nothing routes through the LAPIC yet, so it cannot be
   ! delivered.  Unmasking anything here without installing it first is a #GP.
   integer(c_int32_t), parameter :: FK_LAPIC_SPURIOUS = 255_c_int32_t
+  ! roadmap 4.1.  Read out of guest memory by tools/qmp-sentinel.py, for the
+  ! reason fk_panic_state and fk_boot_sentinel are: a console line is the
+  ! kernel's opinion of itself, and the topology is the one thing here that a
+  ! second, independent source (the MADT) can be checked against.
+  ! [0] magic  [1] root kind  [2] root phys   [3] MADT phys
+  ! [4] cpus   [5] ioapic0    [6] overrides   [7] GSI for IRQ0
+  integer(c_int64_t), parameter :: FK_ACPI_MAGIC = int(z'4143504954', c_int64_t)
+  integer(c_int64_t), volatile, save, bind(c, name="fk_acpi_topo") :: &
+       fk_acpi_topo(0:7)
+
+  ! 'APIC' packed little-endian, built rather than written down.
+  integer(c_int32_t), parameter :: FK_SIG_APIC = &
+       ior(ior(iachar('A', c_int32_t), shiftl(iachar('P', c_int32_t), 8)), &
+           ior(shiftl(iachar('I', c_int32_t), 16), &
+               shiftl(iachar('C', c_int32_t), 24)))
+
+  character(kind=c_char, len=*), parameter :: FK_ACPI_START = &
+       "Fortran Kernel: ACPI parsing the loader's RSDP tag (roadmap 4.1)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_ACPI_ROOT = &
+       "Fortran Kernel: ACPI root/rev/tables 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_ACPI_XSDT = &
+       "Fortran Kernel: ACPI root is the XSDT (Multiboot2 tag 15)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_ACPI_RSDT = &
+       "Fortran Kernel: ACPI root is the RSDT (Multiboot2 tag 14)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_ACPI_INIT_BAD = &
+       "Fortran Kernel: ACPI init FAILED, status 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_ACPI_NO_MADT = &
+       "Fortran Kernel: ACPI found no MADT." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_MADT_BAD = &
+       "Fortran Kernel: MADT parse FAILED, status 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_MADT_AT = &
+       "Fortran Kernel: MADT at/len 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_MADT_CPUS = &
+       "Fortran Kernel: MADT cpus total/enabled/skipped 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_MADT_IOAPIC = &
+       "Fortran Kernel: MADT ioapics/first-addr/gsi-base 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_MADT_ISO = &
+       "Fortran Kernel: MADT overrides/IRQ0-GSI 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_MADT_NMI = &
+       "Fortran Kernel: MADT NMI entries/LINT 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_MADT_AGREE = &
+       "Fortran Kernel: MADT and IA32_APIC_BASE agree on 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_MADT_DISAGREE = &
+       "Fortran Kernel: MADT and IA32_APIC_BASE DISAGREE." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_MADT_PCAT = &
+       "Fortran Kernel: MADT says PCAT_COMPAT: the 8259s are present and " // &
+       "must be disabled before the IOAPIC is used." // FK_CRLF // c_null_char
+
   character(kind=c_char, len=*), parameter :: FK_LAPIC_START = &
        "Fortran Kernel: LAPIC bring-up from IA32_APIC_BASE (roadmap 3.3)." // &
        FK_CRLF // c_null_char
@@ -1562,6 +1626,160 @@ contains
   ! roadmap 3.3.  The base comes from IA32_APIC_BASE and NOT from the MADT:
   ! bits 51:12 carry it and bit 11 is the global enable, with no ACPI involved
   ! for the boot processor's own LAPIC.
+  ! roadmap 4.1.  Runs AFTER the higher-half handoff, deliberately: the
+  ! tables live in ACPI-reclaim memory, which the linear map covers, so no
+  ! window has to be built and torn down for them.  Everything below the
+  ! physmap top is reachable and anything at or above it is REFUSED rather
+  ! than dereferenced -- on a 2 GiB machine the tables sit ~7 KiB under that
+  ! top, so the check is load-bearing and not decoration.
+  subroutine acpi_bringup(mbi)
+    implicit none
+    integer(c_int64_t), intent(in) :: mbi
+    integer(c_int32_t) :: st
+    integer(c_int64_t) :: mbi_virt, mbi_len, madt_phys, madt_len
+
+    call serial_print_string(FK_ACPI_START)
+
+    call acpi_set_window(FK_VMM_PHYSMAP)
+    call acpi_set_limit(vmm_physmap_top())
+
+    mbi_virt = vmm_phys_to_virt(mbi)
+    ! total_size is the MBI's first word; read through the assembly peek so no
+    ! optimiser may assume anything about a pointer this kernel just computed.
+    mbi_len = iand(fk_peek64(mbi_virt), int(z'FFFFFFFF', c_int64_t))
+
+    st = acpi_init(mbi_virt, mbi_len)
+    if (st /= FK_ACPI_OK) then
+       call serial_print_string(FK_ACPI_INIT_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    if (acpi_root_kind() == FK_ACPI_ROOT_XSDT) then
+       call serial_print_string(FK_ACPI_XSDT)
+    else
+       call serial_print_string(FK_ACPI_RSDT)
+    end if
+    call serial_print_string(FK_ACPI_ROOT)
+    call serial_print_hex(acpi_root_phys(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(acpi_revision(), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(acpi_table_count(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    madt_phys = acpi_find(FK_SIG_APIC)
+    if (madt_phys == 0_c_int64_t) then
+       call serial_print_string(FK_ACPI_NO_MADT)
+       return
+    end if
+    madt_len = acpi_table_length(madt_phys)
+
+    call serial_print_string(FK_MADT_AT)
+    call serial_print_hex(madt_phys, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(madt_len, 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    st = madt_parse(vmm_phys_to_virt(madt_phys), int(madt_len, c_int32_t))
+    if (st /= FK_MADT_OK) then
+       call serial_print_string(FK_MADT_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    call serial_print_string(FK_MADT_CPUS)
+    call serial_print_hex(int(madt_cpu_count(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(madt_cpu_enabled(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(madt_skipped(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_MADT_IOAPIC)
+    call serial_print_hex(int(madt_ioapic_count(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(madt_ioapic_addr(0_c_int32_t), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(madt_ioapic_gsi_base(0_c_int32_t), c_int64_t), &
+                          4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_MADT_ISO)
+    call serial_print_hex(int(madt_iso_count(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(madt_gsi_for_irq(0_c_int32_t), c_int64_t), &
+                          4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_MADT_NMI)
+    call serial_print_hex(int(madt_nmi_count(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(madt_nmi_lint(0_c_int32_t), c_int64_t), &
+                          2_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! TWO INDEPENDENT SOURCES FOR ONE FACT, which is the only line here that
+    ! could not be produced by a parser agreeing with itself: the MADT's
+    ! header address against the value 3.3 read out of IA32_APIC_BASE.
+    if (madt_lapic_addr() == lapic_msr_base()) then
+       call serial_print_string(FK_MADT_AGREE)
+       call serial_print_hex(madt_lapic_addr(), 16_c_int32_t)
+       call serial_print_string(FK_NL)
+    else
+       call serial_print_string(FK_MADT_DISAGREE)
+    end if
+
+    if (madt_pcat_compat() /= 0_c_int32_t) &
+         call serial_print_string(FK_MADT_PCAT)
+
+    ! The same topology on the SCREEN, per the 4.1 directive.  console_write is
+    ! a no-op until console_init has run, so this costs nothing on a boot that
+    ! never got a framebuffer -- which is every UEFI boot today (see 2.2).
+    if (acpi_root_kind() == FK_ACPI_ROOT_XSDT) then
+       call console_write(FK_ACPI_XSDT, 128_c_int32_t)
+    else
+       call console_write(FK_ACPI_RSDT, 128_c_int32_t)
+    end if
+    call console_write(FK_MADT_AT, 64_c_int32_t)
+    call console_print_hex(madt_phys, 16_c_int32_t)
+    call console_write(FK_PMM_SLASH, 4_c_int32_t)
+    call console_print_hex(madt_len, 8_c_int32_t)
+    call console_write(FK_NL, 4_c_int32_t)
+    call console_write(FK_MADT_CPUS, 64_c_int32_t)
+    call console_print_hex(int(madt_cpu_count(), c_int64_t), 4_c_int32_t)
+    call console_write(FK_PMM_SLASH, 4_c_int32_t)
+    call console_print_hex(int(madt_cpu_enabled(), c_int64_t), 4_c_int32_t)
+    call console_write(FK_PMM_SLASH, 4_c_int32_t)
+    call console_print_hex(int(madt_skipped(), c_int64_t), 4_c_int32_t)
+    call console_write(FK_NL, 4_c_int32_t)
+    call console_write(FK_MADT_IOAPIC, 64_c_int32_t)
+    call console_print_hex(int(madt_ioapic_count(), c_int64_t), 4_c_int32_t)
+    call console_write(FK_PMM_SLASH, 4_c_int32_t)
+    call console_print_hex(madt_ioapic_addr(0_c_int32_t), 16_c_int32_t)
+    call console_write(FK_PMM_SLASH, 4_c_int32_t)
+    call console_print_hex(int(madt_ioapic_gsi_base(0_c_int32_t), c_int64_t), &
+                           4_c_int32_t)
+    call console_write(FK_NL, 4_c_int32_t)
+    call console_write(FK_MADT_ISO, 64_c_int32_t)
+    call console_print_hex(int(madt_iso_count(), c_int64_t), 4_c_int32_t)
+    call console_write(FK_PMM_SLASH, 4_c_int32_t)
+    call console_print_hex(int(madt_gsi_for_irq(0_c_int32_t), c_int64_t), &
+                           4_c_int32_t)
+    call console_write(FK_NL, 4_c_int32_t)
+
+    fk_acpi_topo(0) = FK_ACPI_MAGIC
+    fk_acpi_topo(1) = int(acpi_root_kind(), c_int64_t)
+    fk_acpi_topo(2) = acpi_root_phys()
+    fk_acpi_topo(3) = madt_phys
+    fk_acpi_topo(4) = int(madt_cpu_count(), c_int64_t)
+    fk_acpi_topo(5) = madt_ioapic_addr(0_c_int32_t)
+    fk_acpi_topo(6) = int(madt_iso_count(), c_int64_t)
+    fk_acpi_topo(7) = int(madt_gsi_for_irq(0_c_int32_t), c_int64_t)
+  end subroutine acpi_bringup
+
   subroutine lapic_bringup()
     implicit none
     integer(c_int64_t) :: base
@@ -1854,6 +2072,8 @@ contains
     ! FK_FAULT_MODE build runs with interrupts live from here on, so the tick
     ! proof rides on all of them the way 3.4's and 3.5's verdicts do.
     call lapic_bringup()
+
+    call acpi_bringup(mbi)
 
     irq_status = irq_bringup()
 
