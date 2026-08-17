@@ -181,4 +181,37 @@ fk_read_pat:
 	ret
 	.size	fk_read_pat, . - fk_read_pat
 
+/*
+ * RDMSR/WRMSR with the register number chosen by the CALLER, for model-specific
+ * registers this file has no reason to know about -- IA32_APIC_BASE (0x1B) is
+ * the first.  The routines above name their MSR at assembly time; these do not.
+ *
+ *     uint64_t fk_rdmsr(int32_t msr);                  msr EDI, result RAX
+ *     void     fk_wrmsr(int32_t msr, uint64_t value);  msr EDI, value RSI
+ *
+ * Both are #GP on a register the part does not implement, and WRMSR is #GP on a
+ * reserved bit as well; neither checks, because CPUID is the only way to know
+ * and only the caller knows which leaf answers for its register.
+ */
+	.globl	fk_rdmsr
+	.type	fk_rdmsr, @function
+fk_rdmsr:
+	movl	%edi, %ecx
+	rdmsr				/* -> edx:eax, each zero-extended */
+	shlq	$32, %rdx
+	orq	%rdx, %rax
+	ret
+	.size	fk_rdmsr, . - fk_rdmsr
+
+	.globl	fk_wrmsr
+	.type	fk_wrmsr, @function
+fk_wrmsr:
+	movl	%edi, %ecx
+	movq	%rsi, %rdx
+	shrq	$32, %rdx		/* high half; %esi still holds the low */
+	movl	%esi, %eax
+	wrmsr
+	ret
+	.size	fk_wrmsr, . - fk_wrmsr
+
 	.section .note.GNU-stack, "", @progbits

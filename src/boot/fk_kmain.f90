@@ -18,13 +18,20 @@ module fk_kmain_m
                                          c_null_char, c_funloc
   use fk_serial_m, only: FK_SERIAL_COM1, serial_init, serial_print_string, &
                          serial_print_hex
+  use fk_panic_m,  only: panic_code
+  use fk_lapic_m,  only: lapic_init, lapic_msr_base, lapic_msr_enabled, &
+                         lapic_lint0_extint, lapic_lint1_nmi, &
+                         LVT_DM_EXTINT, LVT_DM_NMI, &
+                         lapic_id, lapic_version, lapic_svr, &
+                         lapic_lvt_lint0, lapic_lvt_lint1
   use fk_gdt_m,    only: gdt_init
   use fk_tss_m,    only: tss_init
   use fk_idt_m,    only: idt_init, fk_irq_spurious, idt_set_panic_colors
   use fk_pic_m,    only: pic_remap, pic_unmask, pic_imr
   use fk_pit_m,    only: FK_PIT_HZ, FK_PIT_IRQ, pit_init, fk_tick_count, &
                          fk_first_rip, fk_first_rflags
-  use fk_pmm_m,    only: FK_PMM_PAGE_SIZE, FK_PMM_OK, FK_PMM_E_UNALIGNED, &
+  use fk_pmm_m,    only: FK_PMM_FRONT_EFI, pmm_front_end, &
+                         FK_PMM_PAGE_SIZE, FK_PMM_OK, FK_PMM_E_UNALIGNED, &
                          FK_PMM_E_LOCKED, FK_PMM_E_DOUBLE_FREE, &
                          pmm_init, pmm_alloc_page, pmm_free_page, &
                          pmm_total_pages, pmm_free_pages, pmm_ignored_bytes, &
@@ -49,6 +56,7 @@ module fk_kmain_m
                          vmm_section_start, vmm_section_end, vmm_section_flags, &
                          vmm_guard_page, vmm_phys_to_virt, &
                          FK_VMM_MMIO, FK_VMM_HEAP, FK_VMM_WC, &
+                         FK_VMM_UC, FK_VMM_LAPIC, vmm_reserved_holes, &
                          vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, &
                          vmm_read_pat
   use fk_sched_m,  only: FK_SCHED_MAX, fk_task_runs, fk_sched_switches, &
@@ -117,6 +125,39 @@ module fk_kmain_m
   ! and each PASS line has a FAIL twin that the gate REJECTS -- a verdict the
   ! gate does not refuse is a verdict the kernel is free to get wrong.
   character(kind=c_char, len=*), parameter :: FK_NL = FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PMM_FRONT_EFI_MSG = &
+       "Fortran Kernel: PMM front end is the UEFI GetMemoryMap array " // &
+       "(Multiboot2 tag 17)." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PMM_FRONT_MB2_MSG = &
+       "Fortran Kernel: PMM front end is the Multiboot2 memory map (tag 6)." // &
+       FK_CRLF // c_null_char
+  ! 0xFF, the conventional spurious vector.  NOT installed in the IDT: every
+  ! LVT is masked and nothing routes through the LAPIC yet, so it cannot be
+  ! delivered.  Unmasking anything here without installing it first is a #GP.
+  integer(c_int32_t), parameter :: FK_LAPIC_SPURIOUS = 255_c_int32_t
+  character(kind=c_char, len=*), parameter :: FK_LAPIC_START = &
+       "Fortran Kernel: LAPIC bring-up from IA32_APIC_BASE (roadmap 3.3)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_LAPIC_MSR = &
+       "Fortran Kernel: LAPIC MSR base/enabled 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_LAPIC_OFF = &
+       "Fortran Kernel: LAPIC is DISABLED in IA32_APIC_BASE; not mapped." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_LAPIC_MAP_BAD = &
+       "Fortran Kernel: LAPIC mapping FAILED, status 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_LAPIC_HOLES = &
+       "Fortran Kernel: MMIO apertures punched out of the linear map, " // &
+       "holes 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_LAPIC_LIVE = &
+       "Fortran Kernel: LAPIC id/version/SVR 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_LAPIC_LINT = &
+       "Fortran Kernel: LAPIC LINT0/LINT1 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_LAPIC_MASKED = &
+       "Fortran Kernel: LAPIC software-enabled, LINT0 ExtINT, LINT1 NMI." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_LAPIC_BAD = &
+       "Fortran Kernel: LAPIC FAILED its own readback." // &
+       FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PMM_START = &
        "Fortran Kernel: PMM parsing the Multiboot2 memory map (roadmap 3.4)." // &
        FK_CRLF // c_null_char
@@ -150,10 +191,10 @@ module fk_kmain_m
        "Fortran Kernel: PMM did NOT lock the kernel image out." // &
        FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PMM_ALLOC_OK = &
-       "Fortran Kernel: PMM allocated 5 contiguous frames." // &
+       "Fortran Kernel: PMM allocated 5 distinct, aligned frames." // &
        FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PMM_ALLOC_BAD = &
-       "Fortran Kernel: PMM allocation is NOT contiguous." // &
+       "Fortran Kernel: PMM allocation FAILED: repeated or misaligned frame." // &
        FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PMM_RECLAIM_OK = &
        "Fortran Kernel: PMM freed and reclaimed the same 5 frames." // &
@@ -231,6 +272,8 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_TRIGGER_IDMAP = &
        "Fortran Kernel: reading physical 0x100000 with no identity map " // &
        "(roadmap 1.2b)." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PANIC_REASON = &
+       "unrecoverable: roadmap 1.4 software panic path" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_TRIGGER_WP = &
        "Fortran Kernel: writing to .text, which only CR0.WP refuses " // &
        "(roadmap 3.5)." // FK_CRLF // c_null_char
@@ -541,6 +584,12 @@ module fk_kmain_m
   ! the entire content of the milestone.
   integer(c_int32_t), parameter :: FK_FAULT_NONE = -5_c_int32_t
 
+  ! Roadmap 1.4: a SOFTWARE panic.  Every other value here reaches the dump
+  ! by making the CPU fault, because a register dump is only evidence if the
+  ! registers are real.  This one deliberately does not: it is the path a
+  ! subsystem takes when it has nothing to report but a reason.
+  integer(c_int32_t), parameter :: FK_FAULT_PANIC = -6_c_int32_t
+
   ! How many ticks past the starting count the proof loop waits for.  ONE would
   ! be satisfied by a kernel that never sends an EOI: the 8259 delivers a first
   ! interrupt and then holds its in-service bit forever, so "it ticked once" and
@@ -648,9 +697,10 @@ contains
   subroutine pmm_verify(mbi)
     implicit none
     integer(c_int64_t), intent(in) :: mbi
-    integer(c_int32_t) :: i, n, t
+    integer(c_int32_t) :: i, j, n, t
     integer(c_int64_t) :: b, l, base
     integer(c_int64_t) :: pg(FK_PMM_TEST_PAGES), again(FK_PMM_TEST_PAGES)
+    integer(c_int64_t) :: held(FK_PMM_CURSOR_PAGES)
     logical :: ok
 
     call serial_print_string(FK_PMM_HEADER)
@@ -712,10 +762,18 @@ contains
        call serial_print_string(FK_PMM_ALLOC)
        call serial_print_hex(pg(i), 16_c_int32_t)
        call serial_print_string(FK_NL)
+       ! WHAT THE ALLOCATOR ACTUALLY PROMISES: a distinct, page-aligned frame
+       ! that was free.  NOT contiguity -- first-fit returns adjacent frames
+       ! only where the map leaves adjacent frames free, which is a fact about
+       ! the firmware and not about pmm_alloc_page.  The UEFI map puts
+       ! LoaderData at 0x1000 and again across 0x3000..0xC000, so the first five
+       ! frames it yields are 2, 12, 13, 14, 15 -- correct, and not contiguous.
        if (pg(i) == 0_c_int64_t) ok = .false.
-       if (i > 1_c_int32_t) then
-          if (pg(i) /= pg(i - 1_c_int32_t) + FK_PMM_PAGE_SIZE) ok = .false.
-       end if
+       if (iand(pg(i), FK_PMM_PAGE_SIZE - 1_c_int64_t) /= 0_c_int64_t) &
+            ok = .false.
+       do j = 1_c_int32_t, i - 1_c_int32_t
+          if (pg(j) == pg(i)) ok = .false.
+       end do
     end do
     if (ok) then
        call serial_print_string(FK_PMM_ALLOC_OK)
@@ -767,19 +825,22 @@ contains
     ! frames" prints PASS.  Take enough frames to move the cursor into another
     ! word first, and only then ask for the first one back.
     ok = .true.
-    base = pmm_alloc_page()
+    held(1) = pmm_alloc_page()
+    base = held(1)
     if (base == 0_c_int64_t) ok = .false.
     do i = 2_c_int32_t, FK_PMM_CURSOR_PAGES
-       if (pmm_alloc_page() == 0_c_int64_t) ok = .false.
+       held(i) = pmm_alloc_page()
+       if (held(i) == 0_c_int64_t) ok = .false.
     end do
     if (pmm_free_page(base) /= FK_PMM_OK) ok = .false.
     if (pmm_alloc_page() /= base) ok = .false.
-    ! Hand the block back.  The addresses are computed rather than remembered:
-    ! they are contiguous, which the verdict above has already established, and
-    ! if they are not then these frees refuse and this verdict fails too.
-    do i = 0_c_int32_t, FK_PMM_CURSOR_PAGES - 1_c_int32_t
-       if (pmm_free_page(base + int(i, c_int64_t) * FK_PMM_PAGE_SIZE) &
-           /= FK_PMM_OK) ok = .false.
+    ! The addresses are REMEMBERED, not computed from base.  A first-fit walk
+    ! over 96 frames is contiguous only where the map leaves 96 free frames in
+    ! a row: the UEFI map fragments the low region, so a computed address lands
+    ! on a locked frame and the free refuses -- failing a verdict about the
+    ! scan cursor for a reason that has nothing to do with the cursor.
+    do i = 1_c_int32_t, FK_PMM_CURSOR_PAGES
+       if (pmm_free_page(held(i)) /= FK_PMM_OK) ok = .false.
     end do
     if (ok) then
        call serial_print_string(FK_PMM_CURSOR_OK)
@@ -1498,6 +1559,81 @@ contains
                           fb_pixel_pack(i, i, 0_c_int32_t))
   end subroutine fb_test_bar
 
+  ! roadmap 3.3.  The base comes from IA32_APIC_BASE and NOT from the MADT:
+  ! bits 51:12 carry it and bit 11 is the global enable, with no ACPI involved
+  ! for the boot processor's own LAPIC.
+  subroutine lapic_bringup()
+    implicit none
+    integer(c_int64_t) :: base
+    integer(c_int32_t) :: st
+
+    call serial_print_string(FK_LAPIC_START)
+    base = lapic_msr_base()
+    call serial_print_string(FK_LAPIC_MSR)
+    call serial_print_hex(base, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(lapic_msr_enabled(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    if (lapic_msr_enabled() == 0_c_int32_t) then
+       call serial_print_string(FK_LAPIC_OFF)
+       return
+    end if
+
+    st = vmm_map_mmio(FK_VMM_LAPIC, base, FK_PMM_PAGE_SIZE, FK_VMM_UC)
+    if (st /= FK_VMM_OK) then
+       call serial_print_string(FK_LAPIC_MAP_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    call serial_print_string(FK_LAPIC_HOLES)
+    call serial_print_hex(int(vmm_reserved_holes(), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call lapic_init(FK_VMM_LAPIC, FK_LAPIC_SPURIOUS)
+
+    ! Every number below is READ BACK OFF THE CHIP through the uncached
+    ! mapping, not remembered from what was written -- the same rule fk_pic_m
+    ! applies to the IMR.
+    call serial_print_string(FK_LAPIC_LIVE)
+    call serial_print_hex(int(lapic_id(FK_VMM_LAPIC), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(lapic_version(FK_VMM_LAPIC), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(lapic_svr(FK_VMM_LAPIC), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! AND PUT LINT0 BACK, deliberately.  Software-enabling the LAPIC moves the
+    ! 8259 off the CPU's own INTR pin and onto LINT0, so the masked LINT0 that
+    ! lapic_init leaves behind stops IRQ0 dead -- the timer stops, and with it
+    ! the scheduler.  Until an IOAPIC exists (roadmap 4.1) this kernel's only
+    ! interrupt source is the 8259, so ExtINT is the correct state and not a
+    ! concession.  Found by booting: the gate caught the hang.
+    call lapic_lint0_extint(FK_VMM_LAPIC)
+
+    ! And LINT1 as NMI, for the reason 3.2.5 armed an IST at all: a masked
+    ! NMI line makes IST2 unreachable, and an NMI that is never delivered
+    ! looks exactly like hardware that never raised one.
+    call lapic_lint1_nmi(FK_VMM_LAPIC)
+
+    call serial_print_string(FK_LAPIC_LINT)
+    call serial_print_hex(int(lapic_lvt_lint0(FK_VMM_LAPIC), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(lapic_lvt_lint1(FK_VMM_LAPIC), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! LINT1 masked is still the assertion; LINT0 must now read ExtINT.
+    if (iand(lapic_svr(FK_VMM_LAPIC), 256_c_int32_t) /= 0_c_int32_t .and. &
+        lapic_lvt_lint0(FK_VMM_LAPIC) == LVT_DM_EXTINT .and. &
+        lapic_lvt_lint1(FK_VMM_LAPIC) == LVT_DM_NMI) then
+       call serial_print_string(FK_LAPIC_MASKED)
+    else
+       call serial_print_string(FK_LAPIC_BAD)
+    end if
+  end subroutine lapic_bringup
+
   function irq_bringup() result(status)
     implicit none
     integer(c_int32_t) :: status
@@ -1645,6 +1781,11 @@ contains
     call serial_print_string(FK_PMM_START)
     status = pmm_init(mbi)
     if (status == FK_PMM_OK) then
+       if (pmm_front_end() == FK_PMM_FRONT_EFI) then
+          call serial_print_string(FK_PMM_FRONT_EFI_MSG)
+       else
+          call serial_print_string(FK_PMM_FRONT_MB2_MSG)
+       end if
        call pmm_verify(mbi)
     else
        call serial_print_string(FK_PMM_INIT_FAILED)
@@ -1680,6 +1821,13 @@ contains
        call serial_print_string(FK_NL)
     end if
 
+    ! The LAPIC page must come out of the linear map BEFORE the linear map is
+    ! built, for the reason the framebuffer did: 0xFEE00000 is below top-of-RAM
+    ! on this machine, so the physmap would otherwise cover it write-back and
+    ! two memory types for one physical page is undefined (SDM Vol.3 11.12.4).
+    ! Only the reservation happens here; the mapping needs the tables to exist.
+    call vmm_reserve_mmio(lapic_msr_base(), FK_PMM_PAGE_SIZE)
+
     ! The VMM (roadmap 3.5) and the higher-half handoff (roadmap 1.2b).  AFTER
     ! the PMM, which dereferences the loader's structure through the identity
     ! window this step takes away, and after pmm_verify, which hands the
@@ -1705,6 +1853,8 @@ contains
     ! roadmap 3.2b.  After the handoff, and before the deliberate fault: every
     ! FK_FAULT_MODE build runs with interrupts live from here on, so the tick
     ! proof rides on all of them the way 3.4's and 3.5's verdicts do.
+    call lapic_bringup()
+
     irq_status = irq_bringup()
 
     ! Needs a running clock, so it comes after the timer is live.
@@ -1743,6 +1893,8 @@ contains
     else if (FK_FAULT_MODE == FK_FAULT_IDMAP) then
        call serial_print_string(FK_TRIGGER_IDMAP)
        fk_probe = fk_peek64(FK_PHYS_1MIB)
+    else if (FK_FAULT_MODE == FK_FAULT_PANIC) then
+       call panic_code(FK_PANIC_REASON, int(z'1400', c_int64_t))
     else if (FK_FAULT_MODE == FK_FAULT_WP) then
        call serial_print_string(FK_TRIGGER_WP)
        call fk_poke64(fk_text_start(), 0_c_int64_t)

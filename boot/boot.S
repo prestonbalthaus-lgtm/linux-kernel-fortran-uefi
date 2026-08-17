@@ -489,6 +489,15 @@ fk_cpu_halt:
 	jmp	1b			/* an NMI/SMI can wake HLT; re-park */
 	.size fk_cpu_halt, . - fk_cpu_halt
 
+/* fk_cli -- mask interrupts without parking.  The panic path needs the two    */
+/* separated: it must quiesce the CPU, then still run far enough to report.    */
+	.globl fk_cli
+	.type fk_cli, @function
+fk_cli:
+	cli
+	ret
+	.size fk_cli, . - fk_cli
+
 /* ------------------------------------------------------------------------ */
 /* Read-only data: the 64-bit GDT                                            */
 /* ------------------------------------------------------------------------ */

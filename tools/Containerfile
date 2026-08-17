@@ -21,7 +21,8 @@
 FROM fedora:44
 RUN dnf -y install --setopt=install_weak_deps=False \
         gcc gcc-gfortran make binutils diffutils findutils \
-        grub2-tools grub2-tools-extra grub2-pc-modules xorriso mtools \
+        grub2-tools grub2-tools-extra grub2-pc-modules grub2-efi-x64-modules \
+        xorriso mtools \
         python3 \
     && dnf clean all
 WORKDIR /work

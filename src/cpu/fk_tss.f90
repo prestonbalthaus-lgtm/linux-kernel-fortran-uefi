@@ -10,12 +10,19 @@ module fk_tss_m
   use fk_gdt_m, only: FK_GDT_SEL_TSS, gdt_set_tss
   implicit none
   private
-  public :: FK_TSS_IST_DF, tss_init, tss_on_df_stack, tss_set_rsp0
+  public :: FK_TSS_IST_DF, FK_TSS_IST_NMI, tss_init, tss_on_df_stack, &
+            tss_on_nmi_stack, tss_set_rsp0
 
   ! The IST index the #DF gate descriptor carries.  1..7 select ist1..ist7; 0
   ! means "keep the faulting stack", which for #DF is the one thing that must
   ! not happen.
   integer(c_int32_t), parameter :: FK_TSS_IST_DF = 1_c_int32_t
+
+  ! IST2, for NMI (roadmap 3.3).  An NMI can arrive on any instruction --
+  ! including inside a handler that is mid-way through building a frame --
+  ! so it needs a stack that is known-good regardless of what RSP held.
+  ! Nothing raises one today; the LAPIC is what makes that stop being true.
+  integer(c_int32_t), parameter :: FK_TSS_IST_NMI = 2_c_int32_t
 
   ! The TSS, in 32-bit halves.  NOT one field per architectural quadword: RSP0
   ! sits at offset 4, and the C struct rules that bind(c) follows would align a
@@ -52,7 +59,8 @@ module fk_tss_m
   ! arrives zeroed.  There is no guard page below it -- that needs the VMM at
   ! roadmap 3.5, and until then a runaway panic handler walks into whatever
   ! .bss put underneath.
-  integer(c_int32_t), parameter :: FK_DF_STACK_QWORDS = 1024_c_int32_t
+  integer(c_int32_t), parameter :: FK_DF_STACK_QWORDS  = 1024_c_int32_t
+  integer(c_int32_t), parameter :: FK_NMI_STACK_QWORDS = 1024_c_int32_t
 
   ! bind(c) on both, for the same reason fk_boot_sentinel has it: the readers
   ! that matter are OUTSIDE the program.  tools/qmp-sentinel.py compares the
@@ -61,11 +69,15 @@ module fk_tss_m
   ! the linked image.  Neither can be written against a gfortran-mangled name.
   integer(c_int64_t), target, bind(c, name="fk_df_stack") :: &
        df_stack(FK_DF_STACK_QWORDS)
+  integer(c_int64_t), target, bind(c, name="fk_nmi_stack") :: &
+       nmi_stack(FK_NMI_STACK_QWORDS)
   type(fk_tss_t), target, bind(c, name="fk_tss") :: tss
 
   ! Bounds of the stack IST1 points into, kept for tss_on_df_stack.
   integer(c_int64_t), save :: df_lo = 0_c_int64_t
   integer(c_int64_t), save :: df_hi = 0_c_int64_t
+  integer(c_int64_t), save :: nmi_lo = 0_c_int64_t
+  integer(c_int64_t), save :: nmi_hi = 0_c_int64_t
 
   interface
     ! LTR.  boot/gdt_flush.S: needs the GDT loaded and the descriptor already
@@ -104,6 +116,12 @@ contains
 
     tss%ist1_lo = u32(df_hi)
     tss%ist1_hi = u32(ishft(df_hi, -32))
+
+    nmi_lo = transfer(c_loc(nmi_stack), 0_c_int64_t)
+    nmi_hi = iand(nmi_lo + 8_c_int64_t * int(FK_NMI_STACK_QWORDS, c_int64_t), &
+                  not(15_c_int64_t))
+    tss%ist2_lo = u32(nmi_hi)
+    tss%ist2_hi = u32(ishft(nmi_hi, -32))
 
     ! Past the segment limit, so ring 3 gets no I/O permission bitmap and every
     ! IN/OUT it attempts faults.  Nothing runs in ring 3 until roadmap 7.1;
@@ -144,6 +162,19 @@ contains
     tss%rsp0_lo = u32(addr)
     tss%rsp0_hi = u32(ishft(addr, -32))
   end subroutine tss_set_rsp0
+
+  function tss_on_nmi_stack(addr) result(inside) &
+       bind(c, name="tss_on_nmi_stack")
+    implicit none
+    integer(c_int64_t), intent(in), value :: addr
+    integer(c_int32_t) :: inside
+
+    if (addr >= nmi_lo .and. addr < nmi_hi) then
+       inside = 1_c_int32_t
+    else
+       inside = 0_c_int32_t
+    end if
+  end function tss_on_nmi_stack
 
   function tss_on_df_stack(addr) result(inside) bind(c, name="tss_on_df_stack")
     implicit none
