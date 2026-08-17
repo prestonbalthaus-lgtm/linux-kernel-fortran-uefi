@@ -62,14 +62,14 @@ POLL_INTERVAL="${FK_POLL_INTERVAL:-1}"
 # that crashed before the PMM ran satisfies neither.
 FK_PMM_PASS_LINES=$'Fortran Kernel: PMM reserved and ACPI frames are all marked used.
 Fortran Kernel: PMM locked the kernel image and the loader map out.
-Fortran Kernel: PMM allocated 5 contiguous frames.
+Fortran Kernel: PMM allocated 5 distinct, aligned frames.
 Fortran Kernel: PMM freed and reclaimed the same 5 frames.
 Fortran Kernel: PMM refused a double, unaligned and locked free.
 Fortran Kernel: PMM rewound its scan cursor to a freed frame.'
 FK_PMM_FAIL_LINES=$'Fortran Kernel: PMM init FAILED, status 0x
 Fortran Kernel: PMM reserved or ACPI frames are STILL FREE.
 Fortran Kernel: PMM did NOT lock the kernel image out.
-Fortran Kernel: PMM allocation is NOT contiguous.
+Fortran Kernel: PMM allocation FAILED: repeated or misaligned frame.
 Fortran Kernel: PMM reclaim FAILED.
 Fortran Kernel: PMM guard FAILED.
 Fortran Kernel: PMM cursor rewind FAILED.'
@@ -118,6 +118,18 @@ RWX'
 #   line in the boot still passes.
 #
 # The rest are prefixes because they carry an address or a live count.
+# roadmap 3.3.  The SVR value is spelled out: 0x1FF is the spurious vector in
+# bits 7:0 with bit 8, the software-enable, set -- an APIC that was mapped but
+# never enabled reads 0x0FF and passes a looser pattern. LINT0 masked is the
+# assertion that the legacy 8259 no longer reaches the CPU through the LAPIC.
+FK_LAPIC_PASS_LINES=$'Fortran Kernel: LAPIC MSR base/enabled 0x00000000FEE00000/0x00000001
+Fortran Kernel: LAPIC id/version/SVR 0x00000000/0x00050014/0x000001FF
+Fortran Kernel: LAPIC LINT0/LINT1 0x00000700/0x00010000
+Fortran Kernel: LAPIC is software-enabled, LINT0 forwards the 8259.'
+FK_LAPIC_FAIL_LINES=$'Fortran Kernel: LAPIC is DISABLED in IA32_APIC_BASE; not mapped.
+Fortran Kernel: LAPIC mapping FAILED, status 0x
+Fortran Kernel: LAPIC FAILED its own readback.'
+
 FK_IRQ_PASS_LINES=$'Fortran Kernel: PIT channel 0 hz/divisor 0x00000064/0x00002E9C.
 Fortran Kernel: 8259 IMR now 0x0000FFFE, IRQ0 is the only line open.
 Fortran Kernel: RFLAGS.IF is set, the CPU is interruptible, RFLAGS = 0x
@@ -204,6 +216,11 @@ Fortran Kernel: heap FAILED its own consistency walk, faults 0x'
 # Everything else -- the sentinel, the PMM, the VMM, the heap, the scheduler and
 # the timer -- is asserted on the UEFI path exactly as it is on the BIOS one.
 if [[ "${FK_FIRMWARE:-bios}" == uefi ]]; then
+  # roadmap 0.3: the assertion that the SECOND front end is the one that ran.
+  # Tag 17 exists only where the loader came up on UEFI, so this line is what
+  # separates "booted through OVMF" from "parsed the EFI map".
+  FK_PMM_PASS_LINES="$FK_PMM_PASS_LINES
+Fortran Kernel: PMM front end is the UEFI GetMemoryMap array (Multiboot2 tag 17)."
   FK_FB_PASS_LINES=""
   FK_CON_PASS_LINES=""
   FK_FB_FAIL_LINES=""
@@ -215,6 +232,9 @@ if [[ "${FK_FIRMWARE:-bios}" == uefi ]]; then
   echo "        non-video assertion still applies."
 fi
 
+[[ "${FK_FIRMWARE:-bios}" == uefi ]] || FK_PMM_PASS_LINES="$FK_PMM_PASS_LINES
+Fortran Kernel: PMM front end is the Multiboot2 memory map (tag 6)."
+
 EXPECT_SERIAL="${FK_EXPECT_SERIAL:-Fortran Kernel: UART Serial Initialized.
 $FK_PMM_PASS_LINES
 $FK_VMM_PASS_LINES
@@ -222,6 +242,7 @@ $FK_FB_PASS_LINES
 $FK_CON_PASS_LINES
 $FK_HEAP_PASS_LINES
 $FK_SCHED_PASS_LINES
+$FK_LAPIC_PASS_LINES
 $FK_IRQ_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
@@ -230,6 +251,7 @@ $FK_FB_FAIL_LINES
 $FK_CON_FAIL_LINES
 $FK_HEAP_FAIL_LINES
 $FK_SCHED_FAIL_LINES
+$FK_LAPIC_FAIL_LINES
 $FK_IRQ_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern

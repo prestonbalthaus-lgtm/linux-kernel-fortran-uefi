@@ -37,7 +37,8 @@ module fk_vmm_m
             FK_VMM_PHYSMAP, FK_VMM_SCRATCH, &
             FK_PTE_P, FK_PTE_RW, FK_PTE_PS, FK_PTE_NX, FK_PTE_ADDR, &
             FK_PTE_PWT, FK_PTE_PCD, FK_VMM_MMIO, FK_VMM_HEAP, FK_VMM_WC, &
-            vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, vmm_read_pat, &
+            vmm_reserve_mmio, vmm_reserved_holes, vmm_map_mmio, &
+            vmm_pat_arm, vmm_read_pat, FK_VMM_UC, FK_VMM_LAPIC, &
             vmm_init, vmm_activate, vmm_drop_identity, vmm_map_page, &
             vmm_translate, vmm_phys_of, vmm_pml4_phys, vmm_table_frames, &
             vmm_physmap_top, vmm_nx_enabled, vmm_verify_image, &
@@ -67,6 +68,13 @@ module fk_vmm_m
   integer(c_int64_t), parameter :: FK_VMM_WC   = ior(ior(FK_PTE_P, FK_PTE_RW), &
                                                      ior(FK_PTE_PWT, FK_PTE_NX))
 
+  ! PAT index 3 -- PCD and PWT together -- which boot/mmu.S leaves at 0x00,
+  ! strong UC.  The LAPIC must be strongly uncacheable (SDM Vol.3 11.4.1); UC-
+  ! at index 2 would let an MTRR promote it to something weaker.
+  integer(c_int64_t), parameter :: FK_VMM_UC   = ior(ior(FK_PTE_P, FK_PTE_RW), &
+                                                     ior(ior(FK_PTE_PWT, FK_PTE_PCD), &
+                                                         FK_PTE_NX))
+
   ! PML4[256].  The canonical hole starts at bit 47, so this is the lowest
   ! address in the upper half and leaves the whole top 2 GiB to the kernel.
   integer(c_int64_t), parameter :: FK_VMM_PHYSMAP = int(z'FFFF800000000000', c_int64_t)
@@ -80,6 +88,11 @@ module fk_vmm_m
   ! reachable at two virtual addresses with two memory types is architecturally
   ! undefined (SDM Vol.3 11.12.4), not merely slow.
   integer(c_int64_t), parameter :: FK_VMM_MMIO = int(z'FFFF808000000000', c_int64_t)
+
+  ! The LAPIC's own page, in the same PML4[257] window but far clear of any
+  ! framebuffer that starts at FK_VMM_MMIO.
+  integer(c_int64_t), parameter :: FK_VMM_LAPIC = &
+       FK_VMM_MMIO + int(z'20000000', c_int64_t)
 
   ! PML4[258], the slot after the device window.  The kernel heap grows upward
   ! from here (roadmap 4.0).  A slot of its own rather than a hole inside the
@@ -108,8 +121,14 @@ module fk_vmm_m
   integer(c_int64_t), save :: guard_page = 0_c_int64_t
 
   ! The physical span map_physmap must NOT cover.  See FK_VMM_MMIO.
-  integer(c_int64_t), save :: hole_base  = 0_c_int64_t
-  integer(c_int64_t), save :: hole_bytes = 0_c_int64_t
+  ! A LIST, not one span.  It held exactly one until roadmap 3.3, and one was
+  ! enough only while the framebuffer was the sole aperture: a second caller
+  ! silently OVERWROTE the first, and the physmap then kept a write-back alias
+  ! of whichever device did not win.  The LAPIC is that second caller.
+  integer(c_int32_t), parameter :: FK_VMM_MAX_HOLES = 4_c_int32_t
+  integer(c_int64_t), save :: hole_base(FK_VMM_MAX_HOLES)  = 0_c_int64_t
+  integer(c_int64_t), save :: hole_bytes(FK_VMM_MAX_HOLES) = 0_c_int64_t
+  integer(c_int32_t), save :: hole_count = 0_c_int32_t
 
   integer(c_int64_t), save :: pml4_phys   = 0_c_int64_t
   integer(c_int64_t), save :: kernel_vma  = 0_c_int64_t
@@ -727,9 +746,17 @@ contains
     implicit none
     integer(c_int64_t), intent(in) :: p
     logical :: hit
+    integer(c_int32_t) :: i
 
-    hit = hole_bytes > 0_c_int64_t .and. &
-          p < hole_base + hole_bytes .and. p + FK_VMM_SIZE_2M > hole_base
+    hit = .false.
+    do i = 1_c_int32_t, hole_count
+       if (hole_bytes(i) > 0_c_int64_t .and. &
+           p < hole_base(i) + hole_bytes(i) .and. &
+           p + FK_VMM_SIZE_2M > hole_base(i)) then
+          hit = .true.
+          return
+       end if
+    end do
   end function hits_hole
 
   !> Declare a physical span the linear map must not cover.  MUST be called
@@ -739,9 +766,22 @@ contains
     integer(c_int64_t), intent(in), value :: phys, bytes
 
     if (bytes <= 0_c_int64_t) return
-    hole_base  = round_down(phys, FK_VMM_SIZE_2M)
-    hole_bytes = round_up(phys + bytes, FK_VMM_SIZE_2M) - hole_base
+    ! Refusing beyond the last slot is deliberate: a dropped reservation is a
+    ! write-back alias nothing would report, which is the defect this list was
+    ! introduced to remove.  vmm_reserved_holes() is what a caller checks.
+    if (hole_count >= FK_VMM_MAX_HOLES) return
+    hole_count = hole_count + 1_c_int32_t
+    hole_base(hole_count)  = round_down(phys, FK_VMM_SIZE_2M)
+    hole_bytes(hole_count) = round_up(phys + bytes, FK_VMM_SIZE_2M) &
+                             - hole_base(hole_count)
   end subroutine vmm_reserve_mmio
+
+  function vmm_reserved_holes() result(n) bind(c, name="vmm_reserved_holes")
+    implicit none
+    integer(c_int32_t) :: n
+
+    n = hole_count
+  end function vmm_reserved_holes
 
   !> Map BYTES of physical device memory at VIRT, 4 KiB at a time.  Page
   !! granularity rather than 2 MiB: an aperture is rarely a whole number of

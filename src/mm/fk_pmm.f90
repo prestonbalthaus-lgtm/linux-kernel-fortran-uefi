@@ -23,12 +23,17 @@
 ! rather than silently dropped, because a PMM that quietly forgets a third of
 ! the machine's RAM is indistinguishable from one that works.
 module fk_pmm_m
+  use fk_efi_mmap_m, only: FK_EFI_OK, FK_EFI_BAD64, FK_EFI_TYPE_CONVENTIONAL, &
+                           efi_mmap_set, efi_mmap_count, efi_mmap_base, &
+                           efi_mmap_bytes, efi_mmap_type
   use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t, c_ptr, &
                                          c_f_pointer
   implicit none
   private
   public :: FK_PMM_PAGE_SIZE, FK_PMM_MAX_PHYS, FK_PMM_MAX_REGIONS, &
             FK_PMM_IDMAP_BYTES, &
+            FK_PMM_FRONT_NONE, FK_PMM_FRONT_MB2, FK_PMM_FRONT_EFI, &
+            pmm_front_end, &
             FK_PMM_TYPE_AVAILABLE, FK_PMM_TYPE_RESERVED, FK_PMM_TYPE_ACPI, &
             FK_PMM_TYPE_NVS, FK_PMM_TYPE_BADRAM, &
             FK_PMM_OK, FK_PMM_E_MBI_NULL, FK_PMM_E_MBI_ALIGN, &
@@ -81,6 +86,23 @@ module fk_pmm_m
 
   integer(c_int32_t), parameter :: MB2_TAG_END  = 0_c_int32_t
   integer(c_int32_t), parameter :: MB2_TAG_MMAP = 6_c_int32_t
+  ! Tag 17 is the array GetMemoryMap() returned, passed straight through by
+  ! a loader that came up on UEFI.  Present ONLY on that path: a BIOS boot of
+  ! the same image carries tag 6 and no 17, which is what makes the choice
+  ! below a fact about the firmware rather than a build-time switch.
+  integer(c_int32_t), parameter :: MB2_TAG_EFI_MMAP = 17_c_int32_t
+
+  integer(c_int32_t), parameter :: FK_PMM_FRONT_NONE = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_PMM_FRONT_MB2  = 1_c_int32_t
+  integer(c_int32_t), parameter :: FK_PMM_FRONT_EFI  = 2_c_int32_t
+
+  ! EFI types worth keeping apart once mapped onto this module's codes.
+  ! Everything not named here is RESERVED, which is the conservative answer:
+  ! LoaderData holds the kernel and the boot info, and BootServices memory is
+  ! reclaimable in principle but not by a kernel that never called
+  ! ExitBootServices itself.
+  integer(c_int32_t), parameter :: EFI_TYPE_ACPI_RECLAIM = 9_c_int32_t
+  integer(c_int32_t), parameter :: EFI_TYPE_ACPI_NVS     = 10_c_int32_t
 
   ! pmm_init failures.  Distinct values because "the PMM did not come up" is
   ! never a useful thing to print on a console that has one line to say it in.
@@ -120,6 +142,7 @@ module fk_pmm_m
   integer(c_int64_t), save :: reg_len(FK_PMM_MAX_REGIONS)
   integer(c_int32_t), save :: reg_type(FK_PMM_MAX_REGIONS)
   integer(c_int32_t), save :: reg_count = 0_c_int32_t
+  integer(c_int32_t), save :: front_end = FK_PMM_FRONT_NONE
 
   integer(c_int64_t), save :: ram_pages    = 0_c_int64_t
   integer(c_int64_t), save :: free_count   = 0_c_int64_t
@@ -352,6 +375,7 @@ contains
     end do
     ready      = .false.
     reg_count  = 0_c_int32_t
+    front_end  = FK_PMM_FRONT_NONE
     ram_pages  = 0_c_int64_t
     free_count = 0_c_int64_t
     ignored    = 0_c_int64_t
@@ -364,9 +388,8 @@ contains
     integer(c_int64_t), intent(in) :: mbi_phys
     integer(c_int32_t) :: status
     type(c_ptr) :: p
-    integer(c_int64_t) :: total, base, length, first, last
-    integer(c_int32_t) :: off, mmap_off, tag_type, tag_size, ent_size, i, w
-    integer(c_int32_t) :: rtype
+    integer(c_int64_t) :: total, first, last
+    integer(c_int32_t) :: off, mmap_off, efi_off, tag_type, tag_size, i, w
 
     ! EVERY BIT SET FIRST, AND THIS IS NOT A FORMALITY.  .bss arrives zeroed,
     ! which for this bitmap means "the whole address space is free RAM": ACPI
@@ -383,6 +406,7 @@ contains
     free_count = 0_c_int64_t
     ignored    = 0_c_int64_t
     cursor     = 1_c_int32_t
+    front_end  = FK_PMM_FRONT_NONE
     mbi_lo     = 0_c_int64_t
     mbi_hi     = 0_c_int64_t
     kern_lo    = fk_kernel_phys_start()
@@ -426,6 +450,7 @@ contains
     ! malformed input that turns this walk into an infinite loop or a read past
     ! the end of the structure.
     mmap_off = -1_c_int32_t
+    efi_off  = -1_c_int32_t
     off = 8_c_int32_t
     do while (int(off, c_int64_t) + 8_c_int64_t <= total)
        tag_type = int(mbi_u32(off), c_int32_t)
@@ -436,52 +461,25 @@ contains
           return
        end if
        if (tag_type == MB2_TAG_END) exit
-       if (tag_type == MB2_TAG_MMAP) mmap_off = off
+       if (tag_type == MB2_TAG_MMAP)     mmap_off = off
+       if (tag_type == MB2_TAG_EFI_MMAP) efi_off  = off
        off = off + iand(tag_size + 7_c_int32_t, not(7_c_int32_t))
     end do
 
-    if (mmap_off < 0_c_int32_t) then
+    ! THE FRONT END IS CHOSEN BY WHAT THE LOADER ACTUALLY PROVIDED, and tag 17
+    ! wins where both exist: on the UEFI path tag 6 is GRUB's own summary of the
+    ! EFI map, and the EFI map is the original.
+    if (efi_off >= 0_c_int32_t) then
+       status = collect_efi(efi_off)
+       front_end = FK_PMM_FRONT_EFI
+    else if (mmap_off >= 0_c_int32_t) then
+       status = collect_mb2(mmap_off)
+       front_end = FK_PMM_FRONT_MB2
+    else
        status = FK_PMM_E_NO_MMAP
        return
     end if
-
-    ! entry_size is READ, never assumed to be 24: the specification reserves the
-    ! right to grow the entry, and a future loader that does would otherwise be
-    ! parsed with every field one stride out of place.
-    tag_size = int(mbi_u32(mmap_off + 4_c_int32_t), c_int32_t)
-    ent_size = int(mbi_u32(mmap_off + 8_c_int32_t), c_int32_t)
-    if (ent_size < 24_c_int32_t .or. iand(ent_size, 7_c_int32_t) /= 0_c_int32_t) then
-       status = FK_PMM_E_ENTRY_SIZE
-       return
-    end if
-
-    ! --- pass A: record every entry, and free the available ones ----------
-    ! The MBI is walked directly, so the number of entries this loop marks is
-    ! not bounded by the table.  Overflowing the table is fatal below, which is
-    ! what keeps the table an authoritative copy rather than a truncated one.
-    off = mmap_off + 16_c_int32_t
-    do while (int(off - mmap_off, c_int64_t) + int(ent_size, c_int64_t) <= &
-              int(tag_size, c_int64_t))
-       base   = mbi_u64(off)
-       length = mbi_u64(off + 8_c_int32_t)
-       rtype  = int(mbi_u32(off + 16_c_int32_t), c_int32_t)
-
-       if (reg_count >= FK_PMM_MAX_REGIONS) then
-          status = FK_PMM_E_TOO_MANY
-          return
-       end if
-       reg_count = reg_count + 1_c_int32_t
-       reg_base(reg_count) = base
-       reg_len(reg_count)  = length
-       reg_type(reg_count) = rtype
-
-       if (rtype == FK_PMM_TYPE_AVAILABLE) then
-          ignored = ignored + lost_bytes(base, length)
-          if (span_inward(base, length, first, last)) &
-               ram_pages = ram_pages + bits_clear(first, last)
-       end if
-       off = off + ent_size
-    end do
+    if (status /= FK_PMM_OK) return
     free_count = ram_pages
 
     ! --- pass B: everything that is not available is used -----------------
@@ -518,6 +516,126 @@ contains
 
     status = FK_PMM_OK
   end function pmm_build
+
+  function pmm_front_end() result(w) bind(c, name="pmm_front_end")
+    implicit none
+    integer(c_int32_t) :: w
+
+    w = front_end
+  end function pmm_front_end
+
+  ! Append one region and, if it is usable RAM, free its whole frames.  Shared
+  ! by both front ends so that the two differ ONLY in how they decode firmware's
+  ! table -- the rounding, the accounting and the table itself are one decision.
+  function add_region(base, length, rtype) result(status)
+    implicit none
+    integer(c_int64_t), intent(in) :: base, length
+    integer(c_int32_t), intent(in) :: rtype
+    integer(c_int32_t) :: status
+    integer(c_int64_t) :: first, last
+
+    if (reg_count >= FK_PMM_MAX_REGIONS) then
+       status = FK_PMM_E_TOO_MANY
+       return
+    end if
+    reg_count = reg_count + 1_c_int32_t
+    reg_base(reg_count) = base
+    reg_len(reg_count)  = length
+    reg_type(reg_count) = rtype
+
+    if (rtype == FK_PMM_TYPE_AVAILABLE) then
+       ignored = ignored + lost_bytes(base, length)
+       if (span_inward(base, length, first, last)) &
+            ram_pages = ram_pages + bits_clear(first, last)
+    end if
+    status = FK_PMM_OK
+  end function add_region
+
+  ! Multiboot2 tag 6.  entry_size is READ, never assumed to be 24: the
+  ! specification reserves the right to grow the entry.
+  function collect_mb2(tag_off) result(status)
+    implicit none
+    integer(c_int32_t), intent(in) :: tag_off
+    integer(c_int32_t) :: status
+    integer(c_int32_t) :: off, tag_size, ent_size, rtype
+    integer(c_int64_t) :: base, length
+
+    tag_size = int(mbi_u32(tag_off + 4_c_int32_t), c_int32_t)
+    ent_size = int(mbi_u32(tag_off + 8_c_int32_t), c_int32_t)
+    if (ent_size < 24_c_int32_t .or. iand(ent_size, 7_c_int32_t) /= 0_c_int32_t) then
+       status = FK_PMM_E_ENTRY_SIZE
+       return
+    end if
+
+    off = tag_off + 16_c_int32_t
+    do while (int(off - tag_off, c_int64_t) + int(ent_size, c_int64_t) <= &
+              int(tag_size, c_int64_t))
+       base   = mbi_u64(off)
+       length = mbi_u64(off + 8_c_int32_t)
+       rtype  = int(mbi_u32(off + 16_c_int32_t), c_int32_t)
+       status = add_region(base, length, rtype)
+       if (status /= FK_PMM_OK) return
+       off = off + ent_size
+    end do
+    status = FK_PMM_OK
+  end function collect_mb2
+
+  ! Multiboot2 tag 17 -- the EFI_MEMORY_DESCRIPTOR array GetMemoryMap() returned
+  ! (roadmap 0.3).  The header is type/size/descriptor_size/descriptor_version
+  ! and the array follows at +16.  The STRIDE comes from the tag and is not
+  ! sizeof(descriptor): real OVMF reports 48 against 40 bytes of fields, so a
+  ! parser that assumed the struct size would desynchronise on descriptor 1.
+  ! fk_efi_mmap_m owns that decoding; this function only maps its types onto the
+  ! codes the rest of the PMM already speaks.
+  function collect_efi(tag_off) result(status)
+    implicit none
+    integer(c_int32_t), intent(in) :: tag_off
+    integer(c_int32_t) :: status
+    integer(c_int32_t) :: tag_size, dver, i, n, etype, rtype
+    integer(c_int64_t) :: dsize, abytes, base, length
+    type(c_ptr) :: arr
+
+    tag_size = int(mbi_u32(tag_off + 4_c_int32_t), c_int32_t)
+    if (int(tag_size, c_int64_t) < 16_c_int64_t) then
+       status = FK_PMM_E_TAG_OVERRUN
+       return
+    end if
+    dsize  = mbi_u32(tag_off + 8_c_int32_t)
+    dver   = int(mbi_u32(tag_off + 12_c_int32_t), c_int32_t)
+    abytes = int(tag_size, c_int64_t) - 16_c_int64_t
+    arr    = transfer(mbi_lo + int(tag_off, c_int64_t) + 16_c_int64_t, arr)
+
+    if (efi_mmap_set(arr, abytes, dsize, dver) /= FK_EFI_OK) then
+       status = FK_PMM_E_ENTRY_SIZE
+       return
+    end if
+
+    n = efi_mmap_count()
+    do i = 0_c_int32_t, n - 1_c_int32_t
+       base   = efi_mmap_base(i)
+       length = efi_mmap_bytes(i)
+       etype  = efi_mmap_type(i)
+       ! A refused byte count is a descriptor claiming more memory than an
+       ! address space holds.  Treating it as reserved keeps it out of the
+       ! allocator instead of wrapping it into a small usable region.
+       if (length == FK_EFI_BAD64) then
+          status = FK_PMM_E_ENTRY_SIZE
+          return
+       end if
+       if (etype == FK_EFI_TYPE_CONVENTIONAL) then
+          rtype = FK_PMM_TYPE_AVAILABLE
+       else if (etype == EFI_TYPE_ACPI_RECLAIM) then
+          rtype = FK_PMM_TYPE_ACPI
+       else if (etype == EFI_TYPE_ACPI_NVS) then
+          rtype = FK_PMM_TYPE_NVS
+       else
+          rtype = FK_PMM_TYPE_RESERVED
+       end if
+       status = add_region(base, length, rtype)
+       if (status /= FK_PMM_OK) return
+    end do
+    status = FK_PMM_OK
+  end function collect_efi
 
   ! First free frame, marked used.  0 means out of memory -- frame 0 is
   ! reserved by pmm_init precisely so that this cannot be mistaken for success.

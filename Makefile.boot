@@ -94,6 +94,8 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/drivers/pic/fk_pic.f90 \
                src/drivers/pit/fk_pit.f90 \
                src/cpu/fk_idt.f90 \
+               src/cpu/fk_lapic.f90 \
+               src/mm/fk_efi_mmap.f90 \
                src/mm/fk_pmm.f90 \
                src/lib/fk_string.f90 \
                src/drivers/video/fk_fbinfo.f90 \

@@ -60,8 +60,8 @@ fi
 # roadmap 3.4's six verdicts ride on EVERY case, not just the PMM ones. A
 # mutation is only attributable if everything it did not touch still holds, and
 # these lines are printed before the deliberate fault on every build.
-PMM_EXPECT=$'Fortran Kernel: PMM reserved and ACPI frames are all marked used.\nFortran Kernel: PMM locked the kernel image and the loader map out.\nFortran Kernel: PMM allocated 5 contiguous frames.\nFortran Kernel: PMM freed and reclaimed the same 5 frames.\nFortran Kernel: PMM refused a double, unaligned and locked free.\nFortran Kernel: PMM rewound its scan cursor to a freed frame.'
-PMM_REJECT=$'Fortran Kernel: PMM init FAILED, status 0x\nFortran Kernel: PMM reserved or ACPI frames are STILL FREE.\nFortran Kernel: PMM did NOT lock the kernel image out.\nFortran Kernel: PMM allocation is NOT contiguous.\nFortran Kernel: PMM reclaim FAILED.\nFortran Kernel: PMM guard FAILED.\nFortran Kernel: PMM cursor rewind FAILED.'
+PMM_EXPECT=$'Fortran Kernel: PMM reserved and ACPI frames are all marked used.\nFortran Kernel: PMM locked the kernel image and the loader map out.\nFortran Kernel: PMM allocated 5 distinct, aligned frames.\nFortran Kernel: PMM freed and reclaimed the same 5 frames.\nFortran Kernel: PMM refused a double, unaligned and locked free.\nFortran Kernel: PMM rewound its scan cursor to a freed frame.'
+PMM_REJECT=$'Fortran Kernel: PMM init FAILED, status 0x\nFortran Kernel: PMM reserved or ACPI frames are STILL FREE.\nFortran Kernel: PMM did NOT lock the kernel image out.\nFortran Kernel: PMM allocation FAILED: repeated or misaligned frame.\nFortran Kernel: PMM reclaim FAILED.\nFortran Kernel: PMM guard FAILED.\nFortran Kernel: PMM cursor rewind FAILED.'
 
 # roadmap 3.5's verdicts ride on every case for the same reason 3.4's do. The
 # last line of each is not a verdict at all: " R-X" and "RWX" are the W^X

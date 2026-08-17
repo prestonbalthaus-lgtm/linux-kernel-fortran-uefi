@@ -1,5 +1,7 @@
 TESTS                 += pmm
-FSRC_pmm              := src/mm/fk_pmm.f90
+# ORDER IS SEMANTIC: fk_pmm USEs fk_efi_mmap_m for the UEFI front end
+# (roadmap 0.3), so the .mod has to exist before fk_pmm.f90 compiles.
+FSRC_pmm              := src/mm/fk_efi_mmap.f90 src/mm/fk_pmm.f90
 DRV_pmm               := tests/mm/test_pmm.c
 
 # No ORACLE_pmm, for the same reason mk/serial.mk has none: a Multiboot2 parser
