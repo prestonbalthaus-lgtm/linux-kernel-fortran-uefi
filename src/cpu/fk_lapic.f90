@@ -12,7 +12,8 @@ module fk_lapic_m
   implicit none
   private
   public :: lapic_init, lapic_eoi, lapic_id, lapic_version, lapic_svr, &
-            lapic_lint0_extint, LVT_DM_EXTINT, &
+            lapic_lint0_extint, lapic_lint1_nmi, &
+            LVT_DM_EXTINT, LVT_DM_NMI, &
             lapic_max_lvt, &
             lapic_lvt_cmci, lapic_lvt_timer, lapic_lvt_thermal, &
             lapic_lvt_perf, lapic_lvt_lint0, lapic_lvt_lint1, lapic_lvt_error, &
@@ -43,6 +44,9 @@ module fk_lapic_m
   ! Delivery mode 111b in bits 10:8, mask bit clear: the 8259's INTR pin
   ! forwarded to the core.
   integer(c_int32_t), parameter :: LVT_DM_EXTINT = int(z'700', c_int32_t)
+  ! Delivery mode 100b, mask bit clear.  LINT1 is the NMI pin: masked, the
+  ! IST slot armed for NMI can never be reached.
+  integer(c_int32_t), parameter :: LVT_DM_NMI    = int(z'400', c_int32_t)
 
   integer(c_int32_t), parameter :: MSR_APIC_BASE  = int(z'1B', c_int32_t)
   integer(c_int32_t), parameter :: APIC_BASE_EN   = 11_c_int32_t
@@ -161,6 +165,18 @@ contains
 
     call reg_write(base, REG_LVT_LINT0, LVT_DM_EXTINT)
   end subroutine lapic_lint0_extint
+
+  ! LINT1 as the NMI source, unmasked.  lapic_init masks every LVT, which is
+  ! the right default for lines nothing is ready to take -- but NMI is not one
+  ! of those: roadmap 3.3 arms IST2 for it, and a masked LINT1 makes that slot
+  ! unreachable.  Delivered NMIs land on the emergency stack; blocked ones are
+  ! indistinguishable from hardware that never raised any.
+  subroutine lapic_lint1_nmi(base) bind(c, name="lapic_lint1_nmi")
+    implicit none
+    integer(c_int64_t), intent(in), value :: base
+
+    call reg_write(base, REG_LVT_LINT1, LVT_DM_NMI)
+  end subroutine lapic_lint1_nmi
 
   function lapic_max_lvt(base) result(n) bind(c, name="lapic_max_lvt")
     implicit none

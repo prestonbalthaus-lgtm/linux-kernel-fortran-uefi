@@ -124,8 +124,8 @@ RWX'
 # assertion that the legacy 8259 no longer reaches the CPU through the LAPIC.
 FK_LAPIC_PASS_LINES=$'Fortran Kernel: LAPIC MSR base/enabled 0x00000000FEE00000/0x00000001
 Fortran Kernel: LAPIC id/version/SVR 0x00000000/0x00050014/0x000001FF
-Fortran Kernel: LAPIC LINT0/LINT1 0x00000700/0x00010000
-Fortran Kernel: LAPIC is software-enabled, LINT0 forwards the 8259.'
+Fortran Kernel: LAPIC LINT0/LINT1 0x00000700/0x00000400
+Fortran Kernel: LAPIC software-enabled, LINT0 ExtINT, LINT1 NMI.'
 FK_LAPIC_FAIL_LINES=$'Fortran Kernel: LAPIC is DISABLED in IA32_APIC_BASE; not mapped.
 Fortran Kernel: LAPIC mapping FAILED, status 0x
 Fortran Kernel: LAPIC FAILED its own readback.'

@@ -20,7 +20,7 @@ module fk_kmain_m
                          serial_print_hex
   use fk_panic_m,  only: panic_code
   use fk_lapic_m,  only: lapic_init, lapic_msr_base, lapic_msr_enabled, &
-                         lapic_lint0_extint, &
+                         lapic_lint0_extint, lapic_lint1_nmi, &
                          lapic_id, lapic_version, lapic_svr, &
                          lapic_lvt_lint0, lapic_lvt_lint1
   use fk_gdt_m,    only: gdt_init
@@ -152,7 +152,7 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_LAPIC_LINT = &
        "Fortran Kernel: LAPIC LINT0/LINT1 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_LAPIC_MASKED = &
-       "Fortran Kernel: LAPIC is software-enabled, LINT0 forwards the 8259." // &
+       "Fortran Kernel: LAPIC software-enabled, LINT0 ExtINT, LINT1 NMI." // &
        FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_LAPIC_BAD = &
        "Fortran Kernel: LAPIC FAILED its own readback." // &
@@ -1612,6 +1612,11 @@ contains
     ! concession.  Found by booting: the gate caught the hang.
     call lapic_lint0_extint(FK_VMM_LAPIC)
 
+    ! And LINT1 as NMI, for the reason 3.2.5 armed an IST at all: a masked
+    ! NMI line makes IST2 unreachable, and an NMI that is never delivered
+    ! looks exactly like hardware that never raised one.
+    call lapic_lint1_nmi(FK_VMM_LAPIC)
+
     call serial_print_string(FK_LAPIC_LINT)
     call serial_print_hex(int(lapic_lvt_lint0(FK_VMM_LAPIC), c_int64_t), 8_c_int32_t)
     call serial_print_string(FK_PMM_SLASH)
@@ -1621,7 +1626,7 @@ contains
     ! LINT1 masked is still the assertion; LINT0 must now read ExtINT.
     if (iand(lapic_svr(FK_VMM_LAPIC), 256_c_int32_t) /= 0_c_int32_t .and. &
         lapic_lvt_lint0(FK_VMM_LAPIC) == 1792_c_int32_t .and. &
-        iand(lapic_lvt_lint1(FK_VMM_LAPIC), 65536_c_int32_t) /= 0_c_int32_t) then
+        lapic_lvt_lint1(FK_VMM_LAPIC) == 1024_c_int32_t) then
        call serial_print_string(FK_LAPIC_MASKED)
     else
        call serial_print_string(FK_LAPIC_BAD)
