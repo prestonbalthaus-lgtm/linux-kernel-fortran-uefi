@@ -88,6 +88,7 @@ LDFLAGS_KERNEL := -nostdlib -z max-page-size=0x1000 -T linker.ld
 # the chip and fk_pit_m to service line 0 -- so their .mod files have to exist
 # before it compiles.
 FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
+               src/cpu/fk_panic.f90 \
                src/cpu/fk_gdt.f90 \
                src/cpu/fk_tss.f90 \
                src/drivers/pic/fk_pic.f90 \

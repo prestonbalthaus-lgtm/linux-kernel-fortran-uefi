@@ -18,6 +18,7 @@ module fk_kmain_m
                                          c_null_char, c_funloc
   use fk_serial_m, only: FK_SERIAL_COM1, serial_init, serial_print_string, &
                          serial_print_hex
+  use fk_panic_m,  only: panic_code
   use fk_gdt_m,    only: gdt_init
   use fk_tss_m,    only: tss_init
   use fk_idt_m,    only: idt_init, fk_irq_spurious, idt_set_panic_colors
@@ -231,6 +232,8 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_TRIGGER_IDMAP = &
        "Fortran Kernel: reading physical 0x100000 with no identity map " // &
        "(roadmap 1.2b)." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PANIC_REASON = &
+       "unrecoverable: roadmap 1.4 software panic path" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_TRIGGER_WP = &
        "Fortran Kernel: writing to .text, which only CR0.WP refuses " // &
        "(roadmap 3.5)." // FK_CRLF // c_null_char
@@ -541,6 +544,12 @@ module fk_kmain_m
   ! the entire content of the milestone.
   integer(c_int32_t), parameter :: FK_FAULT_NONE = -5_c_int32_t
 
+  ! Roadmap 1.4: a SOFTWARE panic.  Every other value here reaches the dump
+  ! by making the CPU fault, because a register dump is only evidence if the
+  ! registers are real.  This one deliberately does not: it is the path a
+  ! subsystem takes when it has nothing to report but a reason.
+  integer(c_int32_t), parameter :: FK_FAULT_PANIC = -6_c_int32_t
+
   ! How many ticks past the starting count the proof loop waits for.  ONE would
   ! be satisfied by a kernel that never sends an EOI: the 8259 delivers a first
   ! interrupt and then holds its in-service bit forever, so "it ticked once" and
@@ -651,6 +660,7 @@ contains
     integer(c_int32_t) :: i, n, t
     integer(c_int64_t) :: b, l, base
     integer(c_int64_t) :: pg(FK_PMM_TEST_PAGES), again(FK_PMM_TEST_PAGES)
+    integer(c_int64_t) :: held(FK_PMM_CURSOR_PAGES)
     logical :: ok
 
     call serial_print_string(FK_PMM_HEADER)
@@ -767,19 +777,22 @@ contains
     ! frames" prints PASS.  Take enough frames to move the cursor into another
     ! word first, and only then ask for the first one back.
     ok = .true.
-    base = pmm_alloc_page()
+    held(1) = pmm_alloc_page()
+    base = held(1)
     if (base == 0_c_int64_t) ok = .false.
     do i = 2_c_int32_t, FK_PMM_CURSOR_PAGES
-       if (pmm_alloc_page() == 0_c_int64_t) ok = .false.
+       held(i) = pmm_alloc_page()
+       if (held(i) == 0_c_int64_t) ok = .false.
     end do
     if (pmm_free_page(base) /= FK_PMM_OK) ok = .false.
     if (pmm_alloc_page() /= base) ok = .false.
-    ! Hand the block back.  The addresses are computed rather than remembered:
-    ! they are contiguous, which the verdict above has already established, and
-    ! if they are not then these frees refuse and this verdict fails too.
-    do i = 0_c_int32_t, FK_PMM_CURSOR_PAGES - 1_c_int32_t
-       if (pmm_free_page(base + int(i, c_int64_t) * FK_PMM_PAGE_SIZE) &
-           /= FK_PMM_OK) ok = .false.
+    ! The addresses are REMEMBERED, not computed from base.  A first-fit walk
+    ! over 96 frames is contiguous only where the map leaves 96 free frames in
+    ! a row: the UEFI map fragments the low region, so a computed address lands
+    ! on a locked frame and the free refuses -- failing a verdict about the
+    ! scan cursor for a reason that has nothing to do with the cursor.
+    do i = 1_c_int32_t, FK_PMM_CURSOR_PAGES
+       if (pmm_free_page(held(i)) /= FK_PMM_OK) ok = .false.
     end do
     if (ok) then
        call serial_print_string(FK_PMM_CURSOR_OK)
@@ -1743,6 +1756,8 @@ contains
     else if (FK_FAULT_MODE == FK_FAULT_IDMAP) then
        call serial_print_string(FK_TRIGGER_IDMAP)
        fk_probe = fk_peek64(FK_PHYS_1MIB)
+    else if (FK_FAULT_MODE == FK_FAULT_PANIC) then
+       call panic_code(FK_PANIC_REASON, int(z'1400', c_int64_t))
     else if (FK_FAULT_MODE == FK_FAULT_WP) then
        call serial_print_string(FK_TRIGGER_WP)
        call fk_poke64(fk_text_start(), 0_c_int64_t)

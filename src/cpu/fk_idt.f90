@@ -12,7 +12,8 @@ module fk_idt_m
   use, intrinsic :: iso_c_binding, only: c_int8_t, c_int16_t, c_int32_t, &
                                          c_int64_t, c_char, c_null_char, c_loc
   use fk_gdt_m,    only: FK_GDT_SEL_CODE
-  use fk_tss_m,    only: FK_TSS_IST_DF, tss_on_df_stack
+  use fk_tss_m,    only: FK_TSS_IST_DF, FK_TSS_IST_NMI, tss_on_df_stack, &
+                         tss_on_nmi_stack
   use fk_pic_m,    only: FK_PIC1_VECTOR, FK_PIC_LINES, FK_PIC_CASCADE, &
                          pic_eoi, pic_isr
   use fk_pit_m,    only: FK_PIT_IRQ, pit_tick
@@ -59,7 +60,8 @@ module fk_idt_m
   ! #DF is the fault whose cause may be that the stack is unusable, so it is
   ! the one exception that must not be delivered on it.  fk_tss_m owns which
   ! IST slot that is; this is only the vector that asks for it.
-  integer(c_int32_t), parameter :: FK_VEC_DF = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_VEC_DF  = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_VEC_NMI = 2_c_int32_t
 
   ! The two lines an 8259 raises when a request withdraws before the CPU
   ! acknowledges it: the master's 7, and the slave's 7 -- which is line 15.
@@ -158,6 +160,12 @@ module fk_idt_m
        FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_DF_NO_IST = &
        "*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***" // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NMI_IST = &
+       "*** NMI ENTERED ON IST2 -- THE EMERGENCY STACK HELD ***" // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NMI_NO_IST = &
+       "*** NMI ENTERED ON THE INTERRUPTED STACK -- NO IST SWITCH ***" // &
        FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_UNKNOWN = &
        "Unknown Exception" // c_null_char
@@ -272,6 +280,8 @@ contains
     idt(vec)%sel      = FK_GDT_SEL_CODE
     if (vec == FK_VEC_DF) then
        idt(vec)%ist   = int(FK_TSS_IST_DF, c_int8_t)
+    else if (vec == FK_VEC_NMI) then
+       idt(vec)%ist   = int(FK_TSS_IST_NMI, c_int8_t)
     else
        idt(vec)%ist   = FK_IDT_IST_NONE
     end if
@@ -432,6 +442,18 @@ contains
           call emit(FK_DF_IST)
        else
           call emit(FK_DF_NO_IST)
+       end if
+    end if
+
+    ! Same question for NMI, and it needs asking separately: an NMI arrives on
+    ! an arbitrary instruction, so the RSP in the frame is whatever the
+    ! interrupted code held and says nothing about which stack this handler is
+    ! standing on.  Only the frame address does.
+    if (regs%int_no == int(FK_VEC_NMI, c_int64_t)) then
+       if (tss_on_nmi_stack(frame) /= 0_c_int32_t) then
+          call emit(FK_NMI_IST)
+       else
+          call emit(FK_NMI_NO_IST)
        end if
     end if
 
