@@ -47,7 +47,7 @@ FFLAGS_KERNEL := $(KFLAGS) -Wall -J$(BUILD) -I$(BUILD)
 
 # -z max-page-size=0x1000 is NOT optional and NOT a size optimisation.
 # GNU ld defaults to a 2 MiB max page size on x86-64 and pads every PT_LOAD out
-# to it; with three segments that is up to 6 MiB of zero padding around a 19 KiB
+# to it; with three segments that is up to 6 MiB of zero padding around a 68 KiB
 # kernel, and GRUB then loads all of it. linker.ld documents the flag as a
 # requirement of the script; this is where it is honoured.
 LDFLAGS_KERNEL := -nostdlib -z max-page-size=0x1000 -T linker.ld

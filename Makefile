@@ -41,8 +41,8 @@ kflags-test:
 	         FFLAGS="$(KFLAGS) -Jbuild-kflags" test
 	@echo "=== oracle match holds under the real kernel flag set ==="
 
-# Roadmap 0.1: does linker.ld lay the image out the way it claims? Links the
-# real nine modules, not a toy object.
+# Roadmap 0.1: does linker.ld lay the image out the way it claims? Links every
+# kernel module in the tree under KFLAGS, not a toy object.
 linkscript:
 	@bash tools/linkscript-test.sh
 
