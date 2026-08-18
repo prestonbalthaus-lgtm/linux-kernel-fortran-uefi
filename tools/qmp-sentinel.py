@@ -33,6 +33,9 @@ Subcommands
               models, via 'info registers' and 'info pic'
     ticks     read fk_tick_count out of the running guest TWICE and assert it
               advanced in between (roadmap 3.2b)
+    dma       read the contiguous run at the PHYSICAL base the kernel
+              published, and assert every frame carries its own tag
+              (roadmap 3.x)
     selftest  prove every assertion PASSES on synthetic good input and FAILS on
               every corrupted one -- no QEMU and no kernel required
 
@@ -141,6 +144,14 @@ HEAP_WORDS = 10
 HEAP_MAGIC = 0x4B48454150000001
 STACKS_SYMBOL = "fk_task_stacks"
 SCHED_STACK_QWORDS = 2048            # FK_SCHED_STACK_QWORDS in fk_sched.f90
+
+# roadmap 3.x. bind(c) in src/boot/fk_kmain.f90.
+# [0] magic  [1] phys base  [2] pages  [3] tag seed
+DMA_SYMBOL = "fk_dma_probe"
+DMA_WORDS = 4
+DMA_MAGIC = 0x444D4143
+DMA_PAGE = 4096
+DMA_MAX_PAGES = 64                   # a sanity ceiling on what will be read
 # The panic colours, from src/cpu/fk_idt.f90 by way of idt_set_panic_colors.
 PANIC_FG_RGB = (255, 255, 255)
 PANIC_BG_RGB = (170, 0, 0)
@@ -888,6 +899,91 @@ def do_sched(sock_path, elf, timeout, quiet, interval=0.25):
     return 0
 
 
+# --- roadmap 3.x: the DMA run, read at its PHYSICAL base ------------------
+
+def check_dma(probe, pages_raw):
+    """Return a list of (ok, description).
+
+    PROBE is the four-word fk_dma_probe.  PAGES_RAW is what pmemsave pulled
+    out of guest PHYSICAL memory starting at the base the kernel published --
+    an address no page table was consulted to reach.
+
+    THIS IS THE ONLY FORM THE CONTIGUITY ASSERTION CAN TAKE.  The kernel's
+    bitmap can say a run of frames is adjacent, and a bitmap that is simply
+    wrong says exactly the same thing.  The kernel wrote one word into each
+    frame of the run, derived from that frame's own index, through the linear
+    map.  Reading them back in order at a single physical base means the
+    frames really are adjacent in DRAM -- there is no mapping in the way that
+    could be making them look adjacent when they are not.
+    """
+    out = []
+    magic, base, pages, seed = probe
+
+    out.append((magic == DMA_MAGIC,
+                f"fk_dma_probe magic is 0x{magic:016X} "
+                f"(want 0x{DMA_MAGIC:016X}: dma_bringup ran)"))
+    out.append((base != 0,
+                f"the run's physical base is 0x{base:X} "
+                "(0 would mean pmm_alloc_contiguous refused)"))
+    out.append((base % DMA_PAGE == 0,
+                f"the base is frame aligned (0x{base:X} & 0xFFF == "
+                f"0x{base % DMA_PAGE:X})"))
+    out.append((0 < pages <= DMA_MAX_PAGES,
+                f"the run is {pages} pages (want 1..{DMA_MAX_PAGES})"))
+
+    want = pages * DMA_PAGE
+    if len(pages_raw) != want:
+        out.append((False,
+                    f"read {len(pages_raw)} bytes of the run, expected {want}"))
+        return out
+
+    # Every frame, not a sample: a run that is contiguous for its first three
+    # frames and jumps on the fourth is exactly what a broken scan produces.
+    bad = []
+    for i in range(pages):
+        got = struct.unpack_from("<Q", pages_raw, i * DMA_PAGE)[0]
+        if got != (seed + i) & 0xFFFFFFFFFFFFFFFF:
+            bad.append((i, got))
+    out.append((not bad,
+                f"all {pages} frames carry their own tag at the physical base"
+                if not bad else
+                "frame(s) " + ", ".join(
+                    f"{i} reads 0x{g:016X} (want 0x{(seed + i) & 0xFFFFFFFFFFFFFFFF:016X})"
+                    for i, g in bad[:4])))
+    return out
+
+
+def do_dma(sock_path, elf, timeout, quiet):
+    _v, probe_paddr = symbol_phys_addr(elf, DMA_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-dma.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    try:
+        client.handshake()
+        client.pmemsave(probe_paddr, DMA_WORDS * 8, tmp.name)
+        raw = open(tmp.name, "rb").read()
+        if len(raw) != DMA_WORDS * 8:
+            raise QmpError(f"pmemsave wrote {len(raw)} bytes for {DMA_SYMBOL}")
+        probe = list(struct.unpack(f"<{DMA_WORDS}Q", raw))
+        pages_raw = b""
+        # The run itself is only read when the header is plausible: pmemsave of
+        # a bogus length at a bogus address is a monitor error, not a verdict.
+        if probe[0] == DMA_MAGIC and probe[1] != 0 \
+           and 0 < probe[2] <= DMA_MAX_PAGES:
+            client.pmemsave(probe[1], probe[2] * DMA_PAGE, tmp.name)
+            pages_raw = open(tmp.name, "rb").read()
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+    results = check_dma(probe, pages_raw)
+    if not report_hwstate(results, quiet):
+        print(f"        {DMA_SYMBOL} at 0x{probe_paddr:X}")
+        return 1
+    return 0
+
+
 def do_dump(sock_path, elf, out_path, timeout, send_quit):
     _vaddr, paddr = symbol_phys_addr(elf, SENTINEL_SYMBOL)
     client = QmpClient(sock_path, time.monotonic() + timeout)
@@ -1416,6 +1512,48 @@ def do_selftest():
                 "an RSP0 one quadword above the frame -- the top rather than "
                 "the fake return address -- is rejected")
 
+    def dma_run(base=0x6E000, pages=4, seed=0x0DA10DA100000000,
+                magic=DMA_MAGIC, corrupt=None, short=False):
+        raw = bytearray(b"\x00" * (pages * DMA_PAGE))
+        for i in range(pages):
+            struct.pack_into("<Q", raw, i * DMA_PAGE,
+                             (seed + i) & 0xFFFFFFFFFFFFFFFF)
+        if corrupt is not None:
+            struct.pack_into("<Q", raw, corrupt * DMA_PAGE, 0xA5A5A5A5A5A5A5A5)
+        if short:
+            raw = raw[:-8]
+        return [magic, base, pages, seed], bytes(raw)
+
+    def expect_dma(ok_wanted, probe, raw, what):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_dma(probe, raw))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} -- assertion said "
+                  f"{'accept' if got else 'reject'}")
+            fail_n += 1
+
+    expect_dma(True, *dma_run(), "a tagged four-frame run is accepted")
+    expect_dma(False, *dma_run(magic=0),
+               "a run whose probe magic was never written is rejected")
+    expect_dma(False, *dma_run(base=0),
+               "a base of 0 -- the allocator refused -- is rejected")
+    expect_dma(False, *dma_run(base=0x6E800),
+               "a base that is not frame aligned is rejected")
+    expect_dma(False, *dma_run(pages=0),
+               "a run of zero pages is rejected")
+    # THE ONE THIS EXISTS FOR: three frames adjacent and the fourth somewhere
+    # else. The first three tags land where they should and only the fourth
+    # reads as whatever was already in that frame.
+    expect_dma(False, *dma_run(corrupt=3),
+               "a run whose LAST frame is not where it claims is rejected")
+    expect_dma(False, *dma_run(corrupt=1),
+               "a run whose second frame is not where it claims is rejected")
+    expect_dma(False, *dma_run(short=True),
+               "a short read of the run is rejected")
+
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
 
@@ -1479,6 +1617,12 @@ def main(argv=None):
     t.add_argument("--min-delta", type=int, default=2)
     t.add_argument("--quiet", action="store_true")
 
+    m = sub.add_parser("dma", help="assert the DMA run at its physical base")
+    m.add_argument("--qmp", required=True)
+    m.add_argument("--elf", required=True)
+    m.add_argument("--timeout", type=float, default=10.0)
+    m.add_argument("--quiet", action="store_true")
+
     sub.add_parser("selftest", help="prove the assertion can fail")
 
     args = ap.parse_args(argv)
@@ -1504,6 +1648,8 @@ def main(argv=None):
         if args.cmd == "sched":
             return do_sched(args.qmp, args.elf, args.timeout, args.quiet,
                             interval=args.interval)
+        if args.cmd == "dma":
+            return do_dma(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "ticks":
             return do_ticks(args.qmp, args.elf, args.timeout, args.quiet,
                             interval=args.interval, min_delta=args.min_delta)

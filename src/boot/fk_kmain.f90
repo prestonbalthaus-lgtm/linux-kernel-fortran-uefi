@@ -15,7 +15,8 @@
 ! captured COM1 log.
 module fk_kmain_m
   use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t, c_char, &
-                                         c_null_char, c_funloc
+                                         c_null_char, c_funloc, c_ptr, &
+                                         c_f_pointer
   use fk_serial_m, only: FK_SERIAL_COM1, serial_init, serial_print_string, &
                          serial_print_hex
   use fk_panic_m,  only: panic_code
@@ -48,7 +49,8 @@ module fk_kmain_m
                          pmm_total_pages, pmm_free_pages, pmm_ignored_bytes, &
                          pmm_region_count, pmm_region_base, pmm_region_len, &
                          pmm_region_type, pmm_verify_reserved, &
-                         pmm_verify_kernel_locked, pmm_alloc_page_from
+                         pmm_verify_kernel_locked, pmm_alloc_page_from, &
+                         pmm_alloc_contiguous
   use fk_fbinfo_m, only: FK_FB_OK, FK_FB_BASE, FK_FB_PITCH, FK_FB_WIDTH, &
                          FK_FB_HEIGHT, FK_FB_BPP, FK_FB_MASKS, FK_FB_BYTES, &
                          fk_fb_info, fb_probe, fb_pixel_pack, fb_note_mapping
@@ -157,6 +159,18 @@ module fk_kmain_m
   integer(c_int64_t), volatile, save, bind(c, name="fk_acpi_topo") :: &
        fk_acpi_topo(0:7)
 
+  ! roadmap 3.x.  [0] magic  [1] phys base  [2] pages  [3] tag seed.
+  ! The PAGES carry the proof and this only says where to look: every frame in
+  ! the run gets a word derived from its own index, written through the linear
+  ! map, and tools/qmp-sentinel.py reads them back at the PHYSICAL base with no
+  ! page table involved.  A bitmap can only testify about itself.
+  integer(c_int64_t), parameter :: FK_DMA_MAGIC = int(z'444D4143', c_int64_t)
+  integer(c_int64_t), parameter :: FK_DMA_PAGES = 4_c_int64_t
+  integer(c_int64_t), parameter :: FK_DMA_SEED  = &
+       int(z'0DA10DA100000000', c_int64_t)
+  integer(c_int64_t), volatile, save, bind(c, name="fk_dma_probe") :: &
+       fk_dma_probe(0:3)
+
   ! 'APIC' packed little-endian, built rather than written down.
   integer(c_int32_t), parameter :: FK_SIG_APIC = &
        ior(ior(iachar('A', c_int32_t), shiftl(iachar('P', c_int32_t), 8)), &
@@ -237,6 +251,21 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_PMM_TOTALS = &
        "Fortran Kernel: PMM frames total/free/unmanaged-bytes 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PMM_SLASH  = "/0x" // c_null_char
+
+  character(kind=c_char, len=*), parameter :: FK_DMA_START = &
+       "Fortran Kernel: DMA asking the PMM for a contiguous run (roadmap 3.x)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_DMA_BASE = &
+       "Fortran Kernel: DMA run phys/pages 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_DMA_WALK_OK = &
+       "Fortran Kernel: every frame of the run translates to the next physical page." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_DMA_WALK_BAD = &
+       "Fortran Kernel: the DMA run is NOT contiguous in physical memory." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_DMA_REFUSED = &
+       "Fortran Kernel: pmm_alloc_contiguous refused the run." // &
+       FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PMM_TAKEN  = &
        "Fortran Kernel: PMM handed out 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PMM_BEFORE = &
@@ -1632,6 +1661,63 @@ contains
   ! physmap top is reachable and anything at or above it is REFUSED rather
   ! than dereferenced -- on a 2 GiB machine the tables sit ~7 KiB under that
   ! top, so the check is load-bearing and not decoration.
+  ! roadmap 3.x.  Takes a run, tags every frame in it through the linear map,
+  ! and publishes where it is.  AFTER the heap, because heap_bringup wants the
+  ! allocator in the state pmm_verify left it, and before the scheduler, for the
+  ! reason everything else here runs before the scheduler: nothing in the PMM
+  ! takes a lock.
+  subroutine dma_bringup()
+    implicit none
+    integer(c_int64_t) :: phys, virt, i
+    integer(c_int64_t), pointer :: w(:)
+    type(c_ptr) :: cp
+    integer(c_int32_t) :: ok
+
+    fk_dma_probe = 0_c_int64_t
+    call serial_print_string(FK_DMA_START)
+
+    phys = pmm_alloc_contiguous(FK_DMA_PAGES)
+    if (phys == 0_c_int64_t) then
+       call serial_print_string(FK_DMA_REFUSED)
+       return
+    end if
+
+    call serial_print_string(FK_DMA_BASE)
+    call serial_print_hex(phys, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(FK_DMA_PAGES, 4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! One word per frame, derived from that frame's own index.  Read back at
+    ! the PHYSICAL base from outside the guest, they appear in order only if
+    ! the frames really are adjacent in DRAM.
+    virt = vmm_phys_to_virt(phys)
+    cp   = transfer(virt, cp)
+    call c_f_pointer(cp, w, [FK_DMA_PAGES * 512_c_int64_t])
+    do i = 0_c_int64_t, FK_DMA_PAGES - 1_c_int64_t
+       w(i * 512_c_int64_t + 1_c_int64_t) = FK_DMA_SEED + i
+    end do
+
+    ! And the kernel's own half of the same claim, which the host cannot make:
+    ! the page tables agree that each frame's virtual address translates to the
+    ! next physical page.
+    ok = 1_c_int32_t
+    do i = 0_c_int64_t, FK_DMA_PAGES - 1_c_int64_t
+       if (vmm_phys_of(virt + ishft(i, 12)) /= phys + ishft(i, 12)) &
+            ok = 0_c_int32_t
+    end do
+    if (ok == 1_c_int32_t) then
+       call serial_print_string(FK_DMA_WALK_OK)
+    else
+       call serial_print_string(FK_DMA_WALK_BAD)
+    end if
+
+    fk_dma_probe(0) = FK_DMA_MAGIC
+    fk_dma_probe(1) = phys
+    fk_dma_probe(2) = FK_DMA_PAGES
+    fk_dma_probe(3) = FK_DMA_SEED
+  end subroutine dma_bringup
+
   subroutine acpi_bringup(mbi)
     implicit none
     integer(c_int64_t), intent(in) :: mbi
@@ -2090,6 +2176,8 @@ contains
     ! allocating before sched_start.
     heap_next = FK_VMM_HEAP
     status = heap_bringup()
+
+    call dma_bringup()
 
     ! roadmap 4.0's second half.  Last, because from here on this routine is
     ! one of three threads rather than the only one, and everything above

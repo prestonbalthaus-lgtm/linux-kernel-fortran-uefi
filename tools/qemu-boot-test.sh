@@ -31,6 +31,10 @@
 #                     band must be carrying. Set it to panic for an
 #                     FK_FAULT_MODE build -- that is what asserts the register
 #                     dump reached the SCREEN and not only COM1.
+#   FK_CHECK_DMA      0 to skip the DMA-run assertion (default: on). Set it to
+#                     0 for a build that ends in a deliberate panic, for
+#                     FK_CHECK_SCHED's reason: the run is taken during bringup
+#                     and a panic build never gets that far.
 #   FK_CHECK_SCHED    0 to skip the scheduler/heap assertion (default: on).
 #                     Set it to 0 for a build that ends in a deliberate panic:
 #                     the CPU is halted, so no thread is running to count.
@@ -204,6 +208,13 @@ Fortran Kernel: kzalloc returned memory that was already zero.
 Fortran Kernel: heap refused a double free, a stray pointer and a wrapped size.
 Fortran Kernel: heap tiles its window exactly, blocks/used/free 0x00000001/0x00000000/
 Fortran Kernel: heap coalesced every freed block back into one, largest free 0x'
+# roadmap 3.x. The phys/pages line is a prefix -- the address is whatever the
+# allocator happened to return -- so what is asserted here is the VERDICT, and
+# the frames themselves are checked over QMP.
+FK_DMA_PASS_LINES=$'Fortran Kernel: DMA asking the PMM for a contiguous run (roadmap 3.x).
+Fortran Kernel: every frame of the run translates to the next physical page.'
+FK_DMA_FAIL_LINES=$'Fortran Kernel: the DMA run is NOT contiguous in physical memory.
+Fortran Kernel: pmm_alloc_contiguous refused the run.'
 # roadmap 4.0's scheduler. "switches/A/B" carries three live counts, so it is
 # a prefix -- but the line only prints after the boot thread has watched BOTH
 # spawned threads' own counters pass 2, which no single switch can produce.
@@ -258,6 +269,7 @@ $FK_VMM_PASS_LINES
 $FK_FB_PASS_LINES
 $FK_CON_PASS_LINES
 $FK_HEAP_PASS_LINES
+$FK_DMA_PASS_LINES
 $FK_SCHED_PASS_LINES
 $FK_LAPIC_PASS_LINES
 $FK_ACPI_PASS_LINES
@@ -268,6 +280,7 @@ $FK_VMM_FAIL_LINES
 $FK_FB_FAIL_LINES
 $FK_CON_FAIL_LINES
 $FK_HEAP_FAIL_LINES
+$FK_DMA_FAIL_LINES
 $FK_SCHED_FAIL_LINES
 $FK_LAPIC_FAIL_LINES
 $FK_ACPI_FAIL_LINES
@@ -339,6 +352,8 @@ CHECK_TICKS="${FK_CHECK_TICKS:-1}"
 [[ "$CHECK_TICKS" != 0 ]] && say "tick check : fk_tick_count read twice from the running guest"
 CHECK_SCHED="${FK_CHECK_SCHED:-1}"
 [[ "$CHECK_SCHED" != 0 ]] && say "sched check: fk_task_runs and fk_heap_stat, read twice while it runs"
+CHECK_DMA="${FK_CHECK_DMA:-1}"
+[[ "$CHECK_DMA" != 0 ]] && say "dma check  : the contiguous run, read at the physical base it published"
 CHECK_FB="${FK_CHECK_FB:-1}"
 [[ "$CHECK_FB" != 0 ]] && say "fb check   : fk_fb_info, then the pixels at the base it names (${FK_FB_EXPECT:-console} palette)"
 
@@ -533,6 +548,12 @@ assertion_summary() {
       else                         say "  framebuffer      : FAIL  see the pixel comparison above"
       fi
     fi
+    if [[ "$CHECK_DMA" != 0 ]]; then
+      if   (( DMA_OK == 1 )); then  say "  DMA run          : PASS  every frame carried its tag at the physical base"
+      elif (( DMA_RAN == 0 )); then say "  DMA run          : FAIL  the guest died before it could be asked"
+      else                          say "  DMA run          : FAIL  see the frame comparison above"
+      fi
+    fi
     if [[ "$CHECK_SCHED" != 0 ]]; then
       if   (( SCHED_OK == 1 )); then  say "  scheduler + heap : PASS  both threads' own counters grew, heap is whole"
       elif (( SCHED_RAN == 0 )); then say "  scheduler + heap : FAIL  the guest died before it could be asked"
@@ -691,6 +712,25 @@ fi
 # so "both threads are running" is a fact about a machine that is still
 # switching between them, which nothing the kernel printed can establish: the
 # boot thread prints its verdict and could then never be scheduled again.
+# roadmap 3.x. Read at the PHYSICAL base the kernel published, so no page
+# table is consulted to reach it: the frames appear in order only if they
+# really are adjacent in DRAM. The kernel's own bitmap cannot say that, and a
+# bitmap that is simply wrong says it just as confidently.
+DMA_RAN=0; DMA_OK=0
+if [[ "$CHECK_DMA" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    DMA_RAN=1
+    rule
+    say "--- the DMA run, read frame by frame at its physical base ---"
+    if python3 "$SENTINEL" dma --qmp "$SOCK" --elf "$KERNEL" --timeout 10; then
+      DMA_OK=1
+    fi
+  else
+    say ""
+    say "DMA run NOT asserted: the guest was already gone."
+  fi
+fi
+
 SCHED_RAN=0; SCHED_OK=0
 if [[ "$CHECK_SCHED" != 0 && "$MODE" == gate ]]; then
   if qemu_alive; then
@@ -787,10 +827,12 @@ FB_BAD=0
 if [[ "$CHECK_FB" != 0 && "$MODE" == gate ]] && (( FB_OK == 0 )); then FB_BAD=1; fi
 SCHED_BAD=0
 if [[ "$CHECK_SCHED" != 0 && "$MODE" == gate ]] && (( SCHED_OK == 0 )); then SCHED_BAD=1; fi
+DMA_BAD=0
+if [[ "$CHECK_DMA" != 0 && "$MODE" == gate ]] && (( DMA_OK == 0 )); then DMA_BAD=1; fi
 
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
    && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )) \
-   && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )); then
+   && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )) && (( DMA_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule
@@ -816,6 +858,13 @@ if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
     say "          from the loader's channel masks -- so the renderer reached"
     say "          real video memory and packed the channels the firmware"
     say "          asked for, not the ones an x86 kernel usually gets away with."
+  fi
+  if [[ "$CHECK_DMA" != 0 ]]; then
+    say "          A run of physically contiguous frames was then read at the"
+    say "          PHYSICAL base the guest published -- no page table was"
+    say "          consulted to reach it -- and every frame carried the tag"
+    say "          the kernel wrote for that frame's own index, in order. A"
+    say "          bitmap can only testify about itself; this is the frames."
   fi
   if [[ "$CHECK_SCHED" != 0 ]]; then
     say "          Two counters that only the two SPAWNED threads increment"
