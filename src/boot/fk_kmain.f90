@@ -33,8 +33,15 @@ module fk_kmain_m
                          pcie_progif, pcie_find_xhci, pcie_find_nvme, &
                          pcie_cmd_enable, pcie_cmd_disable, pcie_command, &
                          pcie_msix_at, pcie_msix_count, &
-                         pcie_msix_bir, pcie_msix_offset, pcie_bar64
-  use fk_pcie_types_m, only: FK_PCI_CMD_MEMORY_BIT, FK_PCI_CMD_MASTER_BIT
+                         pcie_msix_bir, pcie_msix_offset, pcie_bar64, &
+                         pcie_msix_entry_set, pcie_msix_entry_read, &
+                         pcie_msix_enable, pcie_msix_ctrl, pcie_intx_disable, &
+                         FK_PCI_MSIX_E_ADDR_LO, FK_PCI_MSIX_E_DATA, &
+                         FK_PCI_MSIX_E_VCTRL, FK_PCIE_OK
+  use fk_pcie_types_m, only: FK_PCI_CMD_MEMORY_BIT, FK_PCI_CMD_MASTER_BIT, &
+                             FK_PCI_CMD_INTX_DISABLE_BIT, &
+                             FK_PCI_MSIX_CTRL_ENABLE_BIT, &
+                             FK_PCI_MSIX_CTRL_MASKALL_BIT
   use fk_madt_m,   only: FK_MADT_OK, madt_parse, madt_lapic_addr, &
                          madt_pcat_compat, madt_cpu_count, madt_cpu_enabled, &
                          madt_cpu_apic_id, madt_ioapic_count, &
@@ -47,12 +54,13 @@ module fk_kmain_m
                          lapic_lint0_extint, lapic_lint1_nmi, &
                          LVT_DM_EXTINT, LVT_DM_NMI, &
                          lapic_id, lapic_version, lapic_svr, &
-                         lapic_lvt_lint0, lapic_lvt_lint1
+                         lapic_lvt_lint0, lapic_lvt_lint1, &
+                         lapic_msi_addr, lapic_msi_data
   use fk_gdt_m,    only: gdt_init
   use fk_tss_m,    only: tss_init
   use fk_idt_m,    only: idt_init, fk_irq_spurious, idt_set_panic_colors, &
                          idt_set_eoi_lapic, fk_lapic_spurious, &
-                         FK_VECTOR_SPURIOUS
+                         FK_VECTOR_SPURIOUS, FK_VECTOR_MSI
   use fk_ioapic_m, only: FK_IOAPIC_OK, FK_IOAPIC_POL_HIGH, FK_IOAPIC_POL_LOW, &
                          FK_IOAPIC_TRIG_EDGE, FK_IOAPIC_TRIG_LEVEL, &
                          ioapic_set_window, ioapic_id, ioapic_version, &
@@ -93,7 +101,7 @@ module fk_kmain_m
                          vmm_physmap_top, FK_VMM_PHYSMAP, &
                          vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, &
                          vmm_read_pat, vmm_punch_physmap, FK_VMM_E_IS_RAM, &
-                         FK_VMM_IOAPIC, FK_VMM_ECAM
+                         FK_VMM_IOAPIC, FK_VMM_ECAM, FK_VMM_XHCI
   use fk_sched_m,  only: FK_SCHED_MAX, fk_task_runs, fk_sched_switches, &
                          sched_init, sched_spawn, sched_start, sched_current, &
                          sched_tasks
@@ -213,12 +221,20 @@ module fk_kmain_m
   ! functions, then what 5.1 needs off the xHCI: its BDF, the COMMAND it read
   ! back after the enable, the MSI-X triple and BAR0.
   integer(c_int64_t), volatile, save, bind(c, name="fk_pcie_devs") :: &
-       fk_pcie_devs(0:FK_PCIE_SLOTS + 9)
+       fk_pcie_devs(0:FK_PCIE_SLOTS + 11)
   integer(c_int32_t), parameter :: FK_PCIE_W_XHCI = FK_PCIE_SLOTS + 5_c_int32_t
   integer(c_int32_t), parameter :: FK_PCIE_W_CMD  = FK_PCIE_SLOTS + 6_c_int32_t
   integer(c_int32_t), parameter :: FK_PCIE_W_MSIX = FK_PCIE_SLOTS + 7_c_int32_t
   integer(c_int32_t), parameter :: FK_PCIE_W_TBL  = FK_PCIE_SLOTS + 8_c_int32_t
   integer(c_int32_t), parameter :: FK_PCIE_W_BAR  = FK_PCIE_SLOTS + 9_c_int32_t
+  integer(c_int32_t), parameter :: FK_PCIE_W_MSG = FK_PCIE_SLOTS + 10_c_int32_t
+  integer(c_int32_t), parameter :: FK_PCIE_W_CTRL = FK_PCIE_SLOTS + 11_c_int32_t
+
+  ! 64 KiB covers every xHCI register block this kernel will meet: qemu-xhci
+  ! decodes 16 KiB and the specification's capability, operational, runtime and
+  ! doorbell regions fit inside that on real parts too.  Mapping the BAR's own
+  ! reported size needs BAR SIZING, which 4.2 does not do.
+  integer(c_int64_t), parameter :: FK_XHCI_WINDOW_BYTES = 65536_c_int64_t
 
   ! 'MCFG' packed little-endian, built the way FK_SIG_APIC is.
   integer(c_int32_t), parameter :: FK_SIG_MCFG = &
@@ -361,6 +377,21 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_XHCI_NO_MSIX = &
        "Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route." // &
        FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_MAP_BAD = &
+       "Fortran Kernel: the xHCI register block could not be mapped, status 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_WINDOW = &
+       "Fortran Kernel: xHCI BAR0 mapped strong-UC, virt/phys 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_ROUTE = &
+       "Fortran Kernel: xHCI MSI-X entry 0 addr/data/mask 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_ROUTE_OK = &
+       "Fortran Kernel: the xHCI has an MSI-X route to this CPU and INTx is off (roadmap 5.1)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_ROUTE_BAD = &
+       "Fortran Kernel: the xHCI MSI-X route did NOT read back; the controller has no interrupt." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_CTRL = &
+       "Fortran Kernel: xHCI MSI-X control/command 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PCIE_WALKED = &
        "Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2)." // &
        FK_CRLF // c_null_char
@@ -2050,7 +2081,95 @@ contains
     call serial_print_string(FK_PMM_SLASH)
     call serial_print_hex(int(off, c_int64_t), 8_c_int32_t)
     call serial_print_string(FK_NL)
+
+    call xhci_route(i, bar, off)
   end subroutine xhci_bringup
+
+  ! THE ROUTE (roadmap 5.1).  An MSI-X table entry is not configuration space:
+  ! it lives in the device's own memory behind BAR0, so the BAR has to be taken
+  ! out of the linear map and mapped strong-UC first -- the same treatment the
+  ! LAPIC, the IOAPIC and the ECAM window get, and for the same reason.
+  !
+  ! ORDER, and every step of it is load bearing.  The IDT gate for the vector
+  ! is already installed by idt_init, BEFORE anything here can be unmasked.
+  ! Then: map, write the entry masked, unmask it, set MSIX_ENABLE, and only
+  ! then take INTx away.  Reversing the last two leaves a window with no wire
+  ! and no message.
+  subroutine xhci_route(idx, bar, tbl_off)
+    implicit none
+    integer(c_int32_t), intent(in) :: idx, tbl_off
+    integer(c_int64_t), intent(in) :: bar
+    integer(c_int64_t) :: tbl
+    integer(c_int32_t) :: st, addr, data, rb_addr, rb_data, rb_mask, ctrl, cmd
+
+    if (bar == 0_c_int64_t) return
+
+    st = vmm_punch_physmap(bar, FK_XHCI_WINDOW_BYTES)
+    if (st == FK_VMM_OK) &
+         st = vmm_map_mmio(FK_VMM_XHCI, bar, FK_XHCI_WINDOW_BYTES, FK_VMM_UC)
+    if (st /= FK_VMM_OK) then
+       call serial_print_string(FK_XHCI_MAP_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    call serial_print_string(FK_XHCI_WINDOW)
+    call serial_print_hex(FK_VMM_XHCI, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(bar, 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    tbl  = FK_VMM_XHCI + int(tbl_off, c_int64_t)
+    addr = lapic_msi_addr(lapic_id(FK_VMM_LAPIC))
+    data = lapic_msi_data(FK_VECTOR_MSI)
+    st   = pcie_msix_entry_set(tbl, 0_c_int32_t, addr, 0_c_int32_t, data)
+    if (st /= FK_PCIE_OK) return
+
+    ! READ BACK OFF THE DEVICE, not out of what was written.  These are the
+    ! first reads this kernel has ever taken from a BAR.
+    rb_addr = pcie_msix_entry_read(tbl, 0_c_int32_t, FK_PCI_MSIX_E_ADDR_LO)
+    rb_data = pcie_msix_entry_read(tbl, 0_c_int32_t, FK_PCI_MSIX_E_DATA)
+    rb_mask = pcie_msix_entry_read(tbl, 0_c_int32_t, FK_PCI_MSIX_E_VCTRL)
+
+    call serial_print_string(FK_XHCI_ROUTE)
+    call serial_print_hex(int(rb_addr, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(rb_data, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(rb_mask, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ctrl = pcie_msix_enable(idx)
+    cmd  = pcie_intx_disable(idx)
+    ! The entry as the DEVICE holds it: address in 31:0, data in 47:32, the
+    ! mask bit in 48.  The host reads the same four dwords straight out of the
+    ! device model and the two have to agree.
+    fk_pcie_devs(FK_PCIE_W_MSG) = &
+         ior(iand(int(rb_addr, c_int64_t), int(z'FFFFFFFF', c_int64_t)), &
+             ior(shiftl(iand(int(rb_data, c_int64_t), &
+                             int(z'FFFF', c_int64_t)), 32), &
+                 shiftl(iand(int(rb_mask, c_int64_t), 1_c_int64_t), 48)))
+    fk_pcie_devs(FK_PCIE_W_CTRL) = &
+         ior(int(iand(ctrl, int(z'FFFF', c_int32_t)), c_int64_t), &
+             shiftl(int(iand(cmd, int(z'FFFF', c_int32_t)), c_int64_t), 16))
+
+    call serial_print_string(FK_XHCI_CTRL)
+    call serial_print_hex(int(ctrl, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(cmd, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    if (rb_addr == addr .and. rb_data == data .and. &
+        rb_mask == 0_c_int32_t .and. &
+        btest(ctrl, FK_PCI_MSIX_CTRL_ENABLE_BIT) .and. &
+        .not. btest(ctrl, FK_PCI_MSIX_CTRL_MASKALL_BIT) .and. &
+        btest(cmd, FK_PCI_CMD_INTX_DISABLE_BIT)) then
+       call serial_print_string(FK_XHCI_ROUTE_OK)
+    else
+       call serial_print_string(FK_XHCI_ROUTE_BAD)
+    end if
+  end subroutine xhci_route
 
   ! The MADT's interrupt source override flags for one ISA IRQ, decoded into
   ! the IOAPIC's own polarity and trigger encodings.  ACPI 6.5 table 5.26: bits

@@ -1910,10 +1910,47 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
         and the kernel prints its own REFUSED line, which is on the gate's
         reject list.
 
-        What is left is the ROUTE ITSELF: writing the MSI-X table, which lives
-        in device memory rather than configuration space, allocating a vector,
-        and disabling INTx -- deliberately left alone until there is a message
-        to replace it with. The controller has not been touched.
+        THE ROUTE IS NOW WRITTEN TOO, and it is the first thing this kernel
+        has ever put into a device's own memory rather than its configuration
+        space. BAR0 is punched out of the linear map and mapped strong-UC at
+        FK_VMM_XHCI; entry 0 of the MSI-X table is written MASKED, address then
+        data, and unmasked LAST, which is PCI 3.0 6.8.3.5 and not style -- an
+        entry unmasked halfway through sends a message built from two routes.
+        Then MSIX_ENABLE with MASKALL cleared in the same write, and INTx off
+        last, because a controller with neither a wire nor a message raises
+        nothing at all.
+
+            Fortran Kernel: xHCI BAR0 mapped strong-UC, virt/phys 0xFFFF808022000000/0x00000000FEBF0000
+            Fortran Kernel: xHCI MSI-X entry 0 addr/data/mask 0xFEE00000/0x00000030/0x00000000
+            Fortran Kernel: xHCI MSI-X control/command 0x800F/0x0507
+
+        AND THE DEVICE AGREES, read from outside the guest. `xp` goes through
+        QEMU's memory API, so it reaches configuration space through the ECAM
+        window and the table through the BAR exactly as a guest access would --
+        it is the device model's state, not the guest's account of it:
+
+            PASS  QEMU's own COMMAND for the device is 0x0507: decode and bus mastering are on
+            PASS  the capability reads 0x800F: MSI-X is ENABLED
+            PASS  table entry 0 addresses 0xFEE00000, the APIC of CPU 0
+            PASS  carries vector 0x30, and is UNMASKED (vector control 0x00000000)
+            PASS  the guest's read-back agrees with QEMU's device model
+
+        A BAR whose decode is off answers `Cannot access memory`, which is why
+        that is an assertion here rather than a limitation.
+
+        NO INTERRUPT HAS ARRIVED, AND NONE CAN YET. The controller has not been
+        reset, its interrupter is not enabled and R/S is clear, so it has
+        nothing to signal; `fk_msi_count` is 0 and no gate pretends otherwise.
+        The vector is nevertheless installed BEFORE the route is unmasked --
+        `idt_init` puts FK_VECTOR_MSI (0x30) in the IDT unconditionally, the
+        same rule 3.3 applied to the spurious vector, because a vector the IDT
+        does not describe is a #GP during delivery.
+
+        WHAT IS LEFT IS THE CONTROLLER, and it is why this box is still open:
+        reset and the CNR wait, the scratchpad array, DCBAAP, the command ring,
+        the event ring and its ERST, R/S, and a NO-OP command whose completion
+        is polled out of the event ring. This box's validation line is about
+        ring buffers, and there are none.
 
    * [ ] 5.2 USB HID Keyboard Driver
 

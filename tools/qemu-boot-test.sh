@@ -228,10 +228,16 @@ Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2
 Fortran Kernel: xHCI COMMAND firmware/cleared/enabled 0x
 Fortran Kernel: xHCI decode and bus mastering were taken DOWN and put back by this kernel.
 Fortran Kernel: xHCI BAR0 0x
-Fortran Kernel: xHCI MSI-X cap/entries/bar/offset 0x'
+Fortran Kernel: xHCI MSI-X cap/entries/bar/offset 0x
+Fortran Kernel: xHCI BAR0 mapped strong-UC, virt/phys 0x
+Fortran Kernel: xHCI MSI-X entry 0 addr/data/mask 0x
+Fortran Kernel: xHCI MSI-X control/command 0x
+Fortran Kernel: the xHCI has an MSI-X route to this CPU and INTx is off (roadmap 5.1).'
 FK_PCIE_FAIL_LINES=$'Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map.
 Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
 Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route.
+Fortran Kernel: the xHCI register block could not be mapped, status 0x
+Fortran Kernel: the xHCI MSI-X route did NOT read back; the controller has no interrupt.
 Fortran Kernel: the ECAM mapping is CACHED.
 Fortran Kernel: the MCFG table would not parse, status 0x
 Fortran Kernel: the ECAM window could not be taken out of the linear map, status 0x
@@ -242,7 +248,8 @@ if [[ "${FK_MACHINE:-q35}" == pc ]]; then
 Fortran Kernel: no MCFG table; this machine has no ECAM window.'
   FK_PCIE_FAIL_LINES=$'Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2).
 Fortran Kernel: xHCI COMMAND firmware/cleared/enabled 0x
-Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.'
+Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
+Fortran Kernel: the xHCI has an MSI-X route to this CPU and INTx is off (roadmap 5.1).'
 else
   FK_PCIE_FAIL_LINES="$FK_PCIE_FAIL_LINES
 Fortran Kernel: no MCFG table; this machine has no ECAM window."

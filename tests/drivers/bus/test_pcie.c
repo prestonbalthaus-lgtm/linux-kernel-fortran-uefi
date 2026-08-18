@@ -61,6 +61,14 @@ int32_t pcie_msix_bir(int32_t i);
 int32_t pcie_msix_offset(int32_t i);
 int64_t pcie_bar64(int32_t i, int32_t n);
 
+int64_t pcie_msix_entry_addr(int64_t tbl, int32_t entry);
+int32_t pcie_msix_entry_set(int64_t tbl, int32_t entry, int32_t lo, int32_t hi,
+			    int32_t data);
+int32_t pcie_msix_entry_read(int64_t tbl, int32_t entry, int32_t field);
+int32_t pcie_msix_enable(int32_t i);
+int32_t pcie_msix_ctrl(int32_t i);
+int32_t pcie_intx_disable(int32_t i);
+
 int32_t fk_readl(int64_t addr);
 void    fk_writel(int64_t addr, int32_t v);
 
@@ -72,24 +80,52 @@ void    fk_writel(int64_t addr, int32_t v);
 enum { NOT_FOUND = -1, MAX_DEV = 64, BUSES = 3, BUS_BYTES = 1 << 20 };
 enum { OK = 0, E_RANGE = -2, CAP_TTL = 48 };
 
+/* Two arenas, because the MSI-X table is NOT configuration space: it lives in
+ * device memory behind a BAR, reached through a mapping the VMM made, and it
+ * has none of config space's write semantics. Keeping them apart is what lets
+ * the register model below apply to one and not the other. */
+enum { BAR_BYTES = 16 << 10, MSIX_TBL = 0x3000, LOG_MAX = 64 };
+
 static uint8_t *g_space;
+static uint8_t *g_bar;
 static int g_reads;
 static int g_writes;
+/* The ORDER of the writes, which is the only way to see an architectural rule
+ * that says "mask first, unmask last" -- final contents cannot show it. */
+static struct { int64_t off; uint32_t val; } g_log[LOG_MAX];
+static int g_logn;
 
 /* The module's only route to the hardware.  A byte-granular decode, so a
  * misaligned or out-of-window read shows up here rather than being silently
  * rounded into something plausible. */
+static uint8_t *resolve(int64_t addr, uint64_t *off, int *is_bar)
+{
+	uint64_t c = (uint64_t)addr - (uint64_t)(uintptr_t)g_space;
+	uint64_t b = (uint64_t)addr - (uint64_t)(uintptr_t)g_bar;
+
+	if (b + 4 <= (uint64_t)BAR_BYTES) {
+		*off = b;
+		*is_bar = 1;
+		return g_bar;
+	}
+	*off = c;
+	*is_bar = 0;
+	return c + 4 <= (uint64_t)BUSES * BUS_BYTES ? g_space : NULL;
+}
+
 int32_t fk_readl(int64_t addr)
 {
-	uint64_t off = (uint64_t)addr - (uint64_t)(uintptr_t)g_space;
+	uint64_t off;
+	int is_bar;
+	uint8_t *base = resolve(addr, &off, &is_bar);
 
 	g_reads++;
-	if (off + 4 > (uint64_t)BUSES * BUS_BYTES)
+	if (!base)
 		return -1;
-	return (int32_t)(((uint32_t)g_space[off]) |
-			 ((uint32_t)g_space[off + 1] << 8) |
-			 ((uint32_t)g_space[off + 2] << 16) |
-			 ((uint32_t)g_space[off + 3] << 24));
+	return (int32_t)(((uint32_t)base[off]) |
+			 ((uint32_t)base[off + 1] << 8) |
+			 ((uint32_t)base[off + 2] << 16) |
+			 ((uint32_t)base[off + 3] << 24));
 }
 
 /* CONFIGURATION SPACE IS NOT MEMORY, and a model that stores what it is given
@@ -102,12 +138,22 @@ int32_t fk_readl(int64_t addr)
  * destroys error state on the silicon. */
 static uint32_t merge_cfg(uint32_t reg, uint32_t old, uint32_t val)
 {
-	const uint32_t w1c = 0xF9000000u;	/* status 8, 11..15, shifted */
-	const uint32_t wmask = 0x0000FFFFu;	/* COMMAND */
-	uint32_t out;
+	uint32_t wmask, w1c, out;
 
-	if (reg != 0x04)
+	if (reg == 0x04) {
+		wmask = 0x0000FFFFu;		/* COMMAND */
+		w1c = 0xF9000000u;		/* status 8, 11..15, shifted */
+	} else if (reg == 0xA0) {
+		/* Message control, bits 31:16; cap_id and cap_next below it are
+		 * read-only. NO write-1-to-clear bits here -- applying the
+		 * status register's set to this one clears MSIX_ENABLE the
+		 * instant it is written, which is a defect in the model and
+		 * not in the kernel. */
+		wmask = 0xFFFF0000u;
+		w1c = 0;
+	} else {
 		return val;
+	}
 	out = (old & ~wmask) | (val & wmask);
 	return out & ~(val & w1c);
 }
@@ -116,18 +162,30 @@ static uint32_t merge_cfg(uint32_t reg, uint32_t old, uint32_t val)
  * dword away from its target has to be visible here rather than absorbed. */
 void fk_writel(int64_t addr, int32_t v)
 {
-	uint64_t off = (uint64_t)addr - (uint64_t)(uintptr_t)g_space;
+	uint64_t off;
+	int is_bar;
+	uint8_t *base = resolve(addr, &off, &is_bar);
 	uint32_t u = (uint32_t)v;
 
 	g_writes++;
-	if (off + 4 > (uint64_t)BUSES * BUS_BYTES)
+	if (!base)
 		return;
-	u = merge_cfg((uint32_t)(off & 0xFFFu), (uint32_t)fk_readl(addr), u);
-	g_reads--;
-	g_space[off] = (uint8_t)(u & 0xFF);
-	g_space[off + 1] = (uint8_t)((u >> 8) & 0xFF);
-	g_space[off + 2] = (uint8_t)((u >> 16) & 0xFF);
-	g_space[off + 3] = (uint8_t)((u >> 24) & 0xFF);
+	if (g_logn < LOG_MAX) {
+		g_log[g_logn].off = (int64_t)off;
+		g_log[g_logn].val = u;
+		g_logn++;
+	}
+	/* Device memory behind a BAR takes what it is given; configuration
+	 * space does not. */
+	if (!is_bar) {
+		u = merge_cfg((uint32_t)(off & 0xFFFu),
+			      (uint32_t)fk_readl(addr), u);
+		g_reads--;
+	}
+	base[off] = (uint8_t)(u & 0xFF);
+	base[off + 1] = (uint8_t)((u >> 8) & 0xFF);
+	base[off + 2] = (uint8_t)((u >> 16) & 0xFF);
+	base[off + 3] = (uint8_t)((u >> 24) & 0xFF);
 }
 
 static uint8_t *fn_at(int bus, int dev, int fn)
@@ -161,8 +219,10 @@ static void place(int bus, int dev, int fn, uint16_t ven, uint16_t did,
 static void arena_reset(void)
 {
 	memset(g_space, 0xFF, (size_t)BUSES * BUS_BYTES);
+	memset(g_bar, 0xFF, BAR_BYTES);
 	g_reads = 0;
 	g_writes = 0;
+	g_logn = 0;
 }
 
 /* One capability link: id and the offset of the next, 0 to end the chain. */
@@ -601,6 +661,94 @@ static void test_bars(void)
 	EQ64("nor a BAR of an index never walked", 0, pcie_bar64(-1, 0));
 }
 
+/* The route itself: the table entry, the enable, and INTx last. */
+static void test_msix_route(void)
+{
+	int64_t tbl = (int64_t)(uintptr_t)(g_bar + MSIX_TBL);
+	int i, ctrl, cmd;
+
+	place_q35();
+	pcie_set_window((int64_t)(uintptr_t)g_space, 0, BUSES - 1);
+	pcie_scan();
+	i = index_of(0, 0x03, 0);
+
+	EQ64("entry 0 is the table base", tbl, pcie_msix_entry_addr(tbl, 0));
+	EQ64("entry 1 is 16 bytes up", tbl + 16, pcie_msix_entry_addr(tbl, 1));
+	EQ64("entry 15 is 240 up, not 15", tbl + 240,
+	     pcie_msix_entry_addr(tbl, 15));
+
+	g_logn = 0;
+	EQI("programming entry 0 is accepted", OK,
+	    pcie_msix_entry_set(tbl, 0, 0xFEE01000, 0, 0x30));
+
+	/* THE ORDER, which final contents cannot show. PCI 3.0 6.8.3.5: an
+	 * entry may only be changed while masked, and the mask comes off LAST.
+	 * A device whose address is half-written and unmasked sends a message
+	 * built from two different routes. */
+	EQI("five dwords were written", 5, g_logn);
+	EQI("the first write was the mask bit", 1,
+	    g_log[0].off == MSIX_TBL + 12 && g_log[0].val == 1);
+	EQI("the last write cleared it", 1,
+	    g_log[4].off == MSIX_TBL + 12 && g_log[4].val == 0);
+	EQI("and the address went down while it was masked", 1,
+	    g_log[1].off == MSIX_TBL + 0 && g_log[2].off == MSIX_TBL + 4 &&
+	    g_log[3].off == MSIX_TBL + 8);
+
+	EQ32("the message address", 0xFEE01000,
+	     (unsigned)pcie_msix_entry_read(tbl, 0, 0));
+	EQ32("its high half", 0, (unsigned)pcie_msix_entry_read(tbl, 0, 4));
+	EQ32("the vector", 0x30, (unsigned)pcie_msix_entry_read(tbl, 0, 8));
+	EQ32("and the entry is UNMASKED", 0,
+	     (unsigned)pcie_msix_entry_read(tbl, 0, 12));
+
+	/* Entry 1 is still 0xFF poison: a route written one stride off is the
+	 * failure worth refusing. */
+	EQ32("the next entry was not touched", 0xFFFFFFFF,
+	     (unsigned)pcie_msix_entry_read(tbl, 1, 0));
+
+	EQI("programming entry 3 lands at +48", OK,
+	    pcie_msix_entry_set(tbl, 3, 0xFEE05000, 0, 0x31));
+	EQ32("entry 3's vector", 0x31, (unsigned)pcie_msix_entry_read(tbl, 3, 8));
+	EQ32("and entry 0 still holds its own", 0x30,
+	     (unsigned)pcie_msix_entry_read(tbl, 0, 8));
+
+	EQI("a table that was never mapped is refused", E_RANGE,
+	    pcie_msix_entry_set(0, 0, 0xFEE01000, 0, 0x30));
+	EQI("and a negative entry", E_RANGE,
+	    pcie_msix_entry_set(tbl, -1, 0xFEE01000, 0, 0x30));
+	EQ32("a field that is not one of the four reads as zero", 0,
+	     (unsigned)pcie_msix_entry_read(tbl, 0, 3));
+
+	/* The enable. Message control is bits 31:16 of the dword AT the
+	 * capability; cap_id and cap_next below it are read-only. */
+	EQ32("message control starts with 8 entries and no enable", 0x0007,
+	     (unsigned)pcie_msix_ctrl(i));
+	ctrl = pcie_msix_enable(i);
+	EQI("MSI-X is enabled", 1, (ctrl >> 15) & 1);
+	EQI("and the global mask is clear", 0, (ctrl >> 14) & 1);
+	EQ32("the table size underneath is untouched", 0x0007,
+	     (unsigned)(ctrl & 0x7FF));
+	EQ32("cap_id survived the dword write", 0x11,
+	     pcie_cfg_read8(0, 0x03, 0, 0xA0));
+	EQ32("and cap_next did too", 0x00, pcie_cfg_read8(0, 0x03, 0, 0xA1));
+
+	/* INTx LAST. A device with neither a wire nor a message raises
+	 * nothing at all, which is a hang rather than a diagnostic. */
+	cmd = pcie_command(i);
+	EQI("INTx is not disabled before the route exists", 0, (cmd >> 10) & 1);
+	cmd = pcie_intx_disable(i);
+	EQI("and is afterwards", 1, (cmd >> 10) & 1);
+	EQ32("STILL not clearing the W1C status bits", 0xC010,
+	     pcie_cfg_read16(0, 0x03, 0, 0x06));
+
+	/* A function with no MSI-X capability has nothing to enable. */
+	EQI("no capability, no enable", NOT_FOUND,
+	    pcie_msix_enable(index_of(0, 0x1F, 3)));
+	EQI("nor a control word", NOT_FOUND,
+	    pcie_msix_ctrl(index_of(0, 0x1F, 3)));
+	EQI("and an index never walked", NOT_FOUND, pcie_intx_disable(-1));
+}
+
 static void test_no_window(void)
 {
 	pcie_set_window(0, 0, 0);
@@ -615,7 +763,8 @@ static void test_no_window(void)
 int main(void)
 {
 	g_space = malloc((size_t)BUSES * BUS_BYTES);
-	if (!g_space) {
+	g_bar = malloc(BAR_BYTES);
+	if (!g_space || !g_bar) {
 		printf("  FATAL: cannot allocate the config space arena\n");
 		return 2;
 	}
@@ -630,7 +779,9 @@ int main(void)
 	test_caps();
 	test_msix();
 	test_bars();
+	test_msix_route();
 	test_no_window();
 	free(g_space);
+	free(g_bar);
 	return fk_report("pcie");
 }

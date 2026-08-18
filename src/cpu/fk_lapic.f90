@@ -17,7 +17,14 @@ module fk_lapic_m
             lapic_max_lvt, &
             lapic_lvt_cmci, lapic_lvt_timer, lapic_lvt_thermal, &
             lapic_lvt_perf, lapic_lvt_lint0, lapic_lvt_lint1, lapic_lvt_error, &
-            lapic_msr_base, lapic_msr_enabled
+            lapic_msr_base, lapic_msr_enabled, &
+            lapic_msi_addr, lapic_msi_data
+
+  ! SDM Vol.3 11.11.1: the message address is 0FEEh in 31:20, destination in
+  ! 19:12.  It is NOT the LAPIC's MMIO base -- that this machine maps the APIC
+  ! at 0xFEE00000 too is a coincidence of the same fixed prefix.
+  integer(c_int32_t), parameter :: MSI_ADDR_BASE = int(z'FEE00000', c_int32_t)
+  integer(c_int32_t), parameter :: MSI_ADDR_DEST_POS = 12_c_int32_t
 
   integer(c_int32_t), parameter :: REG_ID      = int(z'020', c_int32_t)
   integer(c_int32_t), parameter :: REG_VERSION = int(z'030', c_int32_t)
@@ -280,5 +287,31 @@ contains
     v = 0_c_int32_t
     if (btest(fk_rdmsr(MSR_APIC_BASE), APIC_BASE_EN)) v = 1_c_int32_t
   end function lapic_msr_enabled
+
+  ! THE MESSAGE A DEVICE SENDS, and it is an ADDRESS the device writes to
+  ! rather than a wire it pulls.  SDM Vol.3 11.11.1: bits 31:20 are the fixed
+  ! 0FEEh that makes the write land on the APIC bus instead of in memory, bits
+  ! 19:12 are the destination APIC id, bit 3 is redirection hint and bit 2 is
+  ! destination mode -- both zero here, which is "this exact APIC, physically
+  ! addressed" and is the only form with no dependency on a running scheduler.
+  pure function lapic_msi_addr(dest) result(a) bind(c, name="lapic_msi_addr")
+    implicit none
+    integer(c_int32_t), intent(in), value :: dest
+    integer(c_int32_t) :: a
+
+    a = ior(MSI_ADDR_BASE, shiftl(iand(dest, int(z'FF', c_int32_t)), &
+                                  MSI_ADDR_DEST_POS))
+  end function lapic_msi_addr
+
+  ! SDM Vol.3 11.11.2.  Vector in 7:0; delivery mode 10:8 and trigger mode 15
+  ! are left at zero, which is FIXED and EDGE.  A level-triggered message would
+  ! need bit 14 set as well, and nothing this kernel talks to sends one.
+  pure function lapic_msi_data(vector) result(d) bind(c, name="lapic_msi_data")
+    implicit none
+    integer(c_int32_t), intent(in), value :: vector
+    integer(c_int32_t) :: d
+
+    d = iand(vector, int(z'FF', c_int32_t))
+  end function lapic_msi_data
 
 end module fk_lapic_m

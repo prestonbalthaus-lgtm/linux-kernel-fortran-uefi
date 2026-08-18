@@ -37,6 +37,11 @@ module fk_pcie_m
                              FK_PCI_MSIX_CTRL_QSIZE_POS, &
                              FK_PCI_MSIX_CTRL_QSIZE_LEN, &
                              FK_PCI_MSIX_BIR_POS, FK_PCI_MSIX_BIR_LEN, &
+                             FK_PCI_MSIX_CTRL_MASKALL_BIT, &
+                             FK_PCI_MSIX_CTRL_ENABLE_BIT, &
+                             FK_PCI_MSIX_VCTRL_MASK_BIT, &
+                             FK_PCI_MSIX_ENTRY_STRIDE, &
+                             FK_PCI_CMD_INTX_DISABLE_BIT, &
                              FK_PCI_BAR_SPACE_BIT, FK_PCI_BAR_MEM_TYPE_POS, &
                              FK_PCI_BAR_MEM_TYPE_LEN, FK_PCI_BAR_MEM_TYPE_64, &
                              FK_PCI_BAR_MEM_ADDR_POS
@@ -55,7 +60,11 @@ module fk_pcie_m
             pcie_cmd_disable, &
             pcie_find_cap, pcie_cap_hops, &
             pcie_msix_at, pcie_msix_count, pcie_msix_bir, pcie_msix_offset, &
-            pcie_bar64
+            pcie_bar64, &
+            pcie_msix_entry_set, pcie_msix_entry_read, pcie_msix_entry_addr, &
+            pcie_msix_enable, pcie_msix_ctrl, pcie_intx_disable, &
+            FK_PCI_MSIX_E_ADDR_LO, FK_PCI_MSIX_E_ADDR_HI, &
+            FK_PCI_MSIX_E_DATA, FK_PCI_MSIX_E_VCTRL
 
   ! A configuration read of a function that is not there returns all ones on
   ! every dword, so the vendor id is the probe.
@@ -87,6 +96,12 @@ module fk_pcie_m
   integer(c_int32_t), parameter :: MSIX_OFF_TBL  = 4_c_int32_t
 
   integer(c_int64_t), parameter :: MASK32 = int(z'FFFFFFFF', c_int64_t)
+
+  ! The four dwords of one MSI-X table entry, pci_regs.h:345-352.
+  integer(c_int32_t), parameter :: FK_PCI_MSIX_E_ADDR_LO = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_PCI_MSIX_E_ADDR_HI = 4_c_int32_t
+  integer(c_int32_t), parameter :: FK_PCI_MSIX_E_DATA    = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_PCI_MSIX_E_VCTRL   = 12_c_int32_t
 
   integer(c_int32_t), parameter :: DEVS_PER_BUS = 32_c_int32_t
   integer(c_int32_t), parameter :: FNS_PER_DEV  =  8_c_int32_t
@@ -676,5 +691,121 @@ contains
     hi = pcie_cfg_read32(bus, dev, fn, OFF_BAR0 + 4_c_int32_t * (n + 1))
     a = ior(a, shiftl(iand(int(hi, c_int64_t), MASK32), 32))
   end function pcie_bar64
+
+  ! THE TABLE IS NOT CONFIGURATION SPACE.  It lives in device memory behind a
+  ! BAR, so the caller passes the VIRTUAL address the VMM mapped that BAR at,
+  ! plus the capability's own table offset -- this module never learns where
+  ! the mapping is, exactly as it never learns the ECAM window's physical base.
+  pure function pcie_msix_entry_addr(tbl, entry) result(a) &
+       bind(c, name="pcie_msix_entry_addr")
+    implicit none
+    integer(c_int64_t), intent(in), value :: tbl
+    integer(c_int32_t), intent(in), value :: entry
+    integer(c_int64_t) :: a
+
+    a = tbl + int(entry, c_int64_t) * int(FK_PCI_MSIX_ENTRY_STRIDE, c_int64_t)
+  end function pcie_msix_entry_addr
+
+  ! ORDER IS ARCHITECTURAL, not stylistic.  PCI 3.0 section 6.8.3.5: an entry
+  ! may only be changed while it is MASKED, and the mask bit is cleared LAST.
+  ! Writing the address while the entry is live lets the device send a message
+  ! built from half of one route and half of the next.  The entry comes out of
+  ! reset masked, and this masks it again anyway, because a route programmed
+  ! twice is exactly the case the rule exists for.
+  !
+  ! Four dwords through fk_writel and no wider access: an entry is 16 bytes but
+  ! nothing guarantees a 16-byte write reaches it as one.
+  function pcie_msix_entry_set(tbl, entry, addr_lo, addr_hi, data) &
+       result(status) bind(c, name="pcie_msix_entry_set")
+    implicit none
+    integer(c_int64_t), intent(in), value :: tbl
+    integer(c_int32_t), intent(in), value :: entry, addr_lo, addr_hi, data
+    integer(c_int32_t) :: status
+    integer(c_int64_t) :: e
+
+    status = FK_PCIE_E_RANGE
+    if (tbl == 0_c_int64_t .or. entry < 0_c_int32_t) return
+    e = pcie_msix_entry_addr(tbl, entry)
+
+    call fk_writel(e + FK_PCI_MSIX_E_VCTRL, &
+                   ibset(0_c_int32_t, FK_PCI_MSIX_VCTRL_MASK_BIT))
+    call fk_writel(e + FK_PCI_MSIX_E_ADDR_LO, addr_lo)
+    call fk_writel(e + FK_PCI_MSIX_E_ADDR_HI, addr_hi)
+    call fk_writel(e + FK_PCI_MSIX_E_DATA, data)
+    call fk_writel(e + FK_PCI_MSIX_E_VCTRL, 0_c_int32_t)
+    status = FK_PCIE_OK
+  end function pcie_msix_entry_set
+
+  function pcie_msix_entry_read(tbl, entry, field) result(v) &
+       bind(c, name="pcie_msix_entry_read")
+    implicit none
+    integer(c_int64_t), intent(in), value :: tbl
+    integer(c_int32_t), intent(in), value :: entry, field
+    integer(c_int32_t) :: v
+
+    v = 0_c_int32_t
+    if (tbl == 0_c_int64_t .or. entry < 0_c_int32_t) return
+    if (field /= FK_PCI_MSIX_E_ADDR_LO .and. field /= FK_PCI_MSIX_E_ADDR_HI &
+        .and. field /= FK_PCI_MSIX_E_DATA .and. &
+        field /= FK_PCI_MSIX_E_VCTRL) return
+    v = fk_readl(pcie_msix_entry_addr(tbl, entry) + int(field, c_int64_t))
+  end function pcie_msix_entry_read
+
+  ! Message control is bits 31:16 of the dword at the capability, above cap_id
+  ! and cap_next.  Those two are READ-ONLY, so echoing them back is inert --
+  ! the same reasoning as pcie_cmd_enable's zeroed status half, arrived at from
+  ! the other direction: there the untouched half had to be written as zero,
+  ! here it has to be written as what it already is.
+  !
+  ! MASKALL is cleared in the same write that sets ENABLE.  A function whose
+  ! table is programmed and whose global mask is still set is a device that has
+  ! a route and cannot use it.
+  function pcie_msix_enable(i) result(v) bind(c, name="pcie_msix_enable")
+    implicit none
+    integer(c_int32_t), intent(in), value :: i
+    integer(c_int32_t) :: v, bus, dev, fn, cap, dw, st
+
+    v = FK_PCIE_NOT_FOUND
+    cap = pcie_msix_at(i)
+    if (cap == FK_PCIE_NOT_FOUND) return
+    if (.not. bdf_of(i, bus, dev, fn)) return
+
+    dw = pcie_cfg_read32(bus, dev, fn, cap)
+    dw = ibset(dw, 16_c_int32_t + FK_PCI_MSIX_CTRL_ENABLE_BIT)
+    dw = ibclr(dw, 16_c_int32_t + FK_PCI_MSIX_CTRL_MASKALL_BIT)
+    st = pcie_cfg_write32(bus, dev, fn, cap, dw)
+    if (st /= FK_PCIE_OK) return
+    v = pcie_msix_ctrl(i)
+  end function pcie_msix_enable
+
+  function pcie_msix_ctrl(i) result(v) bind(c, name="pcie_msix_ctrl")
+    implicit none
+    integer(c_int32_t), intent(in), value :: i
+    integer(c_int32_t) :: v, bus, dev, fn, cap
+
+    v = FK_PCIE_NOT_FOUND
+    cap = pcie_msix_at(i)
+    if (cap == FK_PCIE_NOT_FOUND) return
+    if (.not. bdf_of(i, bus, dev, fn)) return
+    v = pcie_cfg_read16(bus, dev, fn, cap + MSIX_OFF_CTRL)
+  end function pcie_msix_ctrl
+
+  ! INTx LAST, and never before a message route exists.  This bit takes the
+  ! device's legacy wire away; a controller with neither a wire nor a working
+  ! message can raise nothing at all, which is a hang rather than a diagnostic.
+  function pcie_intx_disable(i) result(v) bind(c, name="pcie_intx_disable")
+    implicit none
+    integer(c_int32_t), intent(in), value :: i
+    integer(c_int32_t) :: v, bus, dev, fn, cmd, st
+
+    v = FK_PCIE_NOT_FOUND
+    if (.not. bdf_of(i, bus, dev, fn)) return
+    cmd = pcie_cfg_read16(bus, dev, fn, OFF_CMDSTAT)
+    cmd = ibset(cmd, FK_PCI_CMD_INTX_DISABLE_BIT)
+    st = pcie_cfg_write32(bus, dev, fn, OFF_CMDSTAT, &
+                          iand(cmd, int(z'FFFF', c_int32_t)))
+    if (st /= FK_PCIE_OK) return
+    v = pcie_cfg_read16(bus, dev, fn, OFF_CMDSTAT)
+  end function pcie_intx_disable
 
 end module fk_pcie_m
