@@ -224,8 +224,14 @@ Fortran Kernel: heap coalesced every freed block back into one, largest free 0x'
 FK_PCIE_PASS_LINES=$'Fortran Kernel: PCIe looking for the ECAM window (roadmap 4.2).
 Fortran Kernel: the ECAM window has no write-back alias in the linear map.
 Fortran Kernel: the ECAM mapping selects PWT and PCD, strong uncacheable.
-Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2).'
+Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2).
+Fortran Kernel: xHCI COMMAND firmware/cleared/enabled 0x
+Fortran Kernel: xHCI decode and bus mastering were taken DOWN and put back by this kernel.
+Fortran Kernel: xHCI BAR0 0x
+Fortran Kernel: xHCI MSI-X cap/entries/bar/offset 0x'
 FK_PCIE_FAIL_LINES=$'Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map.
+Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
+Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route.
 Fortran Kernel: the ECAM mapping is CACHED.
 Fortran Kernel: the MCFG table would not parse, status 0x
 Fortran Kernel: the ECAM window could not be taken out of the linear map, status 0x
@@ -234,7 +240,9 @@ Fortran Kernel: the PCIe list is TRUNCATED; the machine has more functions than 
 if [[ "${FK_MACHINE:-q35}" == pc ]]; then
   FK_PCIE_PASS_LINES=$'Fortran Kernel: PCIe looking for the ECAM window (roadmap 4.2).
 Fortran Kernel: no MCFG table; this machine has no ECAM window.'
-  FK_PCIE_FAIL_LINES=$'Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2).'
+  FK_PCIE_FAIL_LINES=$'Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2).
+Fortran Kernel: xHCI COMMAND firmware/cleared/enabled 0x
+Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.'
 else
   FK_PCIE_FAIL_LINES="$FK_PCIE_FAIL_LINES
 Fortran Kernel: no MCFG table; this machine has no ECAM window."
@@ -648,6 +656,13 @@ QEMU_ARGS=(
   -qmp "unix:$SOCK,server,nowait"
   -accel "$ACCEL"
 )
+# roadmap 5.1. q35 has no USB controller of any kind unless one is asked for,
+# so the milestone's own device is part of the machine the gate runs. It takes
+# the function set from five to six; the PCI check needs no change for that,
+# because it reads 'info pci' off the live monitor and diffs it against the
+# guest's list as sets, so both sides grow together. What is hardcoded to five
+# is qmp-sentinel's own --selftest fixture, which moves with this.
+[[ "$MACHINE" == pc ]] || QEMU_ARGS+=( -device qemu-xhci )
 [[ "$MODE" == gate ]] && QEMU_ARGS+=( -cdrom "$ISO" )
 
 # FK_FIRMWARE=uefi boots the SAME ISO through OVMF instead of SeaBIOS (roadmap
