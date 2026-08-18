@@ -43,7 +43,7 @@ module fk_pmm_m
             FK_PMM_E_RANGE, FK_PMM_E_NOT_RAM, FK_PMM_E_DOUBLE_FREE, &
             FK_PMM_E_LOCKED, &
             pmm_init, pmm_alloc_page, pmm_alloc_page_from, pmm_free_page, &
-            pmm_page_is_free, &
+            pmm_alloc_contiguous, pmm_free_contiguous, pmm_page_is_free, &
             pmm_total_pages, pmm_free_pages, pmm_used_pages, &
             pmm_ignored_bytes, pmm_region_count, pmm_region_base, &
             pmm_region_len, pmm_region_type, pmm_verify_reserved, &
@@ -704,6 +704,102 @@ contains
        end do
     end do
   end function pmm_alloc_page_from
+
+  ! PAGES contiguous free frames, or 0.  The block allocator above cannot serve
+  ! this and does not try: heap_sbrk hands out a virtual window mapped from
+  ! whatever frames were free, and a bus master does not walk the CPU's page
+  ! tables.  The answer is a PHYSICAL base because that is the address the
+  ! DEVICE uses; vmm_phys_to_virt turns it into the one the CPU uses.
+  !
+  ! First fit, scanned as WORDS.  A full word cannot contribute to a run, so
+  ! the scan skips its 64 bits outright rather than testing them.  A clear bit
+  ! is by construction usable RAM -- pmm_init marks the whole bitmap used and
+  ! clears only AVAILABLE regions -- so a contiguous run of clear bits is a
+  ! contiguous run of frames and needs no second check against the region
+  ! table.  What page granularity does NOT promise is a run clear of a 64 KiB
+  ! boundary, which a TRB data buffer may not cross
+  ! (vendor/linux-7.1.8/drivers/usb/host/xhci.h:1265).
+  function pmm_alloc_contiguous(pages) result(phys) &
+       bind(c, name="pmm_alloc_contiguous")
+    implicit none
+    integer(c_int64_t), intent(in), value :: pages
+    integer(c_int64_t) :: phys
+    integer(c_int64_t) :: page, run_start, run
+    integer(c_int32_t) :: w, b
+
+    phys = 0_c_int64_t
+    if (.not. ready) return
+    if (pages <= 0_c_int64_t) return
+    if (pages > int(FK_PMM_PAGES, c_int64_t)) return
+
+    run       = 0_c_int64_t
+    run_start = 0_c_int64_t
+    page      = 0_c_int64_t
+    do w = 1_c_int32_t, FK_PMM_WORDS
+       if (bitmap(w) == FK_PMM_WORD_FULL) then
+          run  = 0_c_int64_t
+          page = page + 64_c_int64_t
+          cycle
+       end if
+       do b = 0_c_int32_t, 63_c_int32_t
+          if (btest(bitmap(w), b)) then
+             run = 0_c_int64_t
+          else
+             if (run == 0_c_int64_t) run_start = page
+             run = run + 1_c_int64_t
+             if (run == pages) then
+                call mark_run(run_start, pages)
+                phys = ishft(run_start, FK_PMM_PAGE_SHIFT)
+                return
+             end if
+          end if
+          page = page + 1_c_int64_t
+       end do
+    end do
+  end function pmm_alloc_contiguous
+
+  ! The cursor is deliberately not touched.  It is a lower bound on where a
+  ! free frame can be, and every word below it was FULL when pmm_alloc_page
+  ! last moved it forward; pmm_free_page is the only thing that can put a free
+  ! frame below it, and it moves the cursor back itself.  Marking frames USED
+  ! can only make that bound more true, so a run never invalidates it -- and a
+  ! run can never start below it either, which is why this is not a case that
+  ! needs handling rather than one that has been forgotten.
+  subroutine mark_run(first_page, count)
+    implicit none
+    integer(c_int64_t), intent(in) :: first_page, count
+    integer(c_int64_t) :: p
+    integer(c_int32_t) :: w, b
+
+    do p = first_page, first_page + count - 1_c_int64_t
+       w = int(ishft(p, -6), c_int32_t) + 1_c_int32_t
+       b = int(iand(p, 63_c_int64_t), c_int32_t)
+       bitmap(w) = ibset(bitmap(w), b)
+    end do
+    free_count = free_count - count
+  end subroutine mark_run
+
+  ! Hands a run back one frame at a time through the checked single-frame path,
+  ! so a caller that frees a range it never owned is refused by exactly the
+  ! rules that refuse a stray pmm_free_page -- and refused at the first bad
+  ! frame, leaving the rest of the run allocated rather than half-released.
+  function pmm_free_contiguous(phys, pages) result(status) &
+       bind(c, name="pmm_free_contiguous")
+    implicit none
+    integer(c_int64_t), intent(in), value :: phys, pages
+    integer(c_int32_t) :: status
+    integer(c_int64_t) :: i
+
+    status = FK_PMM_OK
+    if (pages <= 0_c_int64_t) then
+       status = FK_PMM_E_RANGE
+       return
+    end if
+    do i = 0_c_int64_t, pages - 1_c_int64_t
+       status = pmm_free_page(phys + ishft(i, FK_PMM_PAGE_SHIFT))
+       if (status /= FK_PMM_OK) return
+    end do
+  end function pmm_free_contiguous
 
   function pmm_free_page(phys) result(status) bind(c, name="pmm_free_page")
     implicit none
