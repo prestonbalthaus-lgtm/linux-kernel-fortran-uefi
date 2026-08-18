@@ -12,7 +12,8 @@ module fk_pic_m
   implicit none
   private
   public :: FK_PIC1_VECTOR, FK_PIC2_VECTOR, FK_PIC_LINES, FK_PIC_CASCADE, &
-            pic_remap, pic_eoi, pic_mask, pic_unmask, pic_imr, pic_isr
+            pic_remap, pic_disable, pic_eoi, pic_mask, pic_unmask, &
+            pic_imr, pic_isr
 
   integer(c_int32_t), parameter :: PIC1_CMD  = int(z'20', c_int32_t)
   integer(c_int32_t), parameter :: PIC1_DATA = int(z'21', c_int32_t)
@@ -109,6 +110,26 @@ contains
     if (fk_inb(PIC1_DATA) /= FK_MASK_ALL) status = 1_c_int32_t
     if (fk_inb(PIC2_DATA) /= FK_MASK_ALL) status = 1_c_int32_t
   end function pic_remap
+
+  ! Every line masked on both chips, and THE ANSWER IS THE CHIPS' OWN: after
+  ! the ICW sequence a read of the data port returns the IMR, so this reports
+  ! what the hardware holds rather than what it was asked to hold.
+  !
+  ! Masked is not the same as gone.  PCAT_COMPAT firmware leaves both 8259s
+  ! wired to the LAPIC's LINT0 as ExtINT, and a masked chip simply never
+  ! asserts; the pair is still there, still remapped away from the CPU's
+  ! exception vectors, and still the thing that would deliver if a line were
+  ! ever unmasked again.
+  function pic_disable() result(status) bind(c, name="pic_disable")
+    implicit none
+    integer(c_int32_t) :: status
+
+    call fk_outb(PIC1_DATA, FK_MASK_ALL)
+    call fk_outb(PIC2_DATA, FK_MASK_ALL)
+    status = 0_c_int32_t
+    if (fk_inb(PIC1_DATA) /= FK_MASK_ALL) status = 1_c_int32_t
+    if (fk_inb(PIC2_DATA) /= FK_MASK_ALL) status = 1_c_int32_t
+  end function pic_disable
 
   ! Acknowledge line irq.  SLAVE FIRST, THEN MASTER, and only ever the master
   ! for a line below 8: a slave interrupt reaches the CPU through the master's

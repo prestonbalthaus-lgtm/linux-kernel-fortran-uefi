@@ -503,12 +503,31 @@ case_M32() {
   subst src/cpu/fk_idt.f90 $'    do v = 0_c_int32_t, FK_PIC_LINES - 1_c_int32_t\n       call idt_set_gate(FK_PIC1_VECTOR + v, fk_irq_stub(v))\n    end do\n\n' ''
   run_case M32-irq-gates-not-present
 }
-# THE ONE EXPECTED TO ESCAPE, and it is run in order to find out rather than to
-# be right: delete the three OUTs and the chip keeps whatever divisor the
-# firmware left, which on this machine still ticks -- at 18.2 Hz. Every console
-# line still passes, because the divisor the kernel prints is the one it
-# COMPUTED and not one it read back, and the 8253 has no readback for the
-# reload value. Closing it needs a timing assertion nobody has written.
+# THE ONE THAT ESCAPES, AND IT DEPENDS ON THE MACHINE. Delete the three OUTs
+# and the chip keeps whatever divisor the firmware left, which still ticks --
+# at 18.2 Hz instead of 100. Every console line still passes: the divisor the
+# kernel prints is the one it COMPUTED, and the 8253 has no readback for the
+# reload value.
+#
+#     FK_MACHINE=pc    CAUGHT,  2 runs out of 2
+#     FK_MACHINE=q35   ESCAPES, 2 runs out of 2   <-- and q35 is the default
+#
+# What catches it on i440FX is FK_CHECK_SCHED, and by accident rather than by
+# design: it reads the two spawned threads' own loop counters a quarter of a
+# second apart, and at 18.2 Hz they do not move in that window. Context
+# switches still grow, so the machine is demonstrably alive; the per-thread
+# counters are simply not sampled often enough to change. On q35 the same
+# sampling lands the other side of the margin and both counters move.
+#
+# THIS IS THE WHOLE POINT: it was a MARGIN and not a bound, and roadmap 4.2
+# moving the gate's default machine to q35 was enough to move it back. An
+# earlier version of this comment claimed the mutation was closed, on the
+# strength of three runs on the machine that was default at the time. It was
+# not closed; it was lucky.
+#
+# Closing it for real needs a frequency assertion -- ticks counted against a
+# wall-clock interval read from outside the guest -- and NOT a longer
+# FK_SCHED interval, which would only re-hide it on one machine again.
 case_M33() {
   subst src/drivers/pit/fk_pit.f90 $'    call fk_outb(PIT_CMD, FK_PIT_MODE)\n    call fk_outb(PIT_CH0, iand(divisor, FK_BYTE))\n    call fk_outb(PIT_CH0, iand(ishft(divisor, -8), FK_BYTE))\n' ''
   run_case M33-pit-never-programmed

@@ -40,6 +40,8 @@ int32_t pmm_init(int64_t mbi_phys);
 int64_t pmm_alloc_page(void);
 int32_t pmm_free_page(int64_t phys);
 int32_t pmm_page_is_free(int64_t phys);
+int64_t pmm_alloc_contiguous(int64_t pages);
+int32_t pmm_free_contiguous(int64_t phys, int64_t pages);
 int64_t pmm_total_pages(void);
 int64_t pmm_free_pages(void);
 int64_t pmm_used_pages(void);
@@ -483,6 +485,259 @@ static void test_malformed(void)
 	}
 }
 
+/* Take single frames until WANT of them come back consecutively, and leave the
+ * rejects allocated.  The low end of a real map is not one unbroken run -- the
+ * kernel image and the loader's structure are locked out in the middle of it --
+ * so a test that needs a known layout has to find its own window rather than
+ * assume the first N allocations give one. */
+static int grab_contig(int64_t *out, int want)
+{
+	int have = 0, guard = 0;
+	int64_t p;
+
+	while (have < want && guard++ < 200000) {
+		p = pmm_alloc_page();
+		if (p == 0)
+			return 0;
+		if (have && p != out[have - 1] + (int64_t)PAGE_SIZE)
+			have = 0;
+		out[have++] = p;
+	}
+	return have == want;
+}
+
+/* --- contiguous runs ----------------------------------------------------- */
+static void test_contiguous(void)
+{
+	uint64_t mlo = (uint64_t)(uintptr_t)mbi_mem;
+	int64_t base, second, before;
+	int i;
+
+	mbi_build(MAP_QEMU24, 8, 24, 1, 0);
+	EQ32("contig fixture", PMM_OK, pmm_init((int64_t)mlo));
+	before = pmm_free_pages();
+
+	base = pmm_alloc_contiguous(4);
+	EQ64("a run of four comes back", 1, base != 0);
+	EQ64("the run is page aligned", 0, base & (int64_t)(PAGE_SIZE - 1));
+	EQ64("four frames left the pool", before - 4, pmm_free_pages());
+
+	/* Every frame in the run is used, and the frame just past it is not.
+	 * An allocator that sets one bit too many passes every other check. */
+	for (i = 0; i < 4; i++)
+		EQ32("run frame is used", 0,
+		     pmm_page_is_free(base + (int64_t)i * PAGE_SIZE));
+
+	/* A second run cannot overlap the first. */
+	second = pmm_alloc_contiguous(4);
+	EQ64("a second run comes back", 1, second != 0);
+	EQ64("the two runs are disjoint", 1,
+	     (second + 4 * (int64_t)PAGE_SIZE <= base) ||
+	     (second >= base + 4 * (int64_t)PAGE_SIZE));
+
+	/* Freeing hands every frame back, and only those frames. */
+	EQ32("free_contiguous accepts its own run", PMM_OK,
+	     pmm_free_contiguous(base, 4));
+	for (i = 0; i < 4; i++)
+		EQ32("freed run frame reads free", 1,
+		     pmm_page_is_free(base + (int64_t)i * PAGE_SIZE));
+	EQ32("free_contiguous accepts the second", PMM_OK,
+	     pmm_free_contiguous(second, 4));
+	EQ64("both runs came back", before, pmm_free_pages());
+
+	/* Degenerate and impossible asks are refusals, not faults. */
+	EQ64("zero pages refused", 0, pmm_alloc_contiguous(0));
+	EQ64("negative pages refused", 0, pmm_alloc_contiguous(-1));
+	EQ64("a run larger than the bitmap refused", 0,
+	     pmm_alloc_contiguous((int64_t)1 << 40));
+	EQ64("refused asks changed nothing", before, pmm_free_pages());
+
+	EQ32("free of zero pages refused", E_RANGE, pmm_free_contiguous(0, 0));
+	EQ32("free of a negative count refused", E_RANGE,
+	     pmm_free_contiguous(0, -1));
+
+	/* A run of one is the single-frame allocator's job done twice over, and
+	 * it must not disagree with it. */
+	base = pmm_alloc_contiguous(1);
+	EQ64("a run of one comes back", 1, base != 0);
+	EQ32("the run of one is used", 0, pmm_page_is_free(base));
+	EQ32("and frees", PMM_OK, pmm_free_contiguous(base, 1));
+
+	/* The run must be contiguous in the BITMAP, which is what a device
+	 * cares about: allocate a long one and walk it frame by frame. */
+	base = pmm_alloc_contiguous(64);
+	EQ64("a run of sixty-four comes back", 1, base != 0);
+	for (i = 0; i < 64; i++)
+		EQ32("long run frame is used", 0,
+		     pmm_page_is_free(base + (int64_t)i * PAGE_SIZE));
+	EQ32("frame past the long run is untouched", 1,
+	     pmm_page_is_free(base + 64 * (int64_t)PAGE_SIZE));
+	EQ32("long run frees", PMM_OK, pmm_free_contiguous(base, 64));
+	EQ64("the long run came back whole", before, pmm_free_pages());
+
+	/* A run that spans a bitmap word boundary is the case the word-skipping
+	 * scan can get wrong.  Take single frames until the next allocation
+	 * would start mid-word, then ask for a run that must cross into the
+	 * following word. */
+	{
+		int64_t held[70];
+		int n = 0;
+
+		while (n < 70) {
+			held[n] = pmm_alloc_page();
+			if (held[n] == 0)
+				break;
+			n++;
+			if (n >= 5)
+				break;
+		}
+		base = pmm_alloc_contiguous(70);
+		EQ64("a word-crossing run comes back", 1, base != 0);
+		for (i = 0; i < 70; i++)
+			EQ32("word-crossing frame is used", 0,
+			     pmm_page_is_free(base + (int64_t)i * PAGE_SIZE));
+		EQ32("word-crossing run frees", PMM_OK,
+		     pmm_free_contiguous(base, 70));
+		for (i = 0; i < n; i++)
+			EQ32("held frame frees", PMM_OK, pmm_free_page(held[i]));
+		EQ64("everything came back", before, pmm_free_pages());
+	}
+
+	EQ32("free of an unaligned base refused", E_UNALIGNED,
+	     pmm_free_contiguous(PAGE_SIZE + 8, 1));
+
+	/* THE CASE A FRESH BITMAP CANNOT TEST.  On an untouched allocator every
+	 * free frame is contiguous with the next, so an implementation that
+	 * never restarts its run counter returns exactly the same answer as one
+	 * that does.  Fragment the low end first -- take sixteen frames and give
+	 * back every other one, leaving holes of exactly one frame -- and then
+	 * ask for four.  No run of four exists in that region, so a correct
+	 * allocator must step over the whole of it. */
+	{
+		int64_t frag[16];
+		int n;
+
+		for (n = 0; n < 16; n++) {
+			frag[n] = pmm_alloc_page();
+			EQ64("fragmenter got a frame", 1, frag[n] != 0);
+		}
+		for (n = 0; n < 16; n += 2)
+			EQ32("fragmenter freed a frame", PMM_OK,
+			     pmm_free_page(frag[n]));
+
+		base = pmm_alloc_contiguous(4);
+		EQ64("a run comes back past the holes", 1, base != 0);
+		EQ64("the run starts beyond the fragmented region", 1,
+		     base > frag[15]);
+		for (i = 0; i < 4; i++)
+			EQ32("fragmented-case frame is used", 0,
+			     pmm_page_is_free(base + (int64_t)i * PAGE_SIZE));
+		/* And the holes are STILL free: the run took none of them. */
+		for (n = 0; n < 16; n += 2)
+			EQ32("the hole survived the run", 1,
+			     pmm_page_is_free(frag[n]));
+
+		EQ32("fragmented-case run frees", PMM_OK,
+		     pmm_free_contiguous(base, 4));
+		for (n = 1; n < 16; n += 2)
+			EQ32("fragmenter frame frees", PMM_OK,
+			     pmm_free_page(frag[n]));
+		EQ64("the fragmented pool came back whole", before,
+		     pmm_free_pages());
+	}
+
+	/* Same shape, one word wider: a three-frame hole cannot hold a run of
+	 * four either, and the scan has to cross a bitmap word boundary to find
+	 * one that can. */
+	{
+		int64_t held[80];
+		int n;
+
+		for (n = 0; n < 80; n++)
+			held[n] = pmm_alloc_page();
+		for (n = 0; n < 80; n += 4) {
+			EQ32("wide fragmenter freed", PMM_OK,
+			     pmm_free_page(held[n]));
+			if (n + 1 < 80)
+				EQ32("wide fragmenter freed", PMM_OK,
+				     pmm_free_page(held[n + 1]));
+			if (n + 2 < 80)
+				EQ32("wide fragmenter freed", PMM_OK,
+				     pmm_free_page(held[n + 2]));
+		}
+		base = pmm_alloc_contiguous(4);
+		EQ64("a run comes back past the wide holes", 1, base != 0);
+		EQ64("it starts beyond the three-frame holes", 1,
+		     base > held[79]);
+		EQ32("wide run frees", PMM_OK, pmm_free_contiguous(base, 4));
+		for (n = 0; n < 80; n++)
+			if (n % 4 == 3)
+				EQ32("wide holder frees", PMM_OK,
+				     pmm_free_page(held[n]));
+		EQ64("the wide pool came back whole", before, pmm_free_pages());
+	}
+
+	/* THE RUN'S BASE IS THE FIRST FRAME, NOT THE LAST.  Every check above
+	 * would still pass if the allocator answered with the run's END and
+	 * marked forward from there, because on a mostly-free bitmap the frames
+	 * past the end happen to be free too.  Build a gap of EXACTLY the size
+	 * asked for, bounded by used frames on both sides and with nothing
+	 * before it that could hold the run, and the correct answer becomes a
+	 * single address. */
+	{
+		int64_t held[300];
+		int64_t want;
+		int n;
+
+		mbi_build(MAP_QEMU24, 8, 24, 1, 0);
+		EQ32("exact-gap fixture", PMM_OK, pmm_init((int64_t)mlo));
+		EQ64("the holders are contiguous", 1, grab_contig(held, 300));
+
+		for (n = 100; n < 120; n++)
+			EQ32("gap frame freed", PMM_OK, pmm_free_page(held[n]));
+
+		want = held[100];
+		base = pmm_alloc_contiguous(20);
+		EQ64("the run of twenty is the gap itself", want, base);
+		EQ32("the frame below the gap is still used", 0,
+		     pmm_page_is_free(held[99]));
+		EQ32("the frame above the gap is still used", 0,
+		     pmm_page_is_free(held[120]));
+	}
+
+	/* A FULL BITMAP WORD BREAKS A RUN.  The scan skips a word whose bits are
+	 * all set instead of testing them one by one; an implementation that
+	 * skips it without also restarting the run counter will happily join the
+	 * free frames on either side of sixty-four used ones and report a run
+	 * that straddles them.  Place ten free frames ending at a word boundary,
+	 * a full word of used frames after it, and ten more free frames beyond
+	 * -- then ask for fifteen, which fits in neither stretch. */
+	{
+		int64_t held[400];
+		int64_t p0, w;
+		int n;
+
+		mbi_build(MAP_QEMU24, 8, 24, 1, 0);
+		EQ32("word-skip fixture", PMM_OK, pmm_init((int64_t)mlo));
+		EQ64("the word-skip holders are contiguous", 1,
+		     grab_contig(held, 400));
+
+		p0 = held[0] / (int64_t)PAGE_SIZE;
+		w  = ((p0 + 10 + 63) / 64) * 64;      /* first word boundary past p0+10 */
+
+		for (n = (int)(w - 10 - p0); n < (int)(w - p0); n++)
+			EQ32("stretch A freed", PMM_OK, pmm_free_page(held[n]));
+		for (n = (int)(w + 64 - p0); n < (int)(w + 74 - p0); n++)
+			EQ32("stretch B freed", PMM_OK, pmm_free_page(held[n]));
+
+		base = pmm_alloc_contiguous(15);
+		EQ64("a run of fifteen comes back", 1, base != 0);
+		EQ64("it did not straddle the full word", 1, base > held[399]);
+		EQ32("stretch A survived", 1, pmm_page_is_free(held[(int)(w - 10 - p0)]));
+		EQ32("stretch B survived", 1, pmm_page_is_free(held[(int)(w + 64 - p0)]));
+	}
+}
+
 /* --- allocation --------------------------------------------------------- */
 static void test_alloc_free(void)
 {
@@ -677,6 +932,7 @@ int main(void)
 
 	test_malformed();
 	test_alloc_free();
+	test_contiguous();
 	test_verifiers_can_fail();
 	test_reinit();
 

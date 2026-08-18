@@ -34,6 +34,25 @@ int32_t lapic_msr_enabled(void);
 
 /* Supplied by boot/mmu.S in the kernel; by the model below here. */
 int64_t fk_rdmsr(int32_t msr);
+
+/* boot/io.S's MMIO accessors.  fk_lapic_m reaches every register through these
+ * rather than through a volatile Fortran pointer, because -O2 narrows such a
+ * pointer's load when only some of its bits are used -- and a one-byte read of
+ * a local APIC register is undefined (SDM Vol.3 11.4.1).  Supplied here for
+ * the same reason fk_rdmsr is: assembling boot/io.S into a host test would
+ * drag in the port-I/O instructions with it. */
+int32_t fk_readl(int64_t addr);
+void    fk_writel(int64_t addr, int32_t v);
+
+int32_t fk_readl(int64_t addr)
+{
+	return *(volatile int32_t *)(uintptr_t)addr;
+}
+
+void fk_writel(int64_t addr, int32_t v)
+{
+	*(volatile int32_t *)(uintptr_t)addr = v;
+}
 void    fk_wrmsr(int32_t msr, int64_t value);
 
 /* --- the modelled MSR ---------------------------------------------------- */

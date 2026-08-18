@@ -8,7 +8,7 @@
 ! consults the MSR to find itself, which is also what lets a host test point the
 ! driver at an ordinary 4 KiB buffer.
 module fk_lapic_m
-  use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t, c_ptr, c_f_pointer
+  use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t
   implicit none
   private
   public :: lapic_init, lapic_eoi, lapic_id, lapic_version, lapic_svr, &
@@ -57,6 +57,18 @@ module fk_lapic_m
 
   interface
     ! boot/mmu.S.  RDMSR is privileged and unspellable in Fortran.
+    function fk_readl(addr) result(v) bind(c, name="fk_readl")
+      import :: c_int32_t, c_int64_t
+      implicit none
+      integer(c_int64_t), intent(in), value :: addr
+      integer(c_int32_t)                    :: v
+    end function fk_readl
+    subroutine fk_writel(addr, v) bind(c, name="fk_writel")
+      import :: c_int32_t, c_int64_t
+      implicit none
+      integer(c_int64_t), intent(in), value :: addr
+      integer(c_int32_t), intent(in), value :: v
+    end subroutine fk_writel
     function fk_rdmsr(msr) result(v) bind(c, name="fk_rdmsr")
       import :: c_int32_t, c_int64_t
       implicit none
@@ -67,32 +79,32 @@ module fk_lapic_m
 
 contains
 
-  ! Every LAPIC register is 32 bits wide and the chip's behaviour under any
-  ! other access width is undefined, so the mapping is onto a c_int32_t scalar:
-  ! one whole-register load or store, never a 64-bit one.
+  ! Every local APIC register must be read and written with a NATURALLY
+  ! ALIGNED 4-BYTE access; anything else is undefined (SDM Vol.3 11.4.1).
+  !
+  ! This used to be a volatile Fortran pointer and that was not enough.
+  ! lapic_max_lvt is ibits(reg_read(base, REG_VERSION), 16, 8), and -O2 proved
+  ! only one byte of the load was ever used and emitted `movzbl 0x2(%rax)` --
+  ! a one-byte read of the version register, through a VOLATILE pointer.
+  ! Fortran's VOLATILE forbids eliminating and reordering an access; it does
+  ! not forbid narrowing one.  QEMU answered that read with zero, so
+  ! lapic_max_lvt reported 0 and lapic_init's `>= 6` guard around LVT_CMCI was
+  ! deciding on a value it had no lawful way to obtain.
   function reg_read(base, off) result(v)
     implicit none
     integer(c_int64_t), intent(in) :: base
     integer(c_int32_t), intent(in) :: off
     integer(c_int32_t) :: v
-    integer(c_int32_t), volatile, pointer :: r
-    type(c_ptr) :: p
 
-    p = transfer(base + int(off, c_int64_t), p)
-    call c_f_pointer(p, r)
-    v = r
+    v = fk_readl(base + int(off, c_int64_t))
   end function reg_read
 
   subroutine reg_write(base, off, v)
     implicit none
     integer(c_int64_t), intent(in) :: base
     integer(c_int32_t), intent(in) :: off, v
-    integer(c_int32_t), volatile, pointer :: r
-    type(c_ptr) :: p
 
-    p = transfer(base + int(off, c_int64_t), p)
-    call c_f_pointer(p, r)
-    r = v
+    call fk_writel(base + int(off, c_int64_t), v)
   end subroutine reg_write
 
   ! base is the already-mapped virtual address of the LAPIC page.  Order is

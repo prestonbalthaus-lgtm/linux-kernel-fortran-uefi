@@ -95,6 +95,7 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/drivers/pit/fk_pit.f90 \
                src/cpu/fk_idt.f90 \
                src/cpu/fk_lapic.f90 \
+               src/cpu/fk_ioapic.f90 \
                src/mm/fk_efi_mmap.f90 \
                src/mm/fk_pmm.f90 \
                src/lib/fk_string.f90 \
@@ -107,6 +108,9 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/mm/fk_heap.f90 \
                src/acpi/fk_acpi.f90 \
                src/acpi/fk_madt.f90 \
+               src/acpi/fk_mcfg.f90 \
+               src/drivers/bus/fk_pcie_types.f90 \
+               src/drivers/bus/fk_pcie.f90 \
                src/cpu/fk_sched.f90 \
                src/boot/fk_kmain.f90
 
@@ -171,7 +175,7 @@ NEVERSYM_RE     := ^(malloc|free|printf|puts|calloc|realloc|abort|exit)$$
 
 .DEFAULT_GOAL := kernel
 .PHONY: kernel iso mbcheck symcheck-boot undefcheck-boot bootgate selftest-boot \
-        clean-boot
+        mmiocheck-boot clean-boot
 # A failed post-link gate must not leave a bogus kernel.elf behind for the QEMU
 # boot test to pick up and "boot".
 .DELETE_ON_ERROR:
@@ -334,10 +338,25 @@ undefcheck-boot: $(KERNEL)
 selftest-boot: $(KERNEL)
 	@bash tools/mb2-selftest.sh $(KERNEL)
 
+# Every device register reached a whole dword at a time, checked in the OBJECT
+# and not in the source -- because the source that gets this wrong looks right.
+# A VOLATILE Fortran pointer whose load feeds ibits() is narrowed to a
+# `movzbl 0x2(%rax)` by -O2, and that one-byte read of a device register
+# compiles, links and boots. It is only wrong on the silicon.
+#
+# The self-test runs first and is not a formality: it compiles the bad form and
+# proves the compiler still emits the narrowed access, so a green scan below is
+# evidence about this toolchain rather than about a defect it may have stopped
+# producing.
+mmiocheck-boot: $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o
+	@bash tools/mmiocheck.sh --selftest
+	@bash tools/mmiocheck.sh $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o
+
 # Everything the boot path must survive inside the container. The remaining
 # gate -- does it actually boot -- needs a VM and therefore runs on the host:
 # tools/qemu-boot-test.sh.
-bootgate: $(KERNEL) mbcheck symcheck-boot undefcheck-boot selftest-boot
+bootgate: $(KERNEL) mbcheck symcheck-boot undefcheck-boot selftest-boot \
+          mmiocheck-boot
 	@echo "=== boot path gates clean: header valid, image enterable, no runtime ==="
 
 # --- ISO ---------------------------------------------------------------------

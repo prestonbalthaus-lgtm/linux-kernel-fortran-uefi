@@ -38,6 +38,8 @@ module fk_vmm_m
             FK_PTE_P, FK_PTE_RW, FK_PTE_PS, FK_PTE_NX, FK_PTE_ADDR, &
             FK_PTE_PWT, FK_PTE_PCD, FK_VMM_MMIO, FK_VMM_HEAP, FK_VMM_WC, &
             vmm_reserve_mmio, vmm_reserved_holes, vmm_map_mmio, &
+            vmm_punch_physmap, FK_VMM_E_IS_RAM, FK_VMM_IOAPIC, &
+            FK_VMM_ECAM, &
             vmm_pat_arm, vmm_read_pat, FK_VMM_UC, FK_VMM_LAPIC, &
             vmm_init, vmm_activate, vmm_drop_identity, vmm_map_page, &
             vmm_translate, vmm_phys_of, vmm_pml4_phys, vmm_table_frames, &
@@ -93,6 +95,17 @@ module fk_vmm_m
   ! framebuffer that starts at FK_VMM_MMIO.
   integer(c_int64_t), parameter :: FK_VMM_LAPIC = &
        FK_VMM_MMIO + int(z'20000000', c_int64_t)
+  ! 16 MiB above the LAPIC's page, derived from the same base rather than
+  ! written out: two constants that must stay inside one window are two things
+  ! that can drift apart.
+  integer(c_int64_t), parameter :: FK_VMM_IOAPIC = &
+       FK_VMM_MMIO + int(z'21000000', c_int64_t)
+  ! 1 GiB into the MMIO window, clear of the two single pages above and with
+  ! room for the 256 MiB an MCFG allocation covering all 256 buses declares.
+  ! Derived from FK_VMM_MMIO like the others: three constants that must stay
+  ! inside one window are three things that can drift out of it.
+  integer(c_int64_t), parameter :: FK_VMM_ECAM = &
+       FK_VMM_MMIO + int(z'40000000', c_int64_t)
 
   ! PML4[258], the slot after the device window.  The kernel heap grows upward
   ! from here (roadmap 4.0).  A slot of its own rather than a hole inside the
@@ -108,6 +121,7 @@ module fk_vmm_m
   integer(c_int32_t), parameter :: FK_VMM_E_NOT_READY  = 4_c_int32_t
   integer(c_int32_t), parameter :: FK_VMM_E_UNREACHABLE = 5_c_int32_t
   integer(c_int32_t), parameter :: FK_VMM_E_NO_NX      = 6_c_int32_t
+  integer(c_int32_t), parameter :: FK_VMM_E_IS_RAM     = 7_c_int32_t
 
   ! The image, as six page-granular spans with a permission each.  ONE table
   ! rather than one open-coded sequence per job: mapping, verifying and
@@ -775,6 +789,66 @@ contains
     hole_bytes(hole_count) = round_up(phys + bytes, FK_VMM_SIZE_2M) &
                              - hole_base(hole_count)
   end subroutine vmm_reserve_mmio
+
+  ! Remove linear-map coverage for a device aperture discovered AFTER the map
+  ! was built.  vmm_reserve_mmio is the same idea for an aperture known BEFORE
+  ! vmm_init, and an address that comes out of an ACPI table cannot use it:
+  ! reading that table needs the very map the reservation would have holed.
+  !
+  ! REFUSES a range overlapping reported RAM.  Two memory types for one
+  ! physical page is undefined (SDM Vol.3 11.12.4), and when firmware claims a
+  ! device aperture inside RAM the answer is to believe neither of them, not to
+  ! quietly unmap memory the allocator is already handing out.
+  !
+  ! Whole 2 MiB pages, because that is the granularity map_physmap built the
+  ! window at; a range that shares a large page with RAM is refused by the test
+  ! above rather than shattered, which walk() will not do either.
+  function vmm_punch_physmap(phys, bytes) result(status) &
+       bind(c, name="vmm_punch_physmap")
+    implicit none
+    integer(c_int64_t), intent(in), value :: phys, bytes
+    integer(c_int32_t) :: status
+    integer(c_int64_t) :: lo, hi, p, e, entry, tbl
+    integer(c_int64_t), pointer :: t(:)
+    integer(c_int32_t) :: i, sh
+
+    status = FK_VMM_OK
+    if (bytes <= 0_c_int64_t) return
+    if (pml4_phys == 0_c_int64_t) then
+       status = FK_VMM_E_NOT_READY
+       return
+    end if
+
+    lo = round_down(phys, FK_VMM_SIZE_2M)
+    hi = round_up(phys + bytes, FK_VMM_SIZE_2M)
+
+    do i = 1_c_int32_t, pmm_region_count()
+       if (pmm_region_type(i) /= FK_PMM_TYPE_AVAILABLE) cycle
+       e = pmm_region_base(i) + pmm_region_len(i)
+       if (lo < e .and. hi > pmm_region_base(i)) then
+          status = FK_VMM_E_IS_RAM
+          return
+       end if
+    end do
+
+    p = lo
+    do while (p < hi)
+       if (p < map_top) then
+          call walk_leaf(FK_VMM_PHYSMAP + p, entry, sh)
+          ! Only a 2 MiB leaf that is actually there.  walk() below descends
+          ! rather than builds, because walk_leaf just proved every level
+          ! above it exists -- so a punch never allocates a frame.
+          if (entry /= 0_c_int64_t .and. sh == 21_c_int32_t) then
+             call walk(FK_VMM_PHYSMAP + p, 21_c_int32_t, tbl, status)
+             if (status /= FK_VMM_OK) return
+             call table_at(tbl, t)
+             t(idx(FK_VMM_PHYSMAP + p, 21_c_int32_t)) = 0_c_int64_t
+             call fk_invlpg(FK_VMM_PHYSMAP + p)
+          end if
+       end if
+       p = p + FK_VMM_SIZE_2M
+    end do
+  end function vmm_punch_physmap
 
   function vmm_reserved_holes() result(n) bind(c, name="vmm_reserved_holes")
     implicit none
