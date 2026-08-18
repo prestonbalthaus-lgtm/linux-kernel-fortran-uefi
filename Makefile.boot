@@ -177,6 +177,7 @@ NEVERSYM_RE     := ^(malloc|free|printf|puts|calloc|realloc|abort|exit)$$
 
 .DEFAULT_GOAL := kernel
 .PHONY: kernel iso mbcheck symcheck-boot undefcheck-boot bootgate selftest-boot \
+        isocheck-boot \
         mmiocheck-boot clean-boot
 # A failed post-link gate must not leave a bogus kernel.elf behind for the QEMU
 # boot test to pick up and "boot".
@@ -362,14 +363,49 @@ mmiocheck-boot: $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o $(BUILD)/fk_pcie.o \
 # Everything the boot path must survive inside the container. The remaining
 # gate -- does it actually boot -- needs a VM and therefore runs on the host:
 # tools/qemu-boot-test.sh.
+# roadmap 2.2. Two greps and no VM: the grub.cfg the ISO recipe wrote must
+# carry the insmod, and the ISO must actually contain the EFI video driver it
+# resolves to. A missing module is SILENT at boot -- GRUB prints its error and
+# carries on -- so this refuses in the container in a second rather than three
+# minutes into a QEMU boot, and it catches grub2-efi-x64-modules going missing
+# from the container image, which the BIOS path would never notice.
+isocheck-boot: $(ISO)
+	@grep -q 'insmod all_video' $(ISODIR)/boot/grub/grub.cfg \
+	  || { echo "  FAIL  grub.cfg does not load a video driver"; exit 1; }
+	@xorriso -indev $(ISO) -find /boot/grub/x86_64-efi -name efi_gop.mod \
+	         2>/dev/null | grep -q efi_gop.mod \
+	  || { echo "  FAIL  the ISO carries no x86_64-efi video driver"; exit 1; }
+	@echo "  OK    the ISO loads a video driver and carries one for UEFI"
+
 bootgate: $(KERNEL) mbcheck symcheck-boot undefcheck-boot selftest-boot \
-          mmiocheck-boot
+          mmiocheck-boot isocheck-boot
 	@echo "=== boot path gates clean: header valid, image enterable, no runtime ==="
 
 # --- ISO ---------------------------------------------------------------------
 # timeout=0 with default=0 boots straight through: a headless boot test must
 # never sit at a menu waiting for a keypress that will not come.
-$(ISO): $(KERNEL)
+#
+# `insmod all_video` IS THE UEFI FRAMEBUFFER (roadmap 2.2).  The kernel's
+# Multiboot2 header has always ASKED for a mode (header tag 5, required), and
+# on BIOS GRUB answers with tag 8.  Under OVMF it answered
+#     no suitable video mode found
+# on COM1 and handed over an MBI with no tag 8 at all -- because the EFI core
+# grub2-mkrescue builds embeds the video FRAMEWORK and no video DRIVER.  The
+# drivers are on the ISO already; nothing had loaded them.  all_video is the
+# portable spelling: moddep.lst resolves it to efi_gop/efi_uga/video_bochs/
+# video_cirrus on x86_64-efi and to vbe/vga/video_bochs/video_cirrus on
+# i386-pc, so one line covers both halves of the hybrid image.
+#
+# A missing module is SILENT here: GRUB reports it and carries on to the
+# multiboot2 line, producing exactly the old behaviour. That is what the
+# grub.cfg and ISO checks in bootgate refuse, and what the UEFI framebuffer
+# assertions in tools/qemu-boot-test.sh catch if they ever get that far.
+# MAKEFILE.BOOT IS A PREREQUISITE, and that is not tidiness. grub.cfg is
+# written BY THIS RECIPE, so a change to the boot configuration -- the insmod
+# line that gives UEFI its video driver, for one -- moves no file make was
+# watching, and the previous ISO is reused. Measured: dropping the insmod line
+# and re-running left the UEFI gate green against an ISO that still had it.
+$(ISO): $(KERNEL) Makefile.boot
 	rm -rf $(ISODIR)
 	mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/kernel.elf
@@ -378,6 +414,7 @@ $(ISO): $(KERNEL)
 	  'set default=0' \
 	  '' \
 	  'menuentry "PROJECT FORTRAN-KERNEL" {' \
+	  '    insmod all_video' \
 	  '    multiboot2 /boot/kernel.elf' \
 	  '    boot' \
 	  '}' > $(ISODIR)/boot/grub/grub.cfg

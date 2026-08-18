@@ -315,8 +315,8 @@ Fortran Kernel: heap FAILED its own consistency walk, faults 0x'
 # the screen simply does not exist on this path.  The video assertions are
 # therefore dropped for FK_FIRMWARE=uefi, and dropping them is announced: a gate
 # that silently narrows what it checks reads exactly like one that passed.
-# Everything else -- the sentinel, the PMM, the VMM, the heap, the scheduler and
-# the timer -- is asserted on the UEFI path exactly as it is on the BIOS one.
+# EVERYTHING is asserted on the UEFI path exactly as it is on the BIOS one --
+# the video assertions included, since roadmap 2.2's second half.
 if [[ "${FK_FIRMWARE:-bios}" == uefi ]]; then
   # roadmap 0.3: the assertion that the SECOND front end is the one that ran.
   # Tag 17 exists only where the loader came up on UEFI, so this line is what
@@ -324,15 +324,17 @@ if [[ "${FK_FIRMWARE:-bios}" == uefi ]]; then
   FK_PMM_PASS_LINES="$FK_PMM_PASS_LINES
 Fortran Kernel: PMM front end is the UEFI GetMemoryMap array (Multiboot2 tag 17).
 Fortran Kernel: ACPI root is the XSDT (Multiboot2 tag 15)."
-  FK_FB_PASS_LINES=""
-  FK_CON_PASS_LINES=""
-  FK_FB_FAIL_LINES=""
-  FK_CON_FAIL_LINES=""
-  : "${FK_CHECK_FB:=0}"
+  # roadmap 2.2's second half. THESE ASSERTIONS USED TO BE DELETED HERE, and
+  # the deletion was the danger: the UEFI gate was GREEN with no framebuffer
+  # at all, so it would have stayed green whether or not one ever appeared.
+  # `insmod all_video` in the ISO's grub.cfg is what changed -- GRUB loads a
+  # video DRIVER under OVMF, sets the mode the kernel's header tag 5 asks for,
+  # and hands over a real tag 8. The lines below are therefore asserted on
+  # BOTH firmware paths now, and the only thing that differs is the base:
+  # 0xFD000000 on SeaBIOS, 0x80000000 under OVMF, which is why neither is
+  # written down anywhere.
+  : "${FK_CHECK_FB:=1}"
   export FK_CHECK_FB
-  echo "  NOTE  UEFI: video assertions dropped -- GRUB sets no mode under OVMF,"
-  echo "        so there is no framebuffer tag for the kernel to map. Every"
-  echo "        non-video assertion still applies."
 fi
 
 [[ "${FK_FIRMWARE:-bios}" == uefi ]] || FK_PMM_PASS_LINES="$FK_PMM_PASS_LINES
