@@ -1,13 +1,15 @@
 
 # PROPOSED NEXT MILESTONE -- AWAITING LEAD ARCHITECT APPROVAL
 
-Updated 2026-08-18. **4.1, 3.x and 3.3 have LANDED and are ticked.** 3.x gave
+Updated 2026-08-18. **4.1, 3.x, 3.3 and 4.2 have LANDED and are ticked.** 3.x gave
 the DMA allocator declared in 3.6 a body and a host-side proof of contiguity;
 3.3 closed the 8259 half by routing IRQ0 through the I/O APIC, and found that
 both APIC modules had been reading device registers ONE BYTE AT A TIME through
 a pointer declared VOLATILE -- gfortran narrows such a load, and the LAPIC had
 been getting away with it since it landed. `boot/io.S` grew fk_readl/fk_writel
-and `tools/mmiocheck.sh` now refuses the narrow form in the object file.
+and `tools/mmiocheck.sh` now refuses the narrow form in the object file. 4.2
+then found the ECAM window and walked the bus, and moved the boot gate to
+`-machine q35` because the default board has no MCFG table to find.
 
 Landing earlier, from a separate branch: the PCIe, xHCI and NVMe REGISTER
 LAYOUTS -- types only, no procedures and no driver logic, recorded in 4.2, 5.1
@@ -32,7 +34,7 @@ written without it, and 4.2 is where it gets used.
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 4.2 | PCIe enumeration | the layouts are in, 4.1 found the MCFG, and 3.3 left behind the two things it needs: `vmm_punch_physmap` for a window discovered after the linear map exists, and `fk_readl` for reading it a whole dword at a time | nothing |
+| 5.1 | the xHCI controller | 4.2 can find it and 3.x can give it contiguous memory; nothing else is in the way except the controller itself | an interrupt route for it -- there is no _PRT, so MSI-X, which is declared in fk_pcie_types and used by nothing |
 | 2.2 | a framebuffer on the UEFI path | still none: GRUB sets no video mode under OVMF, so tag 8 is absent | GRUB's video modules in the EFI half of the ISO, or GOP through the EFI system table (tag 12, which IS present) |
 | 1.1 | the string half of the core library | unchanged and still owed | nothing; 6.1 and 6.4 cannot start without it |
 
@@ -1685,11 +1687,86 @@ Discovering what hardware actually exists on the Minisforum motherboard.
         seen; nothing reads it. There is no AML interpreter and no _PRT, so PCI
         interrupt routing at 4.2 has only the ISO table to work from.
 
-   * [ ] 4.2 PCIe Bus Enumeration
+   * [x] 4.2 PCIe Bus Enumeration
 
         Validation: Kernel recursively scans the PCIe bus and prints a list of all connected devices (Vendor IDs / Device IDs) to the GOP display.
 
-        THE LAYOUTS ARE IN, THE SCAN IS NOT. `src/drivers/bus/fk_pcie_types.f90`
+        THE BUS IS WALKED. `src/acpi/fk_mcfg.f90` (98 checks) finds the window
+        and `src/drivers/bus/fk_pcie.f90` (74 checks) walks it. On q35:
+
+            Fortran Kernel: the ECAM window has no write-back alias in the linear map.
+            Fortran Kernel: the ECAM mapping selects PWT and PCD, strong uncacheable.
+            Fortran Kernel: PCIe functions kept/seen 0x0005/0x0005
+            Fortran Kernel: PCIe 0x00/0x00.0 0x8086/0x29C0 0x06/0x00/0x00
+            Fortran Kernel: PCIe 0x00/0x01.0 0x1234/0x1111 0x03/0x00/0x00
+            Fortran Kernel: PCIe 0x00/0x1F.0 0x8086/0x2918 0x06/0x01/0x00
+            Fortran Kernel: PCIe 0x00/0x1F.2 0x8086/0x2922 0x01/0x06/0x01
+            Fortran Kernel: PCIe 0x00/0x1F.3 0x8086/0x2930 0x0C/0x05/0x00
+
+        AND THE LIST IS CHECKED AGAINST QEMU'S, AS SETS. Not containment:
+
+            PASS  the guest found every function QEMU reports (5)
+            PASS  and reported none QEMU does not
+
+        A function QEMU reports and the guest missed is a hole in the walk. A
+        function the guest reports and QEMU does not is a GHOST, and that is the
+        one containment waves through -- a single-function device may alias
+        function 0 across all eight, so a walk that ignores the header-type
+        multifunction bit reports one device eight times and each looks
+        entirely plausible. Device 0x1F is the case in the other direction: it
+        is multifunction with functions 0, 2 and 3 present and 1 ABSENT, so a
+        walk that stops at the first gap loses two real devices.
+
+        THE GATE NOW BOOTS q35, and that is part of the milestone rather than a
+        setting. QEMU's default i440FX board emits four ACPI tables and none of
+        them is MCFG -- there is no ECAM window on it and there was nothing here
+        to find. q35 emits five. `FK_MACHINE=pc` still reaches that path and the
+        kernel treats it as a fact about the machine: it prints "no MCFG table;
+        this machine has no ECAM window" and carries on. Both are gated, in
+        opposite directions.
+
+        THE EIGHT RESERVED BYTES ARE THE TRAP. PCI Firmware Specification 3.0
+        section 4.1.2: the allocation array starts at offset 44 and not at 36,
+        because `acpi_table_mcfg` puts a `u8 reserved[8]` after the standard
+        header. A decoder that starts at 36 reads the base out of the reserved
+        field, gets 0, and fails somewhere a long way from the cause. The base
+        is a full u64 assembled byte by byte with the sign masked at every step:
+        0xB0000000 has bit 31 set, and a widening that sign-extends puts the
+        window 4 GiB away from where it is.
+
+        NO BRIDGE RECURSION, and the validation sentence's word "recursively"
+        is answered rather than dodged: the scan covers every bus the MCFG
+        allocation declares, which is a SUPERSET of what walking secondary bus
+        numbers reaches. Recursion would add code and no devices.
+
+        `vmm_punch_physmap` does here what it did for the IOAPIC at 3.3 and for
+        the same reason -- the window's address comes out of an ACPI table, and
+        reading that table needs the linear map a reservation would have holed.
+        4 KiB at a time, because `vmm_map_page` has no large-page path and
+        `walk` refuses to shatter one: 65536 entries and about 512 KiB of page
+        tables for a 256 MiB window.
+
+        "MAPPED" AND "MAPPED UNCACHED" ARE TWO CLAIMS and both are asserted. The
+        second is the one that matters: a cached mapping of configuration space
+        reads a stale line for every device after the first, and would enumerate
+        perfectly on the first boot and never again.
+
+        ELEVEN MUTATIONS, ELEVEN CAUGHT. Against the decoder: entries at offset
+        36 (37 mismatches), the base read as a u32 (1), the sign mask dropped
+        (13), a backwards bus range accepted (2), the range treated as exclusive
+        (11). Against the walk: all eight functions probed regardless of the
+        header-type bit (3), stopping at the first absent function (13), the
+        multifunction bit left in the header type (1), the device shift confused
+        with the function shift (29), truncation hidden by clamping the seen
+        count (3), the window bound check removed (1).
+
+        WHAT IS NOT DONE: no BAR sizing or assignment, no bridge secondary-bus
+        programming, no capability-list walk, no MSI or MSI-X enablement, and
+        one segment group only. The list is capped at 32 published slots and
+        `pcie_overflowed` says so rather than letting a truncated list read as
+        a complete one.
+
+        THE LAYOUTS THAT CAME FIRST. `src/drivers/bus/fk_pcie_types.f90`
         carries the Type 0 and Type 1 configuration headers, the capability list
         header, the MSI-X capability and one table entry, the ECAM shifts, BAR
         decode, and the class/subclass/prog-if triples that identify an xHCI and
@@ -1703,13 +1780,10 @@ Discovering what hardware actually exists on the Minisforum motherboard.
         is a NAMED component, because padding the compiler chooses is padding
         the hardware does not have.
 
-        WHAT IT IS STILL BLOCKED ON, and neither is a table: the ECAM base comes
-        from the MCFG, which 4.1 can already FIND (it is in the root's table
-        list on both firmware paths) but does not parse; and reaching config
-        space needs an uncached mapping of that base, which is `vmm_map_mmio`
-        with FK_VMM_UC -- the LAPIC's path at 3.3, on a much larger region.
-        Interrupt routing for whatever is found has only 4.1's ISO table to work
-        from: there is no AML interpreter and therefore no _PRT.
+        STILL TRUE, and it is 5.1's and 5.2's problem now: interrupt routing for
+        whatever is found has only 4.1's ISO table to work from. There is no AML
+        interpreter and therefore no _PRT, so a PCI line's GSI cannot be looked
+        up -- MSI or MSI-X is the way round it, and neither is written.
 
 ## 🛠️ Phase 5: Modern Drivers (The Crucible)
 
