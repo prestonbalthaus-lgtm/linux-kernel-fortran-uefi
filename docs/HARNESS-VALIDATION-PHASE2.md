@@ -96,8 +96,9 @@ comment claiming the screen would go black without it is wrong. It is retained f
 same reason `tools/../Makefile` retains `-fwrapv` — *"Removing it does not fail the suite
 today, which is exactly why it must not be dropped casually."* The guarantee it buys
 (one assignment is one memory access, not merged, hoisted, or cached across a call)
-becomes load-bearing once the framebuffer is mapped write-combining, which is the normal
-UEFI GOP configuration.
+becomes load-bearing once the framebuffer is mapped write-combining -- which roadmap 2.2
+has since done, on both firmware paths, with the PTE read back and asserted to select PAT
+index 1 on every boot.
 
 **Operational consequence:** `VOLATILE` on this pointer is protected by review and by
 this document, not by a test. Anyone deleting it to save six instructions should be
@@ -122,12 +123,16 @@ pixel-comparison test cannot observe a read.
 
 ## What is still unproven
 
-The renderer has never drawn a pixel on real hardware, or in QEMU. Everything above is
+The renderer has never drawn a pixel on real hardware. SUPERSEDED IN QEMU by 2.2 and 2.4:
+it draws on both firmware paths, and the boot gate reads the framebuffer back out of guest
+memory and compares the status bar against the kernel's own font table, glyph for glyph. Everything above is
 a host-side proof of *arithmetic and memory-layout* correctness under the kernel flag
 set. The claims it does **not** support:
 
 - that the Multiboot2 framebuffer tag is requested or parsed correctly (roadmap 2.2 —
-  no boot path exists yet);
+  no boot path existed yet when this was written; superseded: `boot/boot.S` asks in
+  header tag 5, `fk_fbinfo` parses the tag 8 the loader answers with, and
+  `tools/qemu-boot-test.sh` asserts that parse under SeaBIOS and under OVMF alike);
 - that the firmware's pixel format is BGRx rather than RGBx on any given machine (this
   module passes the colour word through unconverted by design);
 - that anything is visible on the Minisforum's actual display.
