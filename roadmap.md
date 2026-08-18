@@ -36,28 +36,40 @@ written without it, and 3.3 is where it gets used.
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 5.1 | the xHCI controller | two of its three original blockers are discharged: 4.2 finds it (`pcie_find_xhci`) and 3.x gives it contiguous memory (`pmm_alloc_contiguous`) | an interrupt route -- no _PRT, so MSI-X, declared in fk_pcie_types and written by nothing -- and the config WRITES and capability walk needed to enable one |
+| 5.1 | the xHCI controller | all three of its original blockers are discharged: 4.2 finds it (`pcie_find_xhci`), 3.x gives it contiguous memory (`pmm_alloc_contiguous`), and 4.2's debt is paid -- decode and bus mastering are on and MSI-X is decoded | the ROUTE itself: an MSI-X table entry lives in DEVICE memory, not configuration space, so it needs the table mapped, a vector, and INTx off afterwards |
 | 2.2 | a framebuffer on the UEFI path | still none: GRUB sets no video mode under OVMF, so tag 8 is absent | GRUB's video modules in the EFI half of the ISO, or GOP through the EFI system table (tag 12, which IS present) |
 | 1.1 | the string half of the core library | unchanged and still owed | nothing; 6.1 and 6.4 cannot start without it |
 
-**WHAT 5.1 NEEDS BEFORE IT TOUCHES THE CONTROLLER, and it is 4.2's WHAT IS NOT
-DONE list coming due.** `fk_pcie.f90` reads configuration space and never writes
-it: no read-modify-write of the COMMAND register, so memory-space and bus-master
-decode cannot be turned on, and a controller that cannot master the bus cannot
-read a ring wherever it is put. No capability-list walk either, which is how the
-MSI-X capability is found before anything can enable it. Neither is xHCI work and
-both are 5.1's to pay.
+**WHAT 5.1 NEEDED BEFORE IT COULD TOUCH THE CONTROLLER, AND IT IS PAID.** 4.2
+read configuration space and never wrote it, so the COMMAND register could not
+be read-modify-written and a controller that cannot master the bus cannot read
+a ring wherever it is put; and there was no capability-list walk, which is how
+MSI-X is found before anything can enable it. Neither was xHCI work and both
+were 5.1's to pay. They are now in `fk_pcie.f90`, off the running machine:
 
-**AND THE GATE HAS TO GROW A DEVICE.** q35 has no xHCI at all unless the boot
-gate adds `-device qemu-xhci`, which takes the machine from five PCI functions
-to six. 4.2's check survives that on its own -- it reads `info pci` off the live
-monitor and compares it against the guest's list AS SETS, so both sides grow
-together and neither a missed function nor an invented one can hide. What is
-hardcoded to five is qmp-sentinel's own SELF-TEST fixture, which proves the
-comparison refuses, and the prose in the gate's header. Those move with the
-device. `mmiocheck-boot` names fk_lapic.o and fk_ioapic.o explicitly rather than
-globbing, so neither fk_pcie.o nor an xHCI object is policed by it as written --
-and the rule it enforces is the one that cost 3.3 a milestone.
+    Fortran Kernel: xHCI COMMAND firmware/cleared/enabled 0x0107/0x0101/0x0107
+    Fortran Kernel: xHCI MSI-X cap/entries/bar/offset 0x90/0x0010/0x0/0x00003000
+
+**AND THE MIDDLE NUMBER IS WHY THAT TOOK TWO ATTEMPTS.** SeaBIOS leaves this
+controller at COMMAND 0x0107 -- decode and mastering already on -- so a kernel
+that writes nothing reads back what a working one reads back. The obvious
+assertion was watched STAYING GREEN with the enable mutated away. The kernel
+now takes both bits DOWN and puts them back, and 0x0101 is a reading only this
+kernel could have caused.
+
+**THE GATE GREW A DEVICE, AND THE SCANNER GREW A DISTINCTION.** q35 has no xHCI
+unless the boot gate adds `-device qemu-xhci`, which takes the machine from
+five PCI functions to six; 4.2's check survives that on its own, because it
+reads `info pci` off the live monitor and compares it against the guest's list
+AS SETS, so both sides grow together and neither a missed function nor an
+invented one can hide. What was hardcoded to five was qmp-sentinel's own
+SELF-TEST fixture, and it moved with the device. `mmiocheck-boot` now names
+fk_pcie.o as well, which forced the harder half: a module that talks to
+hardware AND keeps a table narrows a load of its own .bss, correctly. The
+discriminator comes out of the object rather than out of a name -- the
+module's own storage carries a relocation, a device register never does -- and
+the self-test proves both directions. An xHCI object joins that list when it
+exists.
 
 **TWO THINGS 4.1 CONFIRMED THAT HAD ONLY BEEN REASONED.** Type 4 of the MADT
 puts NMI on LINT1 for every processor -- which is exactly what 3.3 configured,
@@ -1810,9 +1822,23 @@ Discovering what hardware actually exists on the Minisforum motherboard.
         with the function shift (29), truncation hidden by clamping the seen
         count (3), the window bound check removed (1).
 
+        THE DEBT THIS BOX LEFT IS PART PAID, and 5.1 is what came to collect.
+        Configuration space is now WRITTEN as well as read -- one width, a
+        whole dword, because `tools/mmiocheck.sh` refuses a narrow store as
+        well as a narrow load. There is deliberately no write16: a 16-bit
+        field written as a dword read-modify-write echoes the other half back,
+        and at 0x04 that half is STATUS, whose error bits are write-1-to-clear.
+        `pcie_cmd_enable` therefore writes the dword with the status half
+        ZEROED, which a read-only bit ignores and a W1C bit is defined not to
+        act on. `pcie_find_cap` walks the capability chain -- STATUS bit 4
+        first, low two bits of every pointer dropped, an offset inside the
+        64-byte header refused, and the chase bounded at 48 hops, because a
+        chain that points at itself is a hung boot rather than a wrong answer.
+        MSI-X is DECODED off that: capability offset, table size (encoded
+        N-1), the BAR it lives in and its byte offset inside it.
+
         WHAT IS NOT DONE: no BAR sizing or assignment, no bridge secondary-bus
-        programming, no capability-list walk, no MSI or MSI-X enablement, and
-        one segment group only. The kept list is capped at 64 (FK_PCIE_MAX_DEV)
+        programming, no MSI or MSI-X ENABLEMENT, and one segment group only. The kept list is capped at 64 (FK_PCIE_MAX_DEV)
         and `pcie_overflowed` says so rather than letting a truncated list read
         as a complete one; the copy kmain publishes over QMP carries the first
         32 of that list and no more.
@@ -1859,13 +1885,33 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
         carried in. That is the unsigned rule this tree has applied since 1.1,
         arrived at from the register side.
 
-        BLOCKED ON THREE THINGS WHEN THE LAYOUTS LANDED, AND TWO OF THEM ARE
-        DISCHARGED. 4.2 finds the controller (`pcie_find_xhci`), and 3.x defined
-        the DMA allocator a ring needs, because a ring is read by a bus master
-        that does not walk the CPU's page tables (`pmm_alloc_contiguous`, in the
-        PMM -- see 3.6). What is left is the interrupt route, and it is nobody
-        else's now: there is no _PRT, so it has to be MSI-X, which is declared in
-        fk_pcie_types and written by nothing.
+        BLOCKED ON THREE THINGS WHEN THE LAYOUTS LANDED, AND ALL THREE ARE NOW
+        PAYABLE. 4.2 finds the controller (`pcie_find_xhci`), 3.x defined the
+        DMA allocator a ring needs, because a ring is read by a bus master that
+        does not walk the CPU's page tables (`pmm_alloc_contiguous`, in the PMM
+        -- see 3.6), and 4.2's debt has since been paid where this box needs
+        it: the controller's memory-space decode and bus mastering are turned
+        on by this kernel, and its MSI-X capability is found and decoded.
+
+            Fortran Kernel: xHCI COMMAND firmware/cleared/enabled 0x0107/0x0101/0x0107
+            Fortran Kernel: xHCI BAR0 0x00000000FEBF0000
+            Fortran Kernel: xHCI MSI-X cap/entries/bar/offset 0x90/0x0010/0x0/0x00003000
+
+        THE MIDDLE NUMBER IS THE MILESTONE, and it exists because the obvious
+        assertion was measured ESCAPING. SeaBIOS leaves this controller at
+        COMMAND 0x0107 -- decode and mastering already on -- so a kernel that
+        writes nothing reads back exactly what a working one reads back, and a
+        gate asserting "both bits are set" stayed GREEN with the enable call
+        mutated away. The kernel therefore takes the two bits DOWN and puts
+        them back, and 0x0101 is a reading only this kernel could have caused.
+        The same mutation now fails twice: the sentinel sees 0x0107 -> 0x0107
+        and the kernel prints its own REFUSED line, which is on the gate's
+        reject list.
+
+        What is left is the ROUTE ITSELF: writing the MSI-X table, which lives
+        in device memory rather than configuration space, allocating a vector,
+        and disabling INTx -- deliberately left alone until there is a message
+        to replace it with. The controller has not been touched.
 
    * [ ] 5.2 USB HID Keyboard Driver
 

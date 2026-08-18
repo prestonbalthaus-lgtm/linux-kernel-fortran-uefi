@@ -348,9 +348,13 @@ selftest-boot: $(KERNEL)
 # proves the compiler still emits the narrowed access, so a green scan below is
 # evidence about this toolchain rather than about a defect it may have stopped
 # producing.
-mmiocheck-boot: $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o
+# fk_pcie.o joined the list at roadmap 4.2's debt: it is the first module in
+# the tree to WRITE a device register, and the scanner's pattern covers movb
+# and movw stores as well as narrowed loads.
+mmiocheck-boot: $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o $(BUILD)/fk_pcie.o
 	@bash tools/mmiocheck.sh --selftest
-	@bash tools/mmiocheck.sh $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o
+	@bash tools/mmiocheck.sh $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o \
+	                         $(BUILD)/fk_pcie.o
 
 # Everything the boot path must survive inside the container. The remaining
 # gate -- does it actually boot -- needs a VM and therefore runs on the host:
