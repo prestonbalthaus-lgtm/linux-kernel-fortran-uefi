@@ -109,7 +109,15 @@ SLAVE_IMR = 0xFF
 # class<<8 | subclass.
 PCI_SYMBOL = "fk_pcie_devs"
 PCI_SLOTS = 32
-PCI_WORDS = PCI_SLOTS + 5
+# 5 header words, the function slots, then roadmap 4.2's debt paid for 5.1:
+# the xHCI's BDF, the COMMAND it read back after the enable, the MSI-X triple
+# and BAR0.
+PCI_W_XHCI = PCI_SLOTS + 5
+PCI_WORDS = PCI_SLOTS + 10
+# COMMAND bits: memory-space decode and bus master (pci_regs.h:42-43).
+PCI_CMD_MEMORY = 1 << 1
+PCI_CMD_MASTER = 1 << 2
+XHCI_CLASS_TEXT = "USB controller"
 PCI_MAGIC = 0x5043494501
 
 # roadmap 3.3. 'info pic' prints the IOAPIC's whole 24-entry redirection table
@@ -1052,6 +1060,61 @@ def check_pci(words, pci_text):
     if missing or extra:
         out.append((False, "  QEMU : " + " ".join(_bdf(k) for k in sorted(host))))
         out.append((False, "  guest: " + " ".join(_bdf(k) for k in sorted(guest))))
+    out.extend(check_xhci(words, host))
+    return out
+
+
+def check_xhci(words, host):
+    """Roadmap 4.2's debt, checked from outside the guest.
+
+    The kernel does not get to be the only witness that it enabled anything:
+    QEMU says where the xHCI is, and the guest's published BDF has to be that
+    same function, with the two COMMAND bits actually set in the read-back it
+    took from the device rather than in the value it wrote.
+    """
+    out = []
+    bdf = words[PCI_W_XHCI] & 0xFFFF
+    if not bdf and not words[PCI_W_XHCI + 1]:
+        return out
+
+    key = ((bdf >> 8) & 0xFF, (bdf >> 3) & 0x1F, bdf & 0x07)
+    out.append((key in host,
+                f"the xHCI the guest enabled, {_bdf(key)}, is a function "
+                "QEMU reports"))
+
+    # THE ESCAPE THIS SHAPE EXISTS FOR. SeaBIOS already leaves this machine's
+    # xHCI at COMMAND 0x0107, so "both bits are set" passes on a kernel that
+    # never wrote anything -- measured, by mutating the enable away and
+    # watching the gate stay green. The kernel therefore takes the two bits
+    # DOWN and puts them back, and the CLEARED reading is the assertion: only
+    # this kernel could have cleared them.
+    w = words[PCI_W_XHCI + 1]
+    fw, down, cmd = w & 0xFFFF, (w >> 16) & 0xFFFF, (w >> 32) & 0xFFFF
+    out.append((not (down & (PCI_CMD_MEMORY | PCI_CMD_MASTER)),
+                f"the kernel's write MOVED the device: COMMAND went "
+                f"0x{fw:04X} -> 0x{down:04X} with decode and mastering "
+                f"cleared"))
+    out.append((bool(cmd & PCI_CMD_MEMORY),
+                f"and back to 0x{cmd:04X} with memory-space decode set"))
+    out.append((bool(cmd & PCI_CMD_MASTER),
+                f"and with bus mastering set"))
+    out.append(((down & ~(PCI_CMD_MEMORY | PCI_CMD_MASTER)) ==
+                (fw & ~(PCI_CMD_MEMORY | PCI_CMD_MASTER)),
+                "no other COMMAND bit moved while those two did"))
+
+    msix = words[PCI_W_XHCI + 2]
+    cap, count, bir = msix & 0xFFFF, (msix >> 16) & 0xFFFF, (msix >> 32) & 0xFF
+    table = words[PCI_W_XHCI + 3]
+    out.append((cap >= 0x40,
+                f"MSI-X is at capability offset 0x{cap:02X}, past the header"))
+    out.append((count > 0,
+                f"and declares {count} table entr(ies)"))
+    out.append((table % 8 == 0,
+                f"its table is at 0x{table:X} in BAR {bir}, 8-byte aligned"))
+
+    bar = words[PCI_W_XHCI + 4]
+    out.append((bar != 0 and bar % 16 == 0,
+                f"BAR0 is 0x{bar:X}, a decoded memory address"))
     return out
 
 
@@ -1808,19 +1871,32 @@ def do_selftest():
         "    SATA controller: PCI device 8086:2922\n"
         "  Bus  0, device  31, function 3:\n"
         "    SMBus: PCI device 8086:2930\n"
+        "  Bus  0, device   2, function 0:\n"
+        "    USB controller: PCI device 1b36:000d\n"
     )
     Q35_FNS = [(0, 0, 0, 0x8086, 0x29C0), (0, 1, 0, 0x1234, 0x1111),
+               (0, 2, 0, 0x1B36, 0x000D),
                (0, 31, 0, 0x8086, 0x2918), (0, 31, 2, 0x8086, 0x2922),
                (0, 31, 3, 0x8086, 0x2930)]
+    # What the kernel publishes about the xHCI after enabling it: 00:02.0,
+    # COMMAND with decode and mastering set beside the I/O bit firmware left,
+    # MSI-X at 0x90 with 16 entries in BAR 0, table at 0x3000, BAR0 decoded.
+    XHCI_CMD_OK = 0x0107 | (0x0101 << 16) | (0x0107 << 32)
+    XHCI_OK = [0x0010, XHCI_CMD_OK, 0x90 | (16 << 16) | (0 << 32), 0x3000,
+               0xFEBF0000]
 
-    def pci_words(fns=None, magic=PCI_MAGIC, base=0xB0000000, seen=None):
+    def pci_words(fns=None, magic=PCI_MAGIC, base=0xB0000000, seen=None,
+                  xhci=None):
         fns = Q35_FNS if fns is None else fns
         w = [magic, base, (0 << 8) | 255, len(fns),
-             len(fns) if seen is None else seen] + [0] * PCI_SLOTS
+             len(fns) if seen is None else seen] + [0] * (PCI_WORDS - 5)
         for i, (b, d, f, ven, dev) in enumerate(fns):
             bdf = (b << 8) | (d << 3) | f
             w[5 + i] = (bdf << 48) | (ven << 32) | (dev << 16)
-        return w[:PCI_WORDS]
+        w = w[:PCI_WORDS]
+        for i, v in enumerate(XHCI_OK if xhci is None else xhci):
+            w[PCI_W_XHCI + i] = v
+        return w
 
     def expect_pci(ok_wanted, words, text, what):
         nonlocal pass_n, fail_n
@@ -1864,6 +1940,47 @@ def do_selftest():
                "  Bus  0, device  31, function 0:\n"
                "    ISA bridge: PCI device 8086:2918\n",
                "a QEMU function with no identity line does not inherit one")
+
+    # roadmap 4.2's debt. Each of these is a controller the kernel would have
+    # reported as ready and that cannot do the job.
+    # THE ONE THAT ESCAPED A WEAKER GATE: firmware left both bits set and the
+    # kernel wrote nothing, so the final reading is perfect and the cleared
+    # one never happened.
+    expect_pci(False, pci_words(xhci=[0x0010, 0x0107 | (0x0107 << 16) |
+                                      (0x0107 << 32), XHCI_OK[2], 0x3000,
+                                      0xFEBF0000]), Q35_PCI,
+               "an xHCI the kernel never actually wrote to -- firmware had "
+               "already set both bits -- is rejected")
+    expect_pci(False, pci_words(xhci=[0x0010, 0x0107 | (0x0101 << 16) |
+                                      (0x0105 << 32), XHCI_OK[2], 0x3000,
+                                      0xFEBF0000]), Q35_PCI,
+               "one that came back up WITHOUT bus mastering is rejected")
+    expect_pci(False, pci_words(xhci=[0x0010, 0x0107 | (0x0101 << 16) |
+                                      (0x0103 << 32), XHCI_OK[2], 0x3000,
+                                      0xFEBF0000]), Q35_PCI,
+               "one that came back up without memory-space decode is rejected")
+    expect_pci(False, pci_words(xhci=[0x0010, 0x0107 | (0x0001 << 16) |
+                                      (0x0107 << 32), XHCI_OK[2], 0x3000,
+                                      0xFEBF0000]), Q35_PCI,
+               "a write that also cleared SERR -- the status half echoed back "
+               "as a mask -- is rejected")
+    # 0x28 is 00:05.0, an empty slot on this machine. A guest that enabled
+    # something there enabled nothing.
+    expect_pci(False, pci_words(xhci=[0x0028, XHCI_CMD_OK, XHCI_OK[2], 0x3000,
+                                      0xFEBF0000]), Q35_PCI,
+               "one published at a BDF QEMU has no function at is rejected")
+    expect_pci(False, pci_words(xhci=[0x0010, XHCI_CMD_OK, 0x90, 0x3000,
+                                      0xFEBF0000]), Q35_PCI,
+               "an MSI-X table of zero entries -- the N-1 encoding taken "
+               "literally -- is rejected")
+    expect_pci(False, pci_words(xhci=[0x0010, XHCI_CMD_OK, 0x20 | (16 << 16),
+                                      0x3000, 0xFEBF0000]), Q35_PCI,
+               "a capability offset inside the 64-byte header is rejected")
+    expect_pci(False, pci_words(xhci=[0x0010, XHCI_CMD_OK, XHCI_OK[2], 0x600,
+                                      0xFEBF0000 | 4]), Q35_PCI,
+               "a BAR0 with its type bits left in is rejected")
+    expect_pci(True, pci_words(xhci=[0, 0, 0, 0, 0]), Q35_PCI,
+               "a machine with no xHCI published skips the xHCI checks")
 
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0

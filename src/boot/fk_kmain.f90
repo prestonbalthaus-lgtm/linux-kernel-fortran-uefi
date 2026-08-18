@@ -30,7 +30,11 @@ module fk_kmain_m
                          pcie_count, pcie_seen, pcie_overflowed, &
                          pcie_bus, pcie_device, pcie_function, &
                          pcie_vendor, pcie_devid, pcie_class, pcie_subclass, &
-                         pcie_progif, pcie_find_xhci, pcie_find_nvme
+                         pcie_progif, pcie_find_xhci, pcie_find_nvme, &
+                         pcie_cmd_enable, pcie_cmd_disable, pcie_command, &
+                         pcie_msix_at, pcie_msix_count, &
+                         pcie_msix_bir, pcie_msix_offset, pcie_bar64
+  use fk_pcie_types_m, only: FK_PCI_CMD_MEMORY_BIT, FK_PCI_CMD_MASTER_BIT
   use fk_madt_m,   only: FK_MADT_OK, madt_parse, madt_lapic_addr, &
                          madt_pcat_compat, madt_cpu_count, madt_cpu_enabled, &
                          madt_cpu_apic_id, madt_ioapic_count, &
@@ -205,8 +209,16 @@ module fk_kmain_m
   ! QEMU cannot use it and a field nothing checks is a field nothing checks.
   integer(c_int64_t), parameter :: FK_PCIE_MAGIC = int(z'5043494501', c_int64_t)
   integer(c_int32_t), parameter :: FK_PCIE_SLOTS = 32_c_int32_t
+  ! 0 magic, 1 ECAM base, 2 bus range, 3 kept, 4 seen, then FK_PCIE_SLOTS
+  ! functions, then what 5.1 needs off the xHCI: its BDF, the COMMAND it read
+  ! back after the enable, the MSI-X triple and BAR0.
   integer(c_int64_t), volatile, save, bind(c, name="fk_pcie_devs") :: &
-       fk_pcie_devs(0:FK_PCIE_SLOTS + 4)
+       fk_pcie_devs(0:FK_PCIE_SLOTS + 9)
+  integer(c_int32_t), parameter :: FK_PCIE_W_XHCI = FK_PCIE_SLOTS + 5_c_int32_t
+  integer(c_int32_t), parameter :: FK_PCIE_W_CMD  = FK_PCIE_SLOTS + 6_c_int32_t
+  integer(c_int32_t), parameter :: FK_PCIE_W_MSIX = FK_PCIE_SLOTS + 7_c_int32_t
+  integer(c_int32_t), parameter :: FK_PCIE_W_TBL  = FK_PCIE_SLOTS + 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_PCIE_W_BAR  = FK_PCIE_SLOTS + 9_c_int32_t
 
   ! 'MCFG' packed little-endian, built the way FK_SIG_APIC is.
   integer(c_int32_t), parameter :: FK_SIG_MCFG = &
@@ -333,6 +345,21 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_PCIE_SP = " 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PCIE_NONE_YET = &
        "Fortran Kernel: no xHCI and no NVMe on this bus (roadmap 5.1, 5.3)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_CMD = &
+       "Fortran Kernel: xHCI COMMAND firmware/cleared/enabled 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_CMD_OK = &
+       "Fortran Kernel: xHCI decode and bus mastering were taken DOWN and put back by this kernel." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_CMD_BAD = &
+       "Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_BAR = &
+       "Fortran Kernel: xHCI BAR0 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_MSIX = &
+       "Fortran Kernel: xHCI MSI-X cap/entries/bar/offset 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_NO_MSIX = &
+       "Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route." // &
        FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PCIE_WALKED = &
        "Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2)." // &
@@ -1939,8 +1966,91 @@ contains
                         int(pcie_subclass(i), c_int64_t))))
     end do
 
+    call xhci_bringup()
+
     if (n > 0_c_int32_t) call serial_print_string(FK_PCIE_WALKED)
   end subroutine pcie_bringup
+
+  ! Roadmap 4.2's debt, paid where 5.1 needs it: the controller cannot answer a
+  ! register read without memory-space decode and cannot fetch a ring without
+  ! bus mastering, and neither bit is set by firmware that never had a driver.
+  !
+  ! The COMMAND printed is the one READ BACK afterwards, not the one written --
+  ! a device that refuses a bit must not be reported as having taken it.  INTx
+  ! is deliberately left alone: disabling it before an MSI-X route exists
+  ! leaves a controller that can raise nothing at all.
+  subroutine xhci_bringup()
+    implicit none
+    integer(c_int32_t) :: i, cmd, fw, down, cap, cnt, bir, off
+    integer(c_int64_t) :: bar
+
+    i = pcie_find_xhci()
+    if (i == FK_PCIE_NOT_FOUND) return
+
+    fk_pcie_devs(FK_PCIE_W_XHCI) = &
+         ior(ior(shiftl(int(pcie_bus(i), c_int64_t), 8), &
+                 shiftl(int(pcie_device(i), c_int64_t), 3)), &
+             int(pcie_function(i), c_int64_t))
+
+    ! FIRMWARE HAS ALREADY DONE THIS ON THIS MACHINE.  SeaBIOS leaves the
+    ! controller at COMMAND 0x0107, so a kernel that writes nothing reads back
+    ! what a kernel that works reads back.  The two bits are therefore taken
+    ! DOWN first and put back: a cleared bit is one only this kernel could
+    ! have cleared, and the three values below are the whole proof.
+    fw = pcie_command(i)
+    down = pcie_cmd_disable(i)
+    cmd = pcie_cmd_enable(i)
+    fk_pcie_devs(FK_PCIE_W_CMD) = &
+         ior(ior(int(iand(fw, int(z'FFFF', c_int32_t)), c_int64_t), &
+                 shiftl(int(iand(down, int(z'FFFF', c_int32_t)), c_int64_t), 16)), &
+             shiftl(int(iand(cmd, int(z'FFFF', c_int32_t)), c_int64_t), 32))
+
+    call serial_print_string(FK_XHCI_CMD)
+    call serial_print_hex(int(fw, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(down, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(cmd, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    if (.not. btest(down, FK_PCI_CMD_MEMORY_BIT) .and. &
+        .not. btest(down, FK_PCI_CMD_MASTER_BIT) .and. &
+        btest(cmd, FK_PCI_CMD_MEMORY_BIT) .and. &
+        btest(cmd, FK_PCI_CMD_MASTER_BIT)) then
+       call serial_print_string(FK_XHCI_CMD_OK)
+    else
+       call serial_print_string(FK_XHCI_CMD_BAD)
+    end if
+
+    bar = pcie_bar64(i, 0_c_int32_t)
+    fk_pcie_devs(FK_PCIE_W_BAR) = bar
+    call serial_print_string(FK_XHCI_BAR)
+    call serial_print_hex(bar, 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    cap = pcie_msix_at(i)
+    if (cap == FK_PCIE_NOT_FOUND) then
+       call serial_print_string(FK_XHCI_NO_MSIX)
+       return
+    end if
+    cnt = pcie_msix_count(i)
+    bir = pcie_msix_bir(i)
+    off = pcie_msix_offset(i)
+    fk_pcie_devs(FK_PCIE_W_MSIX) = &
+         ior(ior(int(cap, c_int64_t), shiftl(int(cnt, c_int64_t), 16)), &
+             shiftl(int(bir, c_int64_t), 32))
+    fk_pcie_devs(FK_PCIE_W_TBL) = int(off, c_int64_t)
+
+    call serial_print_string(FK_XHCI_MSIX)
+    call serial_print_hex(int(cap, c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(cnt, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(bir, c_int64_t), 1_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(off, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+  end subroutine xhci_bringup
 
   ! The MADT's interrupt source override flags for one ISA IRQ, decoded into
   ! the IOAPIC's own polarity and trigger encodings.  ACPI 6.5 table 5.26: bits

@@ -41,6 +41,17 @@ OBJDUMP="${OBJDUMP:-objdump}"
 # register-to-register forms -- movzbl %al,%eax, which is how a c_int8_t
 # becomes a c_int32_t -- touch no device and are not what this is about, so the
 # parenthesis is load-bearing: it is what makes an operand an address.
+#
+# AND NOT EVERY NARROW MEMORY ACCESS IS A DEVICE.  A module that talks to
+# hardware also has ordinary storage: fk_pcie_m keeps its device table in
+# .bss, and ibits(d_bdf(i), 8, 8) is narrowed to movzbl -- correctly, because
+# that is RAM.  The discriminator is exact and comes out of the object rather
+# than out of a name: an access to the module's own storage carries a
+# RELOCATION against the symbol, and objdump -dr prints it on the next line.
+# A device register is never a link-time symbol in this tree -- it is reached
+# through an address computed at run time -- so a narrow access with no
+# relocation is the form this refuses, and it is exactly the form the volatile
+# pointer produced.
 # [(] rather than \( on purpose: the pattern is handed to awk through -v, so a
 # backslash would be eaten as a string escape before the regex engine ever saw
 # it -- and awk's answer to the resulting unmatched paren is to die with the
@@ -50,10 +61,15 @@ BAD_RE='^[[:space:]]*[0-9a-f]+:[[:space:]]+(movz[bw][lq]?|mov[bw])[[:space:]]+[^
 scan_one() {
 	local obj="$1" hits fn
 	[ -r "$obj" ] || { echo "  MISSING  $obj"; return 1; }
-	hits=$("$OBJDUMP" -d --no-show-raw-insn "$obj" \
+	hits=$("$OBJDUMP" -dr --no-show-raw-insn "$obj" \
 	       | awk -v re="$BAD_RE" '
-	           /^[0-9a-f]+ <.*>:$/ { fn = $2; next }
-	           $0 ~ re             { print "    " fn "  " $0 }')
+	           /^[0-9a-f]+ <.*>:$/ { fn = $2; pend = ""; next }
+	           pend != "" {
+	               if ($0 ~ /[0-9a-f]+: R_/) { pend = ""; next }
+	               print pend; pend = ""
+	           }
+	           $0 ~ re { pend = "    " fn "  " $0; next }
+	           END     { if (pend != "") print pend }')
 	# A scanner that died half way through prints nothing and would
 	# otherwise read as a clean object.
 	if [ ${PIPESTATUS[1]:-0} -ne 0 ]; then
@@ -99,6 +115,22 @@ contains
   end function bad_field
 end module bad_m
 FSRC
+	cat > "$t/own.f90" <<'FSRC'
+module own_m
+  use, intrinsic :: iso_c_binding, only: c_int32_t
+  implicit none
+  private
+  public :: own_field
+  integer(c_int32_t), save :: table(0:63) = 0_c_int32_t
+contains
+  function own_field(i) result(v) bind(c, name="own_field")
+    implicit none
+    integer(c_int32_t), intent(in), value :: i
+    integer(c_int32_t) :: v
+    v = ibits(table(i), 8, 8)
+  end function own_field
+end module own_m
+FSRC
 	cat > "$t/good.f90" <<'FSRC'
 module good_m
   use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t
@@ -125,6 +157,7 @@ FSRC
 
 	gfortran -O2 -J"$t" -c -o "$t/bad.o"  "$t/bad.f90"  2>/dev/null
 	gfortran -O2 -J"$t" -c -o "$t/good.o" "$t/good.f90" 2>/dev/null
+	gfortran -O2 -J"$t" -c -o "$t/own.o"  "$t/own.f90"  2>/dev/null
 
 	echo "=== mmiocheck self-test (the volatile-pointer form, as compiled) ==="
 	if scan_one "$t/bad.o" >/dev/null 2>&1; then
@@ -143,6 +176,18 @@ FSRC
 		pass=$((pass + 1))
 	else
 		echo "  FAIL  the fk_readl form was refused"
+		fail=$((fail + 1))
+	fi
+	# The other half of the same rule, and the reason this gate can be
+	# pointed at a driver that keeps a table: a narrowed load of the
+	# module's OWN storage is RAM, carries a relocation, and is fine.
+	if scan_one "$t/own.o" >/dev/null 2>&1; then
+		echo "  PASS  a narrowed load of the module's own .bss is accepted"
+		pass=$((pass + 1))
+	else
+		echo "  FAIL  a narrowed load of ordinary storage was refused"
+		"$OBJDUMP" -dr --no-show-raw-insn "$t/own.o" | grep -E 'movz|R_' \
+			| sed 's/^/        /' | head -4
 		fail=$((fail + 1))
 	fi
 	echo "=== $pass passed, $fail failed ==="
