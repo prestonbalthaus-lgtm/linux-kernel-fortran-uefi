@@ -186,6 +186,15 @@ SCHED_STACK_QWORDS = 2048            # FK_SCHED_STACK_QWORDS in fk_sched.f90
 # [0] magic  [1] phys base  [2] pages  [3] tag seed
 DMA_SYMBOL = "fk_dma_probe"
 DMA_WORDS = 4
+
+# roadmap 5.1.
+XHCI_SYMBOL = "fk_xhci_state"
+XHCI_WORDS = 19
+MSI_SYMBOL = "fk_msi_count"
+XHCI_MAGIC = 0x584843490501
+TRB_TYPE_CMD_NOOP = 23
+TRB_TYPE_COMPLETION = 33
+COMP_SUCCESS = 1
 DMA_MAGIC = 0x444D4143
 DMA_PAGE = 4096
 DMA_MAX_PAGES = 64                   # a sanity ceiling on what will be read
@@ -1334,6 +1343,161 @@ def check_dma(probe, pages_raw):
     return out
 
 
+def trb_at(blob, off):
+    """One 16-byte TRB out of a dump: parameter, status, control."""
+    parm, status, control = struct.unpack_from("<QII", blob, off)
+    return parm, status, control
+
+
+def check_xhci_rings(words, cmd_blob, evt_blob, regs, msi):
+    """The controller's own work, read where the CONTROLLER wrote it.
+
+    The command ring and the event ring are read by pmemsave AT THEIR PHYSICAL
+    BASE -- no page table in the path -- so what appears here is what a bus
+    master put in DRAM, not what the guest says it put there. The registers
+    come back through xp, which is the device model's state.
+    """
+    out = []
+    out.append((words[0] == XHCI_MAGIC,
+                f"fk_xhci_state magic is 0x{words[0]:012X} "
+                f"(want 0x{XHCI_MAGIC:012X}: the bring-up ran)"))
+    if words[0] != XHCI_MAGIC:
+        return out
+
+    st = words[15]
+    out.append((st == 0, f"the bring-up sequence returned {st}"))
+
+    # THE RESET, AND IT IS NOT INFERABLE FROM THE END STATE. Firmware drives
+    # this controller before the kernel runs -- SeaBIOS leaves CRCR, DCBAAP
+    # and ERSTBA pointing into its own memory -- and a kernel that programs
+    # its own rings over the top ends up looking identical. These three were
+    # read the instant the reset returned and before anything was programmed,
+    # so they are firmware's values unless the reset actually happened.
+    out.append((words[16] == 0,
+                f"CRCR read 0x{words[16]:X} straight after the reset "
+                "(firmware's pointer is gone)"))
+    out.append((words[17] == 0,
+                f"DCBAAP read 0x{words[17]:X} there too"))
+    out.append((bool(words[18] & 1) and not (words[18] & (1 << 11)),
+                f"and USBSTS 0x{words[18]:X}: halted, and CNR clear"))
+
+    cmd_phys, evt_phys, trb_phys = words[3], words[4], words[6]
+    ev_type, ev_comp = (words[7] >> 32) & 0xFFFFFFFF, words[7] & 0xFFFFFFFF
+    out.append((cmd_phys and evt_phys and words[5],
+                f"rings at cmd 0x{cmd_phys:X}, event 0x{evt_phys:X}, "
+                f"ERST 0x{words[5]:X}"))
+    out.append((cmd_phys % 64 == 0 and evt_phys % 64 == 0 and
+                words[5] % 64 == 0,
+                "and every one of them is 64-byte aligned"))
+
+    # THE COMMAND RING, in DRAM. The kernel says it enqueued a NO-OP; this is
+    # the TRB a bus master would fetch.
+    if cmd_blob:
+        parm, status, control = trb_at(cmd_blob, trb_phys - cmd_phys)
+        out.append((((control >> 10) & 0x3F) == TRB_TYPE_CMD_NOOP,
+                    f"the TRB at 0x{trb_phys:X} is a NO-OP command "
+                    f"(type {(control >> 10) & 0x3F})"))
+        out.append((control & 1 == 1,
+                    "with its cycle bit set, so the controller owned it"))
+        out.append((parm == 0 and status == 0,
+                    "and the rest of it zeroed, as 4.11.1.1 requires"))
+        link = trb_at(cmd_blob, (256 - 1) * 16)
+        out.append((((link[2] >> 10) & 0x3F) == 6,
+                    "the ring's last TRB is a LINK"))
+        out.append(((link[2] >> 1) & 1 == 1,
+                    "with Toggle Cycle set, which is what makes it a ring"))
+        out.append((link[0] == cmd_phys,
+                    f"pointing back at 0x{link[0]:X}"))
+
+    # THE EVENT RING, also in DRAM, and this one the CONTROLLER wrote.
+    if evt_blob:
+        parm, status, control = trb_at(evt_blob, 0)
+        out.append((((control >> 10) & 0x3F) == TRB_TYPE_COMPLETION,
+                    f"the controller posted a Command Completion Event "
+                    f"(type {(control >> 10) & 0x3F})"))
+        out.append((control & 1 == 1,
+                    "with cycle 1, the polarity a zeroed segment cannot fake"))
+        out.append((((status >> 24) & 0xFF) == COMP_SUCCESS,
+                    f"completion code {(status >> 24) & 0xFF} (SUCCESS)"))
+        out.append((parm & ~0xF == trb_phys,
+                    f"naming the command TRB at 0x{parm & ~0xF:X}, which is "
+                    f"the one the kernel enqueued"))
+
+    out.append((ev_type == TRB_TYPE_COMPLETION and ev_comp == COMP_SUCCESS and
+                (words[8] & ~0xF) == trb_phys,
+                "and the guest's own reading of that event agrees"))
+
+    if regs:
+        usbsts, usbcmd, crcr, erdp, iman = regs
+        out.append((not (usbsts & 1),
+                    f"USBSTS 0x{usbsts:08X}: the controller is NOT halted"))
+        out.append((not (usbsts & (1 << 12)),
+                    "and reports no host controller error"))
+        out.append((bool(usbcmd & 1) and bool(usbcmd & 4),
+                    f"USBCMD 0x{usbcmd:08X}: R/S and INTE are both set"))
+        out.append((bool(iman & 2),
+                    f"IMAN 0x{iman:08X}: the interrupter is enabled"))
+        # QEMU-SPECIFIC, and labelled: xHCI 1.2 5.4.5 says CRCR's pointer
+        # field reads as zero on real hardware.
+        out.append(((crcr & ~0x3F) == cmd_phys,
+                    f"CRCR holds the kernel's command ring (QEMU reads it "
+                    f"back; real hardware returns 0)"))
+        out.append(((erdp & ~0xF) == evt_phys + 16,
+                    f"ERDP 0x{erdp:X} advanced one TRB past the segment base, "
+                    "so the event was consumed"))
+
+    out.append((msi >= 1,
+                f"fk_msi_count is {msi}: the controller's MSI-X message "
+                "reached the handler"))
+    return out
+
+
+def do_xhci(sock_path, elf, timeout, quiet):
+    _v, state_paddr = symbol_phys_addr(elf, XHCI_SYMBOL)
+    _v, msi_paddr = symbol_phys_addr(elf, MSI_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-xhci.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    cmd_blob = evt_blob = b""
+    regs = None
+    try:
+        client.handshake()
+        client.pmemsave(state_paddr, XHCI_WORDS * 8, tmp.name)
+        words = list(struct.unpack(f"<{XHCI_WORDS}Q",
+                                   open(tmp.name, "rb").read()))
+        client.pmemsave(msi_paddr, 8, tmp.name)
+        msi = struct.unpack("<Q", open(tmp.name, "rb").read())[0]
+
+        if words[0] == XHCI_MAGIC and words[3] and words[4]:
+            client.pmemsave(words[3], 4096, tmp.name)
+            cmd_blob = open(tmp.name, "rb").read()
+            client.pmemsave(words[4], 4096, tmp.name)
+            evt_blob = open(tmp.name, "rb").read()
+            bar = words[1]
+            if bar:
+                cap = xp_words(client, bar, 1)
+                caplen = (cap[0] & 0xFF) if cap else 0
+                op = bar + caplen
+                rt = bar + 0x1000
+                r = xp_words(client, op, 2)
+                c = xp_words(client, op + 0x18, 2)
+                d = xp_words(client, rt + 0x38, 2)
+                i = xp_words(client, rt + 0x20, 1)
+                if r and c and d and i:
+                    regs = (r[1], r[0],
+                            c[0] | (c[1] << 32), d[0] | (d[1] << 32), i[0])
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+    results = check_xhci_rings(words, cmd_blob, evt_blob, regs, msi)
+    if not report_hwstate(results, quiet):
+        print(f"        {XHCI_SYMBOL} at 0x{state_paddr:X}")
+        return 1
+    return 0
+
+
 def do_dma(sock_path, elf, timeout, quiet):
     _v, probe_paddr = symbol_phys_addr(elf, DMA_SYMBOL)
     tmp = tempfile.NamedTemporaryFile(prefix="fk-dma.", suffix=".bin",
@@ -2242,6 +2406,13 @@ def main(argv=None):
     m.add_argument("--timeout", type=float, default=10.0)
     m.add_argument("--quiet", action="store_true")
 
+    x = sub.add_parser("xhci", help="the xHCI's rings, read where the "
+                                     "controller wrote them")
+    x.add_argument("--qmp", required=True)
+    x.add_argument("--elf", required=True)
+    x.add_argument("--timeout", type=float, default=10.0)
+    x.add_argument("--quiet", action="store_true")
+
     c2 = sub.add_parser("pci", help="the guest's PCI list against QEMU's")
     c2.add_argument("--qmp", required=True)
     c2.add_argument("--elf", required=True)
@@ -2277,6 +2448,8 @@ def main(argv=None):
             return do_pci(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "dma":
             return do_dma(args.qmp, args.elf, args.timeout, args.quiet)
+        if args.cmd == "xhci":
+            return do_xhci(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "ticks":
             return do_ticks(args.qmp, args.elf, args.timeout, args.quiet,
                             interval=args.interval, min_delta=args.min_delta)

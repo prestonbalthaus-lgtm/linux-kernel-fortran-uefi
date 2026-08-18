@@ -35,6 +35,17 @@ module fk_xhci_types_m
   public :: FK_XHCI_OP_PORT_BASE, FK_XHCI_PORT_STRIDE, FK_XHCI_RT_IR_BASE, &
             FK_XHCI_RT_IR_STRIDE, FK_XHCI_DB_STRIDE, FK_XHCI_HCCPARAMS1_OFF, &
             FK_XHCI_DBOFF_PTR_POS, FK_XHCI_RTSOFF_PTR_POS
+  public :: FK_XHCI_CAP_LENGTH_OFF, FK_XHCI_CAP_HCS1_OFF, &
+            FK_XHCI_CAP_HCS2_OFF, FK_XHCI_CAP_HCS3_OFF, &
+            FK_XHCI_CAP_DBOFF_OFF, FK_XHCI_CAP_RTSOFF_OFF, &
+            FK_XHCI_CAP_HCC2_OFF
+  public :: FK_XHCI_OP_USBCMD_OFF, FK_XHCI_OP_USBSTS_OFF, &
+            FK_XHCI_OP_PAGESIZE_OFF, FK_XHCI_OP_DNCTRL_OFF, &
+            FK_XHCI_OP_CRCR_OFF, FK_XHCI_OP_DCBAAP_OFF, FK_XHCI_OP_CONFIG_OFF
+  public :: FK_XHCI_IR_IMAN_OFF, FK_XHCI_IR_IMOD_OFF, FK_XHCI_IR_ERSTSZ_OFF, &
+            FK_XHCI_IR_ERSTBA_OFF, FK_XHCI_IR_ERDP_OFF
+  public :: FK_XHCI_TRB_SIZE, FK_XHCI_TRB_DWORDS, FK_XHCI_ERST_ENTRY_SIZE, &
+            FK_XHCI_RING_ALIGN
   public :: FK_XHCI_MAX_SLOTS, FK_XHCI_MAX_PORTS, FK_XHCI_MAX_INTRS
 
   public :: FK_XHCI_CAPLENGTH_POS, FK_XHCI_CAPLENGTH_LEN, &
@@ -200,6 +211,38 @@ module fk_xhci_types_m
   integer(c_int32_t), parameter :: FK_XHCI_DB_STRIDE = 4_c_int32_t
   ! xECP walking starts from HCCPARAMS1 at the PCI BAR base (xhci-ext-caps.h:17).
   integer(c_int32_t), parameter :: FK_XHCI_HCCPARAMS1_OFF = int(z'0010', c_int32_t)
+
+  ! THE SAME LAYOUTS AS BYTE OFFSETS.  The types above describe the blocks, but
+  ! nothing may reach a device register through a Fortran pointer -- gfortran
+  ! narrows such a load and tools/mmiocheck.sh refuses the result -- so every
+  ! access is fk_readl(base + offset) and the offsets have to exist as numbers.
+  integer(c_int32_t), parameter :: FK_XHCI_CAP_LENGTH_OFF = int(z'0000', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_CAP_HCS1_OFF   = int(z'0004', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_CAP_HCS2_OFF   = int(z'0008', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_CAP_HCS3_OFF   = int(z'000C', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_CAP_DBOFF_OFF  = int(z'0014', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_CAP_RTSOFF_OFF = int(z'0018', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_CAP_HCC2_OFF   = int(z'001C', c_int32_t)
+
+  integer(c_int32_t), parameter :: FK_XHCI_OP_USBCMD_OFF   = int(z'0000', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_OP_USBSTS_OFF   = int(z'0004', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_OP_PAGESIZE_OFF = int(z'0008', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_OP_DNCTRL_OFF   = int(z'0014', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_OP_CRCR_OFF     = int(z'0018', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_OP_DCBAAP_OFF   = int(z'0030', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_OP_CONFIG_OFF   = int(z'0038', c_int32_t)
+
+  integer(c_int32_t), parameter :: FK_XHCI_IR_IMAN_OFF   = int(z'0000', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_IR_IMOD_OFF   = int(z'0004', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_IR_ERSTSZ_OFF = int(z'0008', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_IR_ERSTBA_OFF = int(z'0010', c_int32_t)
+  integer(c_int32_t), parameter :: FK_XHCI_IR_ERDP_OFF   = int(z'0018', c_int32_t)
+
+  integer(c_int32_t), parameter :: FK_XHCI_TRB_SIZE   = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_TRB_DWORDS = 4_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ERST_ENTRY_SIZE = 16_c_int32_t
+  ! CRCR, DCBAAP and ERSTBA all carry their pointer in bits 63:6.
+  integer(c_int32_t), parameter :: FK_XHCI_RING_ALIGN = 64_c_int32_t
   ! DBOFF holds its offset in bits 31:2 and RTSOFF in bits 31:5; the bits below
   ! PTR_POS are reserved and must be masked off before use (xhci-caps.h:85-92).
   integer(c_int32_t), parameter :: FK_XHCI_DBOFF_PTR_POS = 2_c_int32_t

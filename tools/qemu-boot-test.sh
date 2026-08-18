@@ -232,12 +232,22 @@ Fortran Kernel: xHCI MSI-X cap/entries/bar/offset 0x
 Fortran Kernel: xHCI BAR0 mapped strong-UC, virt/phys 0x
 Fortran Kernel: xHCI MSI-X entry 0 addr/data/mask 0x
 Fortran Kernel: xHCI MSI-X control/command 0x
-Fortran Kernel: the xHCI has an MSI-X route to this CPU and INTx is off (roadmap 5.1).'
+Fortran Kernel: the xHCI has an MSI-X route to this CPU and INTx is off (roadmap 5.1).
+Fortran Kernel: xHCI caplength/version/slots/scratchpads/page 0x
+Fortran Kernel: xHCI cmd/event/erst 0x
+Fortran Kernel: the xHCI is RUNNING, USBSTS 0x
+Fortran Kernel: xHCI NO-OP trb/event/code/ptr 0x
+Fortran Kernel: the xHCI executed a command and reported it complete (roadmap 5.1).
+Fortran Kernel: the xHCI\'s MSI-X interrupt ARRIVED, count 0x'
 FK_PCIE_FAIL_LINES=$'Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map.
 Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
 Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route.
 Fortran Kernel: the xHCI register block could not be mapped, status 0x
 Fortran Kernel: the xHCI MSI-X route did NOT read back; the controller has no interrupt.
+Fortran Kernel: the xHCI bring-up FAILED, status 0x
+Fortran Kernel: the PMM refused a contiguous run for the xHCI rings.
+Fortran Kernel: the xHCI never completed the NO-OP; no event arrived.
+Fortran Kernel: the xHCI completed its command but sent NO interrupt.
 Fortran Kernel: the ECAM mapping is CACHED.
 Fortran Kernel: the MCFG table would not parse, status 0x
 Fortran Kernel: the ECAM window could not be taken out of the linear map, status 0x
@@ -249,7 +259,9 @@ Fortran Kernel: no MCFG table; this machine has no ECAM window.'
   FK_PCIE_FAIL_LINES=$'Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2).
 Fortran Kernel: xHCI COMMAND firmware/cleared/enabled 0x
 Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
-Fortran Kernel: the xHCI has an MSI-X route to this CPU and INTx is off (roadmap 5.1).'
+Fortran Kernel: the xHCI has an MSI-X route to this CPU and INTx is off (roadmap 5.1).
+Fortran Kernel: the xHCI is RUNNING, USBSTS 0x
+Fortran Kernel: the xHCI executed a command and reported it complete (roadmap 5.1).'
 else
   FK_PCIE_FAIL_LINES="$FK_PCIE_FAIL_LINES
 Fortran Kernel: no MCFG table; this machine has no ECAM window."
@@ -425,6 +437,11 @@ CHECK_SCHED="${FK_CHECK_SCHED:-1}"
 [[ "$CHECK_SCHED" != 0 ]] && say "sched check: fk_task_runs and fk_heap_stat, read twice while it runs"
 CHECK_DMA="${FK_CHECK_DMA:-1}"
 [[ "$CHECK_DMA" != 0 ]] && say "dma check  : the contiguous run, read at the physical base it published"
+# roadmap 5.1. Off on the pc machine for the same reason the PCI check is:
+# that board has no ECAM window, so no controller was ever found.
+CHECK_XHCI="${FK_CHECK_XHCI:-1}"
+[[ "$MACHINE" == pc ]] && CHECK_XHCI=0
+[[ "$CHECK_XHCI" != 0 ]] && say "xhci check : the command and event rings, read where the controller wrote them"
 CHECK_PCI="${FK_CHECK_PCI:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_PCI=0
 [[ "$CHECK_PCI" != 0 ]] && say "pci check  : the guest's own enumeration against QEMU's info pci, as sets"
@@ -628,6 +645,12 @@ assertion_summary() {
       else                          say "  PCI enumeration  : FAIL  see the two lists above"
       fi
     fi
+    if [[ "$CHECK_XHCI" != 0 ]]; then
+      if   (( XHCI_OK == 1 )); then  say "  xHCI controller  : PASS  it executed a command and the interrupt arrived"
+      elif (( XHCI_RAN == 0 )); then say "  xHCI controller  : FAIL  the guest died before it could be asked"
+      else                           say "  xHCI controller  : FAIL  see the ring dumps above"
+      fi
+    fi
     if [[ "$CHECK_DMA" != 0 ]]; then
       if   (( DMA_OK == 1 )); then  say "  DMA run          : PASS  every frame carried its tag at the physical base"
       elif (( DMA_RAN == 0 )); then say "  DMA run          : FAIL  the guest died before it could be asked"
@@ -823,6 +846,18 @@ if [[ "$CHECK_PCI" != 0 && "$MODE" == gate ]]; then
   fi
 fi
 
+XHCI_RAN=0; XHCI_OK=0
+if [[ "$CHECK_XHCI" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    XHCI_RAN=1
+    rule
+    say "--- the xHCI's rings, read at their physical bases ---"
+    if python3 "$SENTINEL" xhci --qmp "$SOCK" --elf "$KERNEL" --timeout 10; then
+      XHCI_OK=1
+    fi
+  fi
+fi
+
 DMA_RAN=0; DMA_OK=0
 if [[ "$CHECK_DMA" != 0 && "$MODE" == gate ]]; then
   if qemu_alive; then
@@ -936,13 +971,15 @@ SCHED_BAD=0
 if [[ "$CHECK_SCHED" != 0 && "$MODE" == gate ]] && (( SCHED_OK == 0 )); then SCHED_BAD=1; fi
 DMA_BAD=0
 if [[ "$CHECK_DMA" != 0 && "$MODE" == gate ]] && (( DMA_OK == 0 )); then DMA_BAD=1; fi
+XHCI_BAD=0
+if [[ "$CHECK_XHCI" != 0 && "$MODE" == gate ]] && (( XHCI_OK == 0 )); then XHCI_BAD=1; fi
 PCI_BAD=0
 if [[ "$CHECK_PCI" != 0 && "$MODE" == gate ]] && (( PCI_OK == 0 )); then PCI_BAD=1; fi
 
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
    && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )) \
    && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )) && (( DMA_BAD == 0 )) \
-   && (( PCI_BAD == 0 )); then
+   && (( PCI_BAD == 0 )) && (( XHCI_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule
