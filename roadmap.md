@@ -28,7 +28,7 @@ That grep now answers differently, which is the whole of the milestone:
     Fortran Kernel: MADT overrides/IRQ0-GSI 0x0005/0x0002
 
 IRQ0 is overridden to GSI 2. No IOAPIC redirection entry for the timer can be
-written without it, and 4.2 is where it gets used.
+written without it, and 3.3 is where it gets used.
 
 **Next, in order, with what each is really waiting on:**
 
@@ -42,7 +42,7 @@ written without it, and 4.2 is where it gets used.
 puts NMI on LINT1 for every processor -- which is exactly what 3.3 configured,
 by argument, after an injected NMI went nowhere. And MADT flags bit 0,
 PCAT_COMPAT, is SET: firmware stating that the 8259s are present and must be
-disabled before the IOAPIC is used, which is the sentence 3.3's box is open on.
+disabled before the IOAPIC is used, which is the sentence 3.3's box was open on.
 Two milestones reasoned their way to a conclusion and the tables then agreed.
 
 **WHAT 4.1 COST, and this is the pattern the last three milestones share.**
@@ -63,12 +63,27 @@ implementations agreeing is worth more than one implementation asserting. The
 same argument the PMM makes by booting at a different -m, 4.1 makes by booting
 at -smp 2: two CPUs and a 128-byte MADT instead of six and 160.
 
-**Corrections made to this file in this pass**: 3.3's "WHAT IS NOT DONE, and
-4.1 owns most of it" -- 4.1 has landed, and what remains is 4.2's doing rather
-than 4.1's parsing; and 3.6's "DMA memory ... is still not smuggled into this
-box" -- its interface is declared there now, though still not defined.
+**Corrections made in this post-merge sweep**, most of it staleness the merge
+created, plus older drift and one original miscount the same pass turned up.
+3.3's closing block still handed the IOAPIC's doing to 4.2 and still said
+`lapic_eoi` had never been called; 5.1 still listed three blockers, two of which
+the merge discharged; 3.2.5 still called the guard page pending and 3.5 still
+called the framebuffer unmapped; 4.1 and this header pointed IRQ0's GSI-2
+override at 4.2, when 3.3 is what programs it; 4.2 conflated the kept device
+list (64) with the 32 kmain publishes over QMP. The numbers moved too, and every
+replacement was MEASURED rather than copied out of a commit message: the layout
+gate links 36 modules and makes 175 checks, `build/run-pmm` makes 746, the boot
+gate asserts six PMM verdicts each with a FAIL twin out of seven FAIL lines in
+all, mb2-selftest injects eight defects and five of them still get past
+grub2-file, and the image `-z max-page-size` protects is 68 KiB.
 
-**Corrections made in the previous pass**, kept because they are why several
+**Corrections made in the 4.1 pass**: 3.3's "WHAT IS NOT DONE, and
+4.1 owns most of it" -- 4.1 has landed, and what remained was 3.3's own doing
+rather than 4.1's parsing; and 3.6's "DMA memory ... is still not smuggled into
+this box" -- its interface is declared there now, and 3.x has since defined it
+in the PMM.
+
+**Corrections made in the pass before 4.1**, kept because they are why several
 boxes read the way they do: 0.3's "NOTHING here has ever booted that way";
 0.3's "the MISSING half is `-bios OVMF.fd`"; 1.4's "there is no general
 `panic(message)`"; 3.2.5's "ist2..ist7 are zero"; 3.3's "it is not mapped";
@@ -88,7 +103,7 @@ Before any Fortran is written, the autonomous build environment must be establis
         Validation: Script properly aligns .text, .data, and .bss sections for a 64-bit ELF kernel.
 
         DONE: `linker.ld`. Proven, not asserted -- `tools/linkscript-test.sh` links the
-        REAL nine modules under KFLAGS and checks 25 properties (`make linkscript`, also
+        REAL 36 modules under KFLAGS and checks 175 properties (`make linkscript`, also
         part of `make audit`). .text/.rodata/.data/.bss each start on a 4 KiB boundary in
         their own PT_LOAD (RE / R / RW), so the VMM (3.5) can set per-section permissions
         without two sections sharing a page. VMA 0xFFFFFFFF80100000 is forced by
@@ -105,7 +120,7 @@ Before any Fortran is written, the autonomous build environment must be establis
         (`./tools/run.sh kernel`, or `iso`, `bootgate`), separate from ./Makefile so the
         Phase 1 differential harness cannot be disturbed by boot work. It passes
         `-z max-page-size=0x1000`, without which GNU ld pads every PT_LOAD to 2 MiB and
-        the 19 KiB kernel becomes multi-megabyte.
+        the 68 KiB kernel becomes multi-megabyte.
 
         One deviation from the wording: `-ffreestanding` is NOT passed. It is a C-only
         flag; f951 does not accept it. The property it stands for -- no libc, no
@@ -207,7 +222,7 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
 
         `grub2-file --is-x86-multiboot2` exits 0 (Fedora prefixes the GRUB binaries with
         "grub2-"; it is the tool the spec calls grub-file). That gate is necessary and
-        NOT sufficient: tools/mb2-selftest.sh injects seven defects and five of them --
+        NOT sufficient: tools/mb2-selftest.sh injects eight defects and five of them --
         including a boot-fatal entry point -- are accepted by grub2-file and caught only
         by tools/mb2-check.py.
 
@@ -371,12 +386,16 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
             00000020  69 61 6c 69 7a 65 64 2e  0d 0a                    |ialized...|
 
         `boot/io.S` -- `fk_outb`/`fk_inb`, SysV AMD64, four instructions each. Port I/O
-        is the SECOND of exactly two things in this kernel that must be assembly (the
-        first is CLI/HLT): IN and OUT reach a separate 16-bit address space that no
-        Fortran expression can name. Both carry `int32_t` rather than `uint16_t`/`uint8_t`
-        because Fortran has no unsigned types -- 0xC7 in an int8 would have to be written
-        -57 -- so the truncation is concentrated in two instructions instead of becoming
-        a rule every caller has to remember.
+        is the SECOND of what were then exactly two things in this kernel that must be
+        assembly (the first is CLI/HLT): IN and OUT reach a separate 16-bit address
+        space that no Fortran expression can name. Both carry `int32_t` rather than
+        `uint16_t`/`uint8_t` because Fortran has no unsigned types -- 0xC7 in an int8
+        would have to be written -57 -- so the truncation is concentrated in two
+        instructions instead of becoming a rule every caller has to remember.
+
+        NO LONGER A COUNT OF TWO. 3.3 put `fk_readl`/`fk_writel` in this same file for
+        the opposite reason: gfortran CAN emit an MMIO access, and NARROWS it, so that
+        guarantee has to be bought in assembly here too.
 
         `src/drivers/serial/fk_serial.f90` -- 115200 8N1, FIFOs on, interrupts off (there
         is no IDT; one UART IRQ would be a triple fault), plus an internal-loopback
@@ -394,9 +413,10 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
 
         PROVEN, at three levels. `build/run-serial`: 4742 checks against a modelled 16550
         (DLAB routing, FIFO clears, loopback, floating-bus 0xFF), asserting the 13-step
-        port trace byte for byte. `tools/qemu-boot-test.sh`: now asserts THREE things --
-        the 1.2 sentinel, the banner on COM1, and the ABSENCE of the self-test failure
-        line. `--smoke` shows both positive halves refusing a kernel-less guest.
+        port trace byte for byte. `tools/qemu-boot-test.sh`: asserted THREE things when
+        this box landed -- the 1.2 sentinel, the banner on COM1, and the ABSENCE of the
+        self-test failure line -- and every milestone since has added its own verdicts
+        to the same gate. `--smoke` shows both positive halves refusing a kernel-less guest.
         16 injected defects, 16 caught -- `docs/HARNESS-VALIDATION-SERIAL.md`, which also
         records what none of it can catch (no real silicon; timing is asserted as a count,
         never a duration).
@@ -741,9 +761,9 @@ The most critical mathematical and structural phase. Setting up the brain of the
         injected NMI has been observed landing on it. ist3..ist7 are still zero,
         so #MC continues to arrive on the faulting stack -- fine while nothing
         raises one, and the next entry in this list to be paid.
-        There is no guard page below the emergency stack; that needs the VMM at
-        3.5, and until then a runaway panic handler walks into whatever .bss put
-        underneath.
+        There is still no guard page below the EMERGENCY stacks -- the one page
+        3.5 reserved is the boot stack's -- so a runaway panic handler on IST1 or
+        IST2 walks into whatever .bss put underneath, and no open box owns it.
 
         AND THE SHARPER VERSION OF THAT, found by review rather than by a gate:
         `fk_tss` ends at 0xFFFFFFFF80108228 and `__boot_stack_bottom` is
@@ -756,20 +776,25 @@ The most critical mathematical and structural phase. Setting up the brain of the
         fails, and it is the one thing 3.5 must fix before anything deepens the
         call stack.
 
-        SUPERSEDED BY 3.4, AND ONLY BY LUCK. The PMM's 2 MiB bitmap is now the
-        object directly below the boot stack -- with ZERO bytes of slack -- so an
-        overflow corrupts the allocator instead of the TSS, and IST1 survives to
-        catch the fault the overflow causes. That is strictly better and it is
-        nobody's design: it is what the link order happens to be this week, which
-        is exactly why linkscript-test.sh PRINTS the neighbour instead of
-        asserting one. The guard page at 3.5 is still the fix. `tools/linkscript-test.sh` prints the neighbour and the slack
-        on every run rather than asserting a link order. And the ONE boot exercises one IST index on one vector: see
+        SUPERSEDED BY 3.4, AND ONLY BY LUCK -- THEN FIXED BY 3.5. The PMM's 2 MiB
+        bitmap became the object directly below the boot stack -- with ZERO bytes
+        of slack -- so an overflow corrupted the allocator instead of the TSS, and
+        IST1 survived to catch the fault the overflow caused. That was strictly
+        better and it was nobody's design: it was what the link order happened to
+        be that week, which is exactly why linkscript-test.sh PRINTS the neighbour
+        instead of asserting one. The guard page at 3.5 was the fix and it has
+        landed: linker.ld reserves `__boot_stack_guard`, a 4 KiB frame of its own
+        directly below the boot stack, and the VMM leaves it unmapped, so the
+        overflow faults on the guard instead of reaching whatever the link order
+        left beneath it -- which is no longer the bitmap. And the
+        ONE boot exercises one IST index on one vector: see
         `docs/HARNESS-VALIDATION-PHASE3.md` for the mutation table, including the
         defects that got past it.
 
-        A NOTE ON THE COMMITTED IMAGE. `kernel_main` raises exactly one deliberate
-        fault, chosen by the `FK_FAULT_MODE` PARAMETER. 8 (#DF) is the default and
-        the milestone. 0 (#DE) is NOT redundant: #DF carries a CPU error code and
+        A NOTE ON THE COMMITTED IMAGE, AS IT WAS AT THIS MILESTONE. `kernel_main`
+        raised exactly one deliberate fault, chosen by the `FK_FAULT_MODE`
+        PARAMETER, and 8 (#DF) was the default here and is the milestone. Since
+        3.2b the default is -5, which raises nothing at all. 0 (#DE) is NOT redundant: #DF carries a CPU error code and
         so only ever reaches the `ISR_ERR` half of `boot/interrupts.S`, leaving the
         dummy-push half that 3.2's M1 mutation targets unexercised. Both gates are
         driven from `tools/mutate-phase3.sh`, which rebuilds for each.
@@ -1031,15 +1056,15 @@ The most critical mathematical and structural phase. Setting up the brain of the
         while RSP was still on the interrupted stack. Read them together, as
         3.2.5 says: separately neither proves a stack switch.
 
-        WHY THE 8259 IS STILL ALIVE, AND WHY THAT IS THE RIGHT ANSWER TODAY.
-        Once SVR bit 8 is set the CPU no longer takes the 8259 on its own INTR
-        pin -- the chip arrives through LINT0. So `lapic_init`'s masked LINT0
-        stopped IRQ0 dead, the timer stopped, and the scheduler stopped with it;
-        the kernel hung after "preemption is on" and the boot gate caught it.
-        LINT0 is deliberately put BACK into ExtINT, which is what Linux does for
-        the BSP over exactly this window. Until an IOAPIC exists at 4.1 the 8259
-        is the only interrupt source this kernel has, and disabling it would be
-        disabling interrupts.
+        WHY THE 8259 WAS STILL ALIVE WHEN THIS WAS WRITTEN, AND WHY THAT WAS THE
+        RIGHT ANSWER THEN. Once SVR bit 8 is set the CPU no longer takes the 8259
+        on its own INTR pin -- the chip arrives through LINT0. So `lapic_init`'s
+        masked LINT0 stopped IRQ0 dead, the timer stopped, and the scheduler
+        stopped with it; the kernel hung after "preemption is on" and the boot
+        gate caught it. LINT0 is deliberately put BACK into ExtINT, which is what
+        Linux does for the BSP over exactly this window. Until the IOAPIC was
+        brought up in this same box the 8259 was the only interrupt source this
+        kernel had, and disabling it would have been disabling interrupts.
 
         AND LINT1 IS THE NMI SOURCE for the same class of reason, found the same
         way: masking every LVT made 3.2.5's own IST slot unreachable, and
@@ -1049,19 +1074,17 @@ The most critical mathematical and structural phase. Setting up the brain of the
         `lapic_init` masks what nothing is ready to take, and every line this
         kernel DOES depend on is programmed back BY NAME afterwards.
 
-        WHAT IS NOT DONE. 4.1 has since landed and answered the table half of
-        this: the IOAPIC's address is KNOWN (0xFEC00000, GSI base 0), IRQ0's
-        override to GSI 2 is known, and the MADT's PCAT_COMPAT bit is firmware
-        AGREEING that the 8259s must be disabled before the IOAPIC is used. What
-        is still missing is the doing, and it is 4.2's: the IOAPIC is not mapped
-        and not written, so no interrupt can yet be routed anywhere except
-        through the legacy chip. No LAPIC
-        timer -- the 8254 still drives preemption. The spurious vector 0xFF is
-        written into SVR but is NOT installed in the IDT: every LVT is masked
-        and nothing routes through the LAPIC, so it cannot be delivered, and
-        unmasking anything here before installing it is a #GP. No IPIs and no
-        second core. `lapic_eoi` exists and has never been called, because
-        nothing yet arrives that the LAPIC must acknowledge.
+        WHAT WAS NOT DONE WHEN THE LAPIC HALF LANDED, and has been since. 4.1
+        answered the table half: the IOAPIC's address is KNOWN (0xFEC00000, GSI
+        base 0), IRQ0's override to GSI 2 is known, and the MADT's PCAT_COMPAT
+        bit is firmware AGREEING that the 8259s must be disabled before the
+        IOAPIC is used. The doing was this box's own and it is done: the page is
+        punched out of the physmap, mapped strong-UC and written, GSI 2 carries
+        IRQ0, the spurious vector 0xFF is installed in the IDT unconditionally,
+        and `lapic_eoi` -- armed by `idt_set_eoi_lapic` -- retires every
+        interrupt the IOAPIC delivers. What is still not done: no LAPIC timer,
+        so the 8254 still drives preemption; no IPIs and no second core. The
+        rest is under WHAT IS NOT DONE above.
 
         ONE HAZARD FOUND AND CLOSED. `lapic_init` wrote CMCI (0x2F0)
         unconditionally; that register exists only where VERSION bits 23:16
@@ -1095,7 +1118,7 @@ The most critical mathematical and structural phase. Setting up the brain of the
             Fortran Kernel: PMM reserved and ACPI frames are all marked used.
             Fortran Kernel: PMM locked the kernel image and the loader map out.
             PMM  ALLOC 0x0000000000001000 ... 0x0000000000005000
-            Fortran Kernel: PMM allocated 5 contiguous frames.
+            Fortran Kernel: PMM allocated 5 distinct, aligned frames.
             Fortran Kernel: PMM freed and reclaimed the same 5 frames.
             Fortran Kernel: PMM refused a double, unaligned and locked free.
             Fortran Kernel: PMM rewound its scan cursor to a freed frame.
@@ -1188,12 +1211,12 @@ The most critical mathematical and structural phase. Setting up the brain of the
         now, the way linkscript-test.sh already did.
 
         PROVEN, at four levels, and the mutation tables are in
-        docs/HARNESS-VALIDATION-PHASE3.md. `build/run-pmm`: 390 checks against a
+        docs/HARNESS-VALIDATION-PHASE3.md. `build/run-pmm`: 746 checks against a
         reference bitmap built from the specification, compared BIT FOR BIT
         against fk_pmm_bitmap itself -- the array is bind(c) so the diff is with
         the real thing and not with an accessor that could agree with a wrong
         bitmap. 16 injected defects, 16 refused. `linkscript-test.sh`: 7 new
-        static checks. The boot gate: five verdict lines, each with a FAIL twin
+        static checks. The boot gate: six verdict lines, each with a FAIL twin
         the gate REJECTS. `mutate-phase3.sh`: M14-M20.
 
         THREE ESCAPES OF THE FIXTURES, RECORDED BECAUSE THEY WERE MINE, and
@@ -1312,8 +1335,10 @@ The most critical mathematical and structural phase. Setting up the brain of the
         THE GUARD PAGE IS RESERVED IN linker.ld, not carved out of a neighbour,
         and 3.2.5's note about the PMM bitmap being "strictly better and nobody's
         design" is why: there was no slack to carve. `__boot_stack_guard` is a
-        4 KiB frame of its own between the bitmap and the stack, and
-        `tools/linkscript-test.sh` asserts that no .bss object overlaps it --
+        4 KiB frame of its own directly below the boot stack -- the object under
+        the guard is whatever the link order leaves last, which is why the gate
+        PRINTS that neighbour -- and `tools/linkscript-test.sh` asserts that no
+        .bss object overlaps it --
         the one property a linker script cannot check about itself.
 
         PROVEN BY FAULTING, with the address taken from the ELF rather than
@@ -1361,9 +1386,11 @@ The most critical mathematical and structural phase. Setting up the brain of the
         no window at all once PML4[0] is gone. THE LAPIC IS NO LONGER AN EXAMPLE
         OF THIS: 3.3 reserves 0xFEE00000 out of the physmap before it is built
         and maps it strong-UC at FK_VMM_LAPIC, so it is deliberate rather than
-        accidental on any size of machine. The IOAPIC is not, and 4.1 lands
-        directly on it -- it wants `vmm_map_mmio` with caching disabled and NOT
-        the physmap, for exactly the reason the LAPIC did.
+        accidental on any size of machine. THE IOAPIC IS NO LONGER ONE EITHER,
+        and 3.3 had to reach it the other way round: its address comes out of an
+        ACPI table, too late for `vmm_reserve_mmio`, so the page is PUNCHED out
+        of the physmap after the map exists and mapped strong-UC, for exactly
+        the reason the LAPIC did.
 
         AND vmm_reserve_mmio HELD ONLY ONE SPAN UNTIL 3.3, which is a defect
         this box shipped and did not know about. The framebuffer was the sole
@@ -1387,8 +1414,10 @@ The most critical mathematical and structural phase. Setting up the brain of the
         to shatter a large page rather than doing it, so nothing may be mapped at
         4 KiB inside the linear map's 2 MiB range. There is no unmap and no
         reference counting: a page table, once allocated, is never freed. The
-        framebuffer is still not mapped -- 2.2 asked for write-combining
-        attributes and this milestone deliberately did not touch it. And the
+        framebuffer was not mapped by THIS milestone -- 2.2 asked for
+        write-combining attributes and 3.5 deliberately did not touch it; 2.2 has
+        since mapped it with `vmm_map_mmio` at FK_VMM_MMIO, write-combining, with
+        its write-back alias punched out. And the
         linear map covers MMIO holes as ordinary write-back memory because it
         maps [0, top) rather than the AVAILABLE regions; nothing dereferences
         those addresses today, and the day something does, it wants PCD/PWT.
@@ -1444,10 +1473,10 @@ The most critical mathematical and structural phase. Setting up the brain of the
         takes a lock, so kmalloc from an interrupt handler or from two threads
         at once will corrupt the block list. Today the rule is that only the
         boot thread allocates and it stops before `sched_start`; a real lock is
-        4.1's problem, when something other than the boot path allocates.
+        still owed, and belongs to whatever first allocates outside the boot path.
 
-        NOT THE SAME PROBLEM AS DMA MEMORY, which 5.1 and 5.3 need and which is
-        still not smuggled into this box. An xHCI ring and an NVMe submission
+        NOT THE SAME PROBLEM AS DMA MEMORY, which 5.1 and 5.3 need and which this
+        box declares rather than solves as a heap. An xHCI ring and an NVMe submission
         queue must be PHYSICALLY CONTIGUOUS, aligned, and known by their
         physical address to a device that does not use the CPU's page tables. A
         general heap gives none of those three. What 3.5 made easy is the
@@ -1602,7 +1631,7 @@ Discovering what hardware actually exists on the Minisforum motherboard.
             Fortran Kernel: MADT overrides/IRQ0-GSI 0x0005/0x0002
 
         IRQ0 IS overridden, to GSI 2. Nothing can program an IOAPIC redirection
-        entry for the timer without knowing that, and 4.2 is where it gets used.
+        entry for the timer without knowing that, and 3.3 is where it gets used.
 
         `src/acpi/fk_acpi.f90` (554 checks) finds the RSDP in Multiboot2 tag 15
         and falls back to tag 14, validates both checksums, and walks the XSDT
@@ -1632,7 +1661,7 @@ Discovering what hardware actually exists on the Minisforum motherboard.
         3.3 configured, by argument, after an injected NMI went nowhere. And
         MADT flags bit 0, PCAT_COMPAT, is SET: firmware's own statement that the
         8259s are present and must be disabled before the IOAPIC is used, which
-        is the sentence 3.3's box is still open on.
+        is the sentence 3.3's box closed on.
 
         NO TEMPORARY MAPPING, which is a deviation from the directive and a
         simplification rather than a shortcut. 3.5's linear map already covers
@@ -1682,10 +1711,10 @@ Discovering what hardware actually exists on the Minisforum motherboard.
         0xFEC00000, GSI-for-IRQ0 2, read back over QMP.
 
         WHAT IS NOT DONE. Nothing is programmed: this box ends at parse, store
-        and print. The IOAPIC is not mapped and not written -- that is 4.2's,
-        and it is what finally lets 3.3 close. Only the FADT's signature is
+        and print. The IOAPIC is not mapped or written here -- that was 3.3's
+        doing, and it is what let 3.3 close. Only the FADT's signature is
         seen; nothing reads it. There is no AML interpreter and no _PRT, so PCI
-        interrupt routing at 4.2 has only the ISO table to work from.
+        interrupt routing at 5.1 has only the ISO table to work from.
 
    * [x] 4.2 PCIe Bus Enumeration
 
@@ -1762,15 +1791,17 @@ Discovering what hardware actually exists on the Minisforum motherboard.
 
         WHAT IS NOT DONE: no BAR sizing or assignment, no bridge secondary-bus
         programming, no capability-list walk, no MSI or MSI-X enablement, and
-        one segment group only. The list is capped at 32 published slots and
-        `pcie_overflowed` says so rather than letting a truncated list read as
-        a complete one.
+        one segment group only. The kept list is capped at 64 (FK_PCIE_MAX_DEV)
+        and `pcie_overflowed` says so rather than letting a truncated list read
+        as a complete one; the copy kmain publishes over QMP carries the first
+        32 of that list and no more.
 
         THE LAYOUTS THAT CAME FIRST. `src/drivers/bus/fk_pcie_types.f90`
         carries the Type 0 and Type 1 configuration headers, the capability list
         header, the MSI-X capability and one table entry, the ECAM shifts, BAR
         decode, and the class/subclass/prog-if triples that identify an xHCI and
-        an NVMe. No procedures and no module state: nothing scans anything yet.
+        an NVMe. No procedures and no module state of its own: the scan is
+        fk_pcie.f90's, and 4.2 landed it.
 
         Those offsets are a fact rather than a claim -- each taken from the
         specification, cross-checked against vendor/linux-7.1.8's pci_regs.h
@@ -1807,10 +1838,13 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
         carried in. That is the unsigned rule this tree has applied since 1.1,
         arrived at from the register side.
 
-        BLOCKED ON THREE THINGS, all real: 4.2, to find the controller at all;
-        a DMA allocator, because a ring is read by a bus master that does not
-        walk the CPU's page tables (the interface is declared -- see 3.6); and
-        an IOAPIC or MSI-X route for its interrupt, which is 4.2's other half.
+        BLOCKED ON THREE THINGS WHEN THE LAYOUTS LANDED, AND TWO OF THEM ARE
+        DISCHARGED. 4.2 finds the controller (`pcie_find_xhci`), and 3.x defined
+        the DMA allocator a ring needs, because a ring is read by a bus master
+        that does not walk the CPU's page tables (`pmm_alloc_contiguous`, in the
+        PMM -- see 3.6). What is left is the interrupt route, and it is nobody
+        else's now: there is no _PRT, so it has to be MSI-X, which is declared in
+        fk_pcie_types and written by nothing.
 
    * [ ] 5.2 USB HID Keyboard Driver
 
@@ -1824,7 +1858,7 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
         `src/drivers/storage/fk_nvme_types.f90` carries the controller register
         block, the persistent-memory region block, the 64-byte submission queue
         entry and the 16-byte completion queue entry. Measured, like the others.
-        Blocked on the same three things 5.1 is.
+        Blocked on the same one thing 5.1 is: the interrupt route.
 
 ## 🌉 Phase 6: The User-Space Bridge (Distro Maker)
 
