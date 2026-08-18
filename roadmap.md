@@ -36,8 +36,7 @@ written without it, and 3.3 is where it gets used.
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 5.1 | the xHCI controller | all three of its original blockers are discharged: 4.2 finds it (`pcie_find_xhci`), 3.x gives it contiguous memory (`pmm_alloc_contiguous`), and 4.2's debt is paid -- decode and bus mastering are on and MSI-X is decoded | the ROUTE itself: an MSI-X table entry lives in DEVICE memory, not configuration space, so it needs the table mapped, a vector, and INTx off afterwards |
-| 2.2 | a framebuffer on the UEFI path | still none: GRUB sets no video mode under OVMF, so tag 8 is absent | GRUB's video modules in the EFI half of the ISO, or GOP through the EFI system table (tag 12, which IS present) |
+| 5.2 | the USB HID keyboard | 5.1 leaves a running controller, a command ring that wraps, an event ring and a working MSI-X route | slots and device contexts, an address-device command, a transfer ring and a port reset -- none of which 5.1 built |
 | 1.1 | the string half of the core library | unchanged and still owed | nothing; 6.1 and 6.4 cannot start without it |
 
 **WHAT 5.1 NEEDED BEFORE IT COULD TOUCH THE CONTROLLER, AND IT IS PAID.** 4.2
@@ -479,7 +478,55 @@ The Minisforum has no legacy VGA text mode. The kernel must render its own pixel
 
         Validation: Multiboot2 header successfully requests the framebuffer; Fortran pointer maps to the physical video memory address.
 
-        DONE. `boot/boot.S` carries the framebuffer tag (type 5, 1024x768x32)
+        DONE ON BOTH FIRMWARE PATHS, and the UEFI half was one line of
+        grub.cfg. The kernel had always ASKED for a mode -- header tag 5,
+        flags 0, required -- and under OVMF GRUB answered on COM1 with
+
+            error: ../../grub-core/video/video.c:grub_video_set_mode:761:no suitable video mode found.
+
+        and handed over an MBI with no tag 8 in it. The cause was not the
+        request and not the firmware: the EFI core `grub2-mkrescue` builds
+        embeds the video FRAMEWORK and no video DRIVER, while the drivers sit
+        unused on the ISO it just wrote. `insmod all_video` before the
+        `multiboot2` line loads them -- efi_gop/efi_uga/video_bochs/
+        video_cirrus on x86_64-efi, vbe/vga/video_bochs/video_cirrus on
+        i386-pc, which is why one line covers both halves of the hybrid image.
+
+            Fortran Kernel: GOP framebuffer base/pitch/w/h/bpp 0x0000000080000000/0x00001000/0x00000400/0x00000300/0x20
+            Fortran Kernel: GOP framebuffer PTE selects PAT index 1, write-combining.
+            Fortran Kernel: GOP renderer armed on the mapped framebuffer (roadmap 2.4).
+            Fortran Kernel: console is live on the framebuffer, cols/rows 0x00000080/0x0000002F
+
+        Same geometry, same masks (0x0000080008080810) and same console as
+        SeaBIOS; only the base moves, 0xFD000000 to 0x80000000, which is why
+        neither is written down in a gate.
+
+        THE GATE WAS THE REAL WORK, because it was GREEN BEFORE ANY OF THIS.
+        `tools/qemu-boot-test.sh` used to blank FK_FB_PASS_LINES,
+        FK_CON_PASS_LINES and both FAIL lists under FK_FIRMWARE=uefi and set
+        FK_CHECK_FB=0 -- an opt-out that would have stayed green whether or not
+        a framebuffer ever appeared, which is the same shape as a gate that
+        passes before its feature exists. The video assertions now apply on
+        BOTH paths.
+
+        AND THE ISO DID NOT DEPEND ON THE RECIPE THAT WROTE ITS grub.cfg.
+        `$(ISO): $(KERNEL)` only, so removing the insmod line moved no file
+        make was watching and the previous image was reused -- measured, the
+        UEFI gate stayed green against an ISO that still carried the line. The
+        rule now depends on Makefile.boot, and `isocheck-boot` greps the
+        generated grub.cfg and the built ISO in the container, because a
+        missing GRUB module is SILENT: the loader reports it and carries on.
+
+        ONE LATENT DEFECT FELL OUT OF IT. `fb_bringup` keyed on the base
+        being non-zero, and `fb_probe` writes the base BEFORE it validates the
+        mode and returns early on one it refuses -- so a rejected framebuffer
+        left a non-zero base behind. Nothing hit it while the UEFI path had no
+        tag 8 at all. Forced with a probe that refuses the loader's depth, the
+        old guard maps `phys 0xFFFFFFFFFFFFFFFF` with a zero PTE and arms the
+        renderer on it, AFTER printing that it rejected the tag; the guard now
+        keys on the magic, which is written last and only on acceptance.
+
+        `boot/boot.S` carries the framebuffer tag (type 5, 1024x768x32)
         and `src/drivers/video/fk_fbinfo.f90` reads back the tag 8 the loader
         answers with -- through the identity window, before 1.2b's handoff
         closes it, because the reply decides which pages the linear map must

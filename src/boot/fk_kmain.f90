@@ -91,6 +91,7 @@ module fk_kmain_m
                          pmm_alloc_contiguous
   use fk_fbinfo_m, only: FK_FB_OK, FK_FB_BASE, FK_FB_PITCH, FK_FB_WIDTH, &
                          FK_FB_HEIGHT, FK_FB_BPP, FK_FB_MASKS, FK_FB_BYTES, &
+                         FK_FB_TAG, FK_FB_MAGIC, &
                          fk_fb_info, fb_probe, fb_pixel_pack, fb_note_mapping
   use fk_gop_renderer_m, only: vga_init_framebuffer, vga_fill_rect, &
                          vga_width, vga_height, vga_print_string
@@ -1719,7 +1720,15 @@ contains
     integer(c_int32_t) :: st
 
     status = -1_c_int32_t
-    if (fk_fb_info(FK_FB_BASE) == 0_c_int64_t) return
+    ! THE MAGIC, NOT THE BASE.  fb_probe fills base, pitch, geometry and the
+    ! masks BEFORE it validates them, and returns early on a mode it refuses --
+    ! a non-RGB one, a depth that is not 32, a pitch narrower than the width --
+    ! so a rejected framebuffer leaves a NON-ZERO base behind.  The magic is
+    ! written last and only on acceptance, which is the only thing that means
+    ! "the probe agreed to this".  Nothing hit it while the UEFI path had no
+    ! tag 8 at all; the moment that path produces one, this is what stands
+    ! between a refused mode and a renderer armed on it.
+    if (fk_fb_info(FK_FB_TAG) /= FK_FB_MAGIC) return
 
     base  = fk_fb_info(FK_FB_BASE)
     bytes = fk_fb_info(FK_FB_BYTES)
