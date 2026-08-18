@@ -48,13 +48,16 @@ read a ring wherever it is put. No capability-list walk either, which is how the
 MSI-X capability is found before anything can enable it. Neither is xHCI work and
 both are 5.1's to pay.
 
-**AND THE GATE MOVES IN THE SAME CHANGE.** q35 has no xHCI unless the boot gate
-adds `-device qemu-xhci`, which takes the PCI function set from five to six --
-and 4.2 compares that set AS A SET, so the device and the expectation land
-together or the gate goes red for the right reason. `mmiocheck-boot` names
-fk_lapic.o and fk_ioapic.o explicitly rather than globbing, so an xHCI object is
-not policed by it as written, and the MMIO rule is exactly the one that cost 3.3
-a milestone.
+**AND THE GATE HAS TO GROW A DEVICE.** q35 has no xHCI at all unless the boot
+gate adds `-device qemu-xhci`, which takes the machine from five PCI functions
+to six. 4.2's check survives that on its own -- it reads `info pci` off the live
+monitor and compares it against the guest's list AS SETS, so both sides grow
+together and neither a missed function nor an invented one can hide. What is
+hardcoded to five is qmp-sentinel's own SELF-TEST fixture, which proves the
+comparison refuses, and the prose in the gate's header. Those move with the
+device. `mmiocheck-boot` names fk_lapic.o and fk_ioapic.o explicitly rather than
+globbing, so neither fk_pcie.o nor an xHCI object is policed by it as written --
+and the rule it enforces is the one that cost 3.3 a milestone.
 
 **TWO THINGS 4.1 CONFIRMED THAT HAD ONLY BEEN REASONED.** Type 4 of the MADT
 puts NMI on LINT1 for every processor -- which is exactly what 3.3 configured,
