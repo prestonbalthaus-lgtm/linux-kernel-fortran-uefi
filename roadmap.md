@@ -1,11 +1,18 @@
 
 # PROPOSED NEXT MILESTONE -- AWAITING LEAD ARCHITECT APPROVAL
 
-Updated 2026-08-17. **4.1 was approved and has LANDED and is ticked.** Landing
-beside it, from a separate branch: the PCIe, xHCI and NVMe REGISTER LAYOUTS and
-the DMA allocator's INTERFACE -- types and declarations only, no procedures and
-no driver logic, recorded in 4.2, 5.1, 5.3 and 3.6 rather than given boxes of
-their own. Neither change ticks a driver box and neither pretends to.
+Updated 2026-08-18. **4.1, 3.x and 3.3 have LANDED and are ticked.** 3.x gave
+the DMA allocator declared in 3.6 a body and a host-side proof of contiguity;
+3.3 closed the 8259 half by routing IRQ0 through the I/O APIC, and found that
+both APIC modules had been reading device registers ONE BYTE AT A TIME through
+a pointer declared VOLATILE -- gfortran narrows such a load, and the LAPIC had
+been getting away with it since it landed. `boot/io.S` grew fk_readl/fk_writel
+and `tools/mmiocheck.sh` now refuses the narrow form in the object file.
+
+Landing earlier, from a separate branch: the PCIe, xHCI and NVMe REGISTER
+LAYOUTS -- types only, no procedures and no driver logic, recorded in 4.2, 5.1
+and 5.3 rather than given boxes of their own. That change ticks no driver box
+and does not pretend to.
 
 That grep now answers differently, which is the whole of the milestone:
 
@@ -25,9 +32,7 @@ written without it, and 4.2 is where it gets used.
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 4.2 | PCIe enumeration | the layouts are in and 4.1 found the MCFG; this is the last thing between here and any real device | parsing the MCFG for the ECAM base, and an uncached mapping of it -- both are 3.3's `vmm_map_mmio` path on a bigger region |
-| 3.3 | the 8259's other half | 4.1 delivered the IOAPIC's address and firmware's own PCAT_COMPAT statement; only the doing is left | 4.2, for a mapped IOAPIC to route interrupts to instead |
-| 3.x | the DMA allocator's BODY | declared beside heap_sbrk and defined nowhere; 5.1 and 5.3 both stop here | nothing -- it is a thin thing over `pmm_alloc_page`, and 3.5's linear map already makes virt-to-phys a subtraction |
+| 4.2 | PCIe enumeration | the layouts are in, 4.1 found the MCFG, and 3.3 left behind the two things it needs: `vmm_punch_physmap` for a window discovered after the linear map exists, and `fk_readl` for reading it a whole dword at a time | nothing |
 | 2.2 | a framebuffer on the UEFI path | still none: GRUB sets no video mode under OVMF, so tag 8 is absent | GRUB's video modules in the EFI half of the ISO, or GOP through the EFI system table (tag 12, which IS present) |
 | 1.1 | the string half of the core library | unchanged and still owed | nothing; 6.1 and 6.4 cannot start without it |
 
@@ -902,13 +907,87 @@ The most critical mathematical and structural phase. Setting up the brain of the
             handler today. That is a fact about how small this kernel is, not a
             property anything enforces.
 
-  *  [ ] 3.3 Advanced Programmable Interrupt Controller (APIC)
+  *  [x] 3.3 Advanced Programmable Interrupt Controller (APIC)
 
         Validation: Legacy 8259 PIC is disabled. Local APIC is mapped and active.
 
-        THE LAPIC HALF IS DONE. The 8259 half is NOT, and leaving it undone is a
-        decision rather than an omission -- see the box below this text. The box
-        stays open on the strength of its own second sentence.
+        BOTH HALVES ARE DONE. The 8259s are masked and the timer reaches the CPU
+        through the I/O APIC instead. The kernel's own lines:
+
+            Fortran Kernel: IOAPIC id/version/entries 0x00/0x11/0x0018
+            Fortran Kernel: the IOAPIC page has no write-back alias in the linear map.
+            Fortran Kernel: both 8259s report every line masked.
+            Fortran Kernel: IOAPIC gsi/vector/readback 0x0002/0x20/0x00000020
+            Fortran Kernel: the timer still ticks with both 8259s masked (roadmap 3.3).
+
+        and the same facts as QEMU's device models hold them, which is the half
+        no console line can establish:
+
+            PASS  8259 master IMR is 0xFF (want 0xFF)
+            PASS  IOAPIC pin 2 delivers vector 32 (want 32 = 0x20, the IDT's IRQ0 stub)
+            PASS  IOAPIC pin 2 is unmasked (active-hi edge  fixed  physical)
+            PASS  every other IOAPIC pin is masked (24 pins)
+
+        THE PROOF IS NOT THE NEW LINES. It is that the `ticks` and `sched`
+        assertions STILL PASS with imr=ff on both chips -- fk_tick_count read
+        twice from outside the guest and growing, on a machine where the legacy
+        pair can no longer deliver anything. GSI 2 is the number 4.1 measured;
+        routing IRQ0 to GSI 0 would produce every line above and no ticks.
+
+        WHAT THE MILESTONE ACTUALLY COST, AND IT WAS NOT THE IOAPIC. Both APIC
+        modules reached their registers through a VOLATILE Fortran pointer.
+        `lapic_max_lvt` is `ibits(reg_read(base, REG_VERSION), 16, 8)`, and
+        gfortran -O2 proved only one byte of that load is ever used and emitted
+
+            movzbl 0x2(%rax),%eax
+
+        a ONE-BYTE read of a device register, through a pointer declared
+        VOLATILE. Fortran's VOLATILE forbids ELIMINATING and REORDERING an
+        access. It does not forbid NARROWING one, and neither does C's.
+
+        Both parts forbid it: the SDM requires a naturally aligned 4-byte access
+        to every local APIC register (Vol.3 11.4.1), and the I/O APIC's IOWIN is
+        a single 32-bit window with no defined sub-dword behaviour. The LAPIC's
+        narrowed read happened to return the right byte on QEMU -- 0x00050014
+        has 0x05 at offset 2 -- so it had been passing every gate in this tree
+        since the LAPIC landed. The IOAPIC's did not: QEMU answers a one-byte
+        read of IOWIN+2 with ZERO, `ioapic_max_redir` reported 1 entry instead
+        of 24, and every route was refused with E_GSI. That is how it was found,
+        and it would have been found on the Minisforum box instead.
+
+        `fk_readl`/`fk_writel` in `boot/io.S` are the fix -- a call the compiler
+        cannot see through can be neither narrowed nor reordered against the
+        next one, which an indexed register pair needs anyway. `tools/mmiocheck.sh`
+        runs in `bootgate`, reads the OBJECT rather than the source because the
+        source that gets this wrong looks right, and compiles the bad form first
+        to prove this toolchain still emits the narrowed access.
+
+        ORDER INSIDE ioapic_bringup IS THE DESIGN: punch, map, assert the alias
+        is gone, read the chip, `pic_disable`, route, and only then hand the EOI
+        to the LAPIC. Masking before routing is not tidiness -- a line live on an
+        8259 and the IOAPIC at once is delivered twice, and the second is
+        acknowledged at whichever chip the handler was told about, leaving the
+        other holding an in-service bit for ever.
+
+        `vmm_punch_physmap` is new and 4.2 needs it too. `vmm_reserve_mmio` runs
+        BEFORE `vmm_init`, which is unreachable for an address that comes out of
+        an ACPI table: reading that table needs the linear map the reservation
+        would have holed. So the write-back page is REMOVED afterwards instead,
+        and the routine refuses a range overlapping reported RAM -- firmware
+        claiming a device aperture inside memory is not something to quietly
+        unmap.
+
+        The LAPIC's spurious vector is now installed rather than merely chosen.
+        `fk_spurious_stub` counts and IRETQs in two instructions and never enters
+        Fortran; it gets NO EOI, because the local APIC sets no in-service bit
+        for a spurious interrupt and retiring one would retire whatever really
+        is in service. kmain's own duplicate `FK_LAPIC_SPURIOUS = 255` is gone --
+        the compiler found it, as a name clash against fk_idt_m's counter.
+
+        WHAT IS NOT DONE: only IOAPIC 0 is programmed, only GSI 2 is routed,
+        every other pin stays masked, and there is no MSI or MSI-X path. LINT0
+        is still ExtINT and is left that way deliberately -- inert with both
+        chips masked, and changing it would churn assertions for nothing.
 
         `src/cpu/fk_lapic.f90` (10322 checks). Off the running chip, through the
         mapping, and not remembered from what was written:
@@ -1385,11 +1464,65 @@ The most critical mathematical and structural phase. Setting up the brain of the
         boundary, which a TRB's data buffer may not cross
         (vendor/linux-7.1.8/drivers/usb/host/xhci.h:1265).
 
-        DECLARED AND NOT DEFINED, deliberately: an interface body with no caller
-        emits no reference, so `nm -u` on fk_heap.o still prints heap_sbrk and
-        nothing else and the tree links exactly as it did. The first driver to
-        call it fails at LINK time rather than by reading a page of firmware
-        leftovers. Filling it in is the PMM's job and nobody has done it.
+        IT IS NOW DEFINED, in the PMM, because the bitmap is the PMM's. First
+        fit scanned as WORDS: a full word cannot contribute to a run, so it is
+        skipped rather than having its 64 bits tested. A clear bit is by
+        construction usable RAM -- pmm_init marks the whole bitmap used and
+        clears only AVAILABLE regions -- so a contiguous run of clear bits is a
+        contiguous run of frames and needs no second check against the region
+        table. It still answers with a PHYSICAL base; `vmm_phys_to_virt` was
+        already public and is the one call that gives the CPU-side address, so
+        nothing new was needed to get it. `pmm_free_contiguous` hands a run back
+        through the checked single-frame path and refuses at the FIRST bad
+        frame, which leaves the rest allocated rather than half-released.
+
+        THE TEST IS WHERE THE MILESTONE ACTUALLY WAS. Its first version passed
+        against five deliberate defects, because on a freshly initialised bitmap
+        every free frame is adjacent to the next and almost any wrong answer is
+        accidentally right. Five mutations were run and five survived. Three
+        cases fixed it:
+
+            fragmented pool  sixteen frames taken and every other one given
+                             back, so no run of four exists in that region at
+                             all -- kills an implementation that never restarts
+                             its run counter (9 mismatches).
+            exact gap        a hole of EXACTLY twenty frames with used frames on
+                             both sides and nothing before it that could hold
+                             the run, so the correct answer is one address and
+                             not a range -- kills an allocator that answers with
+                             the run's END and marks forward from there, which
+                             every other check tolerates because past the end
+                             the frames happen to be free too (1 mismatch).
+            full word        ten free frames ending at a bitmap word boundary, a
+                             whole used word after it, ten more free beyond, and
+                             a request for fifteen -- kills a scan that skips a
+                             full word without breaking the run, joining the
+                             frames on either side of sixty-four used ones (2
+                             mismatches).
+
+        A sixth mutation, removing a cursor update inside mark_run, changed
+        nothing -- and that was correct: the cursor is a lower bound on where a
+        free frame can be, marking frames USED can only make that bound more
+        true, and a run cannot start below it. The line and its confident
+        comment were deleted.
+
+        AND THE BITMAP IS NOT THE PROOF. It can only testify about itself.
+        dma_bringup writes one word into each frame of a four-frame run, derived
+        from that frame's own index, through the linear map; `qmp-sentinel.py
+        dma` then pmemsaves pages*4096 bytes at the PHYSICAL base the kernel
+        published, with no page table consulted to reach it:
+
+            PASS  the run's physical base is 0x6E000
+            PASS  all 4 frames carry their own tag at the physical base
+
+        That gate was made to refuse before it was trusted to pass. dma_bringup
+        was mutated to write the same four tags at a stride of two frames and
+        the whole boot test exited 1, with frame 1 reading a fragment of the
+        framebuffer's leftovers and frame 3 reading zeros -- which is what a
+        wrong physical address looks like from outside a guest.
+
+        STILL NOT PROMISED, and the caller's problem: a run clear of a 64 KiB
+        boundary.
 
   *  [x] 3.7 Tasks, context switching and a round-robin scheduler
 
