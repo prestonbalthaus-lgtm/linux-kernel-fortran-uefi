@@ -42,6 +42,14 @@
 #                     Set it to 0 for a build that ends in a deliberate panic:
 #                     the CPU is halted with IF clear, so the counter is frozen
 #                     and frozen is the CORRECT answer there.
+#   FK_MACHINE        QEMU machine type (default: q35). The DEFAULT MOVED at
+#                     roadmap 4.2 and the reason is not preference: the
+#                     i440FX board QEMU boots by default emits four ACPI
+#                     tables and none of them is MCFG, so there is no ECAM
+#                     window on it and nothing for 4.2 to find. q35 emits
+#                     five. FK_MACHINE=pc still reaches the no-MCFG path
+#                     deliberately, and the kernel treats it as a fact about
+#                     the machine rather than as a failure.
 #   FK_ACCEL          force 'kvm' or 'tcg'
 #   FK_SMP / FK_MEM   override the mandated 6 vCPU / 24 GB allocation
 set -uo pipefail
@@ -208,6 +216,30 @@ Fortran Kernel: kzalloc returned memory that was already zero.
 Fortran Kernel: heap refused a double free, a stray pointer and a wrapped size.
 Fortran Kernel: heap tiles its window exactly, blocks/used/free 0x00000001/0x00000000/
 Fortran Kernel: heap coalesced every freed block back into one, largest free 0x'
+# roadmap 4.2. The window and device lines carry live values and are prefixes;
+# the three VERDICTS are not. "no MCFG table" is a FAILURE on q35 and the
+# CORRECT answer under FK_MACHINE=pc, so it is added to the reject list only
+# where an MCFG is supposed to exist -- a line that is right on one machine and
+# wrong on another cannot be a constant.
+FK_PCIE_PASS_LINES=$'Fortran Kernel: PCIe looking for the ECAM window (roadmap 4.2).
+Fortran Kernel: the ECAM window has no write-back alias in the linear map.
+Fortran Kernel: the ECAM mapping selects PWT and PCD, strong uncacheable.
+Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2).'
+FK_PCIE_FAIL_LINES=$'Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map.
+Fortran Kernel: the ECAM mapping is CACHED.
+Fortran Kernel: the MCFG table would not parse, status 0x
+Fortran Kernel: the ECAM window could not be taken out of the linear map, status 0x
+Fortran Kernel: the ECAM window could not be mapped, status 0x
+Fortran Kernel: the PCIe list is TRUNCATED; the machine has more functions than slots.'
+if [[ "${FK_MACHINE:-q35}" == pc ]]; then
+  FK_PCIE_PASS_LINES=$'Fortran Kernel: PCIe looking for the ECAM window (roadmap 4.2).
+Fortran Kernel: no MCFG table; this machine has no ECAM window.'
+  FK_PCIE_FAIL_LINES=$'Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2).'
+else
+  FK_PCIE_FAIL_LINES="$FK_PCIE_FAIL_LINES
+Fortran Kernel: no MCFG table; this machine has no ECAM window."
+fi
+
 # roadmap 3.3. The chip/gsi lines carry live values and are prefixes; the three
 # VERDICTS are not, and they are what the gate asserts. "still ticks with both
 # 8259s masked" is the milestone: it is printed only after fk_tick_count has
@@ -291,7 +323,8 @@ $FK_SCHED_PASS_LINES
 $FK_LAPIC_PASS_LINES
 $FK_ACPI_PASS_LINES
 $FK_IRQ_PASS_LINES
-$FK_IOA_PASS_LINES}"
+$FK_IOA_PASS_LINES
+$FK_PCIE_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
 $FK_VMM_FAIL_LINES
@@ -303,7 +336,8 @@ $FK_SCHED_FAIL_LINES
 $FK_LAPIC_FAIL_LINES
 $FK_ACPI_FAIL_LINES
 $FK_IRQ_FAIL_LINES
-$FK_IOA_FAIL_LINES}"
+$FK_IOA_FAIL_LINES
+$FK_PCIE_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a
@@ -367,12 +401,18 @@ fi
 for pat in "${EXPECTS[@]}"; do say "must carry : \"$pat\""; done
 for pat in "${REJECTS[@]}"; do say "must not   : \"$pat\""; done
 [[ -n "${FK_CHECK_HW:-}" ]] && say "hw check   : task register and both 8259s, over QMP"
+# Defined here rather than beside QEMU_ARGS: the PCI switch below reads it, and
+# QEMU_ARGS is not built until after every announcement has been printed.
+MACHINE="${FK_MACHINE:-q35}"
 CHECK_TICKS="${FK_CHECK_TICKS:-1}"
 [[ "$CHECK_TICKS" != 0 ]] && say "tick check : fk_tick_count read twice from the running guest"
 CHECK_SCHED="${FK_CHECK_SCHED:-1}"
 [[ "$CHECK_SCHED" != 0 ]] && say "sched check: fk_task_runs and fk_heap_stat, read twice while it runs"
 CHECK_DMA="${FK_CHECK_DMA:-1}"
 [[ "$CHECK_DMA" != 0 ]] && say "dma check  : the contiguous run, read at the physical base it published"
+CHECK_PCI="${FK_CHECK_PCI:-1}"
+[[ "$MACHINE" == pc ]] && CHECK_PCI=0
+[[ "$CHECK_PCI" != 0 ]] && say "pci check  : the guest's own enumeration against QEMU's info pci, as sets"
 CHECK_FB="${FK_CHECK_FB:-1}"
 [[ "$CHECK_FB" != 0 ]] && say "fb check   : fk_fb_info, then the pixels at the base it names (${FK_FB_EXPECT:-console} palette)"
 
@@ -567,6 +607,12 @@ assertion_summary() {
       else                         say "  framebuffer      : FAIL  see the pixel comparison above"
       fi
     fi
+    if [[ "$CHECK_PCI" != 0 ]]; then
+      if   (( PCI_OK == 1 )); then  say "  PCI enumeration  : PASS  the guest's list and QEMU's are the same set"
+      elif (( PCI_RAN == 0 )); then say "  PCI enumeration  : FAIL  the guest died before it could be asked"
+      else                          say "  PCI enumeration  : FAIL  see the two lists above"
+      fi
+    fi
     if [[ "$CHECK_DMA" != 0 ]]; then
       if   (( DMA_OK == 1 )); then  say "  DMA run          : PASS  every frame carried its tag at the physical base"
       elif (( DMA_RAN == 0 )); then say "  DMA run          : FAIL  the guest died before it could be asked"
@@ -593,6 +639,7 @@ assertion_summary() {
 # -serial file: : a file can be re-read on every poll; a consumed stream cannot.
 # -nic none     : without it QEMU attaches a default e1000 on user-mode slirp.
 QEMU_ARGS=(
+  -machine "$MACHINE"
   -smp "$SMP" -m "$MEM"
   -display none
   -no-reboot
@@ -626,7 +673,6 @@ if [[ "${FK_FIRMWARE:-bios}" == uefi ]]; then
   cp "$OVMF_VARS" "$VARS_COPY"
   chmod u+w "$VARS_COPY"
   QEMU_ARGS+=(
-    -machine q35
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
     -drive "if=pflash,format=raw,file=$VARS_COPY"
   )
@@ -635,6 +681,7 @@ else
   say "firmware   : BIOS (SeaBIOS)"
 fi
 
+say "machine    : $MACHINE$([[ "$MACHINE" == pc ]] && echo '  (no MCFG: the ECAM path is deliberately not exercised)')"
 say "qemu       : qemu-system-x86_64 ${QEMU_ARGS[*]}"
 rule
 
@@ -735,6 +782,25 @@ fi
 # table is consulted to reach it: the frames appear in order only if they
 # really are adjacent in DRAM. The kernel's own bitmap cannot say that, and a
 # bitmap that is simply wrong says it just as confidently.
+# roadmap 4.2. As SETS and not as containment: a device QEMU reports and the
+# guest missed is a hole in the walk, and a device the guest reports and QEMU
+# does not is a ghost -- which is what a multifunction check that ignores the
+# header-type bit produces, one device counted eight times.
+PCI_RAN=0; PCI_OK=0
+if [[ "$CHECK_PCI" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    PCI_RAN=1
+    rule
+    say "--- the guest's PCI enumeration, against QEMU's own tree ---"
+    if python3 "$SENTINEL" pci --qmp "$SOCK" --elf "$KERNEL" --timeout 10; then
+      PCI_OK=1
+    fi
+  else
+    say ""
+    say "PCI list NOT asserted: the guest was already gone."
+  fi
+fi
+
 DMA_RAN=0; DMA_OK=0
 if [[ "$CHECK_DMA" != 0 && "$MODE" == gate ]]; then
   if qemu_alive; then
@@ -848,10 +914,13 @@ SCHED_BAD=0
 if [[ "$CHECK_SCHED" != 0 && "$MODE" == gate ]] && (( SCHED_OK == 0 )); then SCHED_BAD=1; fi
 DMA_BAD=0
 if [[ "$CHECK_DMA" != 0 && "$MODE" == gate ]] && (( DMA_OK == 0 )); then DMA_BAD=1; fi
+PCI_BAD=0
+if [[ "$CHECK_PCI" != 0 && "$MODE" == gate ]] && (( PCI_OK == 0 )); then PCI_BAD=1; fi
 
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
    && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )) \
-   && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )) && (( DMA_BAD == 0 )); then
+   && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )) && (( DMA_BAD == 0 )) \
+   && (( PCI_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule
@@ -877,6 +946,14 @@ if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
     say "          from the loader's channel masks -- so the renderer reached"
     say "          real video memory and packed the channels the firmware"
     say "          asked for, not the ones an x86 kernel usually gets away with."
+  fi
+  if [[ "$CHECK_PCI" != 0 ]]; then
+    say "          The bus the guest walked was then compared against QEMU's"
+    say "          own info pci AS A SET, so a function it missed and a"
+    say "          function it invented both fail -- and the second is the"
+    say "          one a containment test would wave through, because a"
+    say "          single-function device aliased across all eight looks like"
+    say "          eight perfectly plausible devices."
   fi
   if [[ "$CHECK_DMA" != 0 ]]; then
     say "          A run of physically contiguous frames was then read at the"

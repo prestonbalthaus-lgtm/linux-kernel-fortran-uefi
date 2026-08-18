@@ -36,6 +36,9 @@ Subcommands
     dma       read the contiguous run at the PHYSICAL base the kernel
               published, and assert every frame carries its own tag
               (roadmap 3.x)
+    pci       compare the guest's own enumeration against 'info pci', as
+              SETS, so a device missed and a device invented both fail
+              (roadmap 4.2)
     selftest  prove every assertion PASSES on synthetic good input and FAILS on
               every corrupted one -- no QEMU and no kernel required
 
@@ -99,6 +102,15 @@ TICK_BYTES = 8
 # states apart.
 MASTER_IMR = 0xFF
 SLAVE_IMR = 0xFF
+
+# roadmap 4.2. bind(c) in src/boot/fk_kmain.f90.
+# [0] magic [1] ECAM phys [2] bus range lo<<8|hi [3] kept [4] seen
+# then one packed word per function: bdf<<48 | vendor<<32 | device<<16 |
+# class<<8 | subclass.
+PCI_SYMBOL = "fk_pcie_devs"
+PCI_SLOTS = 32
+PCI_WORDS = PCI_SLOTS + 5
+PCI_MAGIC = 0x5043494501
 
 # roadmap 3.3. 'info pic' prints the IOAPIC's whole 24-entry redirection table
 # above the two pic lines, on the default machine and on q35 alike:
@@ -945,6 +957,129 @@ def do_sched(sock_path, elf, timeout, quiet, interval=0.25):
     return 0
 
 
+# --- roadmap 4.2: the guest's PCI list against QEMU's ----------------------
+
+#   Bus  0, device  31, function 2:
+#     SATA controller: PCI device 8086:2922
+PCI_FN_RE = re.compile(r"^\s*Bus\s+(\d+),\s*device\s+(\d+),\s*function\s+(\d+):",
+                       re.M)
+PCI_ID_RE = re.compile(r"PCI device ([0-9a-fA-F]{4}):([0-9a-fA-F]{4})")
+
+
+def parse_info_pci(text):
+    """QEMU's own view: {(bus, dev, fn): (vendor, device)}.
+
+    The vendor:device line belongs to the header above it, so the text is
+    walked in order rather than scanned with one regex -- a device with no
+    'PCI device' line at all must go missing here rather than silently pick up
+    its neighbour's identity.
+    """
+    out = {}
+    key = None
+    for line in text.splitlines():
+        m = PCI_FN_RE.match(line)
+        if m:
+            key = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            continue
+        if key is None:
+            continue
+        m = PCI_ID_RE.search(line)
+        if m:
+            out[key] = (int(m.group(1), 16), int(m.group(2), 16))
+            key = None
+    return out
+
+
+def parse_guest_pci(words):
+    """The kernel's own list: {(bus, dev, fn): (vendor, device)}."""
+    out = {}
+    kept = words[3]
+    for i in range(min(kept, PCI_SLOTS)):
+        w = words[5 + i]
+        bdf = (w >> 48) & 0xFFFF
+        out[((bdf >> 8) & 0xFF, (bdf >> 3) & 0x1F, bdf & 0x07)] = (
+            (w >> 32) & 0xFFFF, (w >> 16) & 0xFFFF)
+    return out
+
+
+def _bdf(k):
+    return f"{k[0]:02x}:{k[1]:02x}.{k[2]}"
+
+
+def check_pci(words, pci_text):
+    """Return a list of (ok, description).
+
+    THE TWO LISTS ARE COMPARED AS SETS, not with one containing the other. A
+    device QEMU reports and the kernel missed is a hole in the walk; a device
+    the kernel reports and QEMU does not is a ghost, which is what a
+    multifunction check that ignores the header-type bit produces -- a
+    single-function device aliased across all eight functions and counted
+    eight times. A containment test would let the second one through.
+    """
+    out = []
+    out.append((words[0] == PCI_MAGIC,
+                f"fk_pcie_devs magic is 0x{words[0]:016X} "
+                f"(want 0x{PCI_MAGIC:016X}: pcie_bringup ran)"))
+    out.append((words[1] != 0,
+                f"the ECAM window is at 0x{words[1]:X} "
+                "(0 would mean no MCFG was found)"))
+    out.append((words[3] == words[4],
+                f"the list is complete: {words[3]} kept of {words[4]} seen"))
+
+    host = parse_info_pci(pci_text)
+    guest = parse_guest_pci(words)
+    out.append((bool(host), f"'info pci' reported {len(host)} function(s)"))
+
+    missing = sorted(set(host) - set(guest))
+    extra = sorted(set(guest) - set(host))
+    out.append((not missing,
+                f"the guest found every function QEMU reports ({len(host)})"
+                if not missing else
+                "the guest MISSED " + ", ".join(_bdf(k) for k in missing)))
+    out.append((not extra,
+                "and reported none QEMU does not"
+                if not extra else
+                "the guest INVENTED " + ", ".join(_bdf(k) for k in extra)))
+
+    wrong = [k for k in sorted(set(host) & set(guest)) if host[k] != guest[k]]
+    out.append((not wrong,
+                f"every vendor:device matches ({len(set(host) & set(guest))} "
+                "function(s) compared)"
+                if not wrong else
+                "; ".join(f"{_bdf(k)} guest says "
+                          f"{guest[k][0]:04x}:{guest[k][1]:04x}, QEMU says "
+                          f"{host[k][0]:04x}:{host[k][1]:04x}" for k in wrong[:4])))
+    if missing or extra:
+        out.append((False, "  QEMU : " + " ".join(_bdf(k) for k in sorted(host))))
+        out.append((False, "  guest: " + " ".join(_bdf(k) for k in sorted(guest))))
+    return out
+
+
+def do_pci(sock_path, elf, timeout, quiet):
+    _v, paddr = symbol_phys_addr(elf, PCI_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-pci.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    try:
+        client.handshake()
+        client.pmemsave(paddr, PCI_WORDS * 8, tmp.name)
+        raw = open(tmp.name, "rb").read()
+        if len(raw) != PCI_WORDS * 8:
+            raise QmpError(f"pmemsave wrote {len(raw)} bytes for {PCI_SYMBOL}")
+        words = list(struct.unpack(f"<{PCI_WORDS}Q", raw))
+        pci_text = client.hmp_query("info pci")
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+    results = check_pci(words, pci_text)
+    if not report_hwstate(results, quiet):
+        print(f"        {PCI_SYMBOL} at 0x{paddr:X}")
+        return 1
+    return 0
+
+
 # --- roadmap 3.x: the DMA run, read at its PHYSICAL base ------------------
 
 def check_dma(probe, pages_raw):
@@ -1661,6 +1796,75 @@ def do_selftest():
     expect_dma(False, *dma_run(short=True),
                "a short read of the run is rejected")
 
+    # roadmap 4.2. The q35 tree this project's own gate meets.
+    Q35_PCI = (
+        "  Bus  0, device   0, function 0:\n"
+        "    Host bridge: PCI device 8086:29c0\n"
+        "  Bus  0, device   1, function 0:\n"
+        "    VGA controller: PCI device 1234:1111\n"
+        "  Bus  0, device  31, function 0:\n"
+        "    ISA bridge: PCI device 8086:2918\n"
+        "  Bus  0, device  31, function 2:\n"
+        "    SATA controller: PCI device 8086:2922\n"
+        "  Bus  0, device  31, function 3:\n"
+        "    SMBus: PCI device 8086:2930\n"
+    )
+    Q35_FNS = [(0, 0, 0, 0x8086, 0x29C0), (0, 1, 0, 0x1234, 0x1111),
+               (0, 31, 0, 0x8086, 0x2918), (0, 31, 2, 0x8086, 0x2922),
+               (0, 31, 3, 0x8086, 0x2930)]
+
+    def pci_words(fns=None, magic=PCI_MAGIC, base=0xB0000000, seen=None):
+        fns = Q35_FNS if fns is None else fns
+        w = [magic, base, (0 << 8) | 255, len(fns),
+             len(fns) if seen is None else seen] + [0] * PCI_SLOTS
+        for i, (b, d, f, ven, dev) in enumerate(fns):
+            bdf = (b << 8) | (d << 3) | f
+            w[5 + i] = (bdf << 48) | (ven << 32) | (dev << 16)
+        return w[:PCI_WORDS]
+
+    def expect_pci(ok_wanted, words, text, what):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_pci(words, text))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} -- assertion said "
+                  f"{'accept' if got else 'reject'}")
+            fail_n += 1
+
+    print("=== PCI enumeration self-test (no QEMU, no kernel) ===")
+    expect_pci(True, pci_words(), Q35_PCI,
+               "the q35 tree, enumerated exactly, is accepted")
+    expect_pci(False, pci_words(magic=0), Q35_PCI,
+               "a list whose magic was never written is rejected")
+    expect_pci(False, pci_words(base=0), Q35_PCI,
+               "an ECAM base of 0 -- no MCFG was found -- is rejected")
+    expect_pci(False, pci_words(seen=9), Q35_PCI,
+               "a list that kept 5 of 9 seen is rejected as truncated")
+    # THE TWO THAT MATTER, and they fail in opposite directions.
+    expect_pci(False, pci_words(Q35_FNS[:-1]), Q35_PCI,
+               "a guest that MISSED a function QEMU reports is rejected")
+    expect_pci(False,
+               pci_words(Q35_FNS + [(0, 31, 1, 0x8086, 0x2918)]), Q35_PCI,
+               "a guest that INVENTED 00:1f.1 -- the multifunction bit "
+               "ignored -- is rejected")
+    expect_pci(False,
+               pci_words([(b, d, f, ven ^ 1, dev) for b, d, f, ven, dev
+                          in Q35_FNS]), Q35_PCI,
+               "a guest whose vendor ids do not match QEMU's is rejected")
+    expect_pci(False, pci_words(), "", "monitor output with no PCI tree is "
+               "rejected")
+    # A function QEMU printed a header for and no identity line under: it must
+    # go missing rather than inherit the next one's vendor:device.
+    expect_pci(False, pci_words(),
+               "  Bus  0, device   0, function 0:\n"
+               "    Host bridge: PCI device 8086:29c0\n"
+               "  Bus  0, device   1, function 0:\n"
+               "  Bus  0, device  31, function 0:\n"
+               "    ISA bridge: PCI device 8086:2918\n",
+               "a QEMU function with no identity line does not inherit one")
+
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
 
@@ -1730,6 +1934,12 @@ def main(argv=None):
     m.add_argument("--timeout", type=float, default=10.0)
     m.add_argument("--quiet", action="store_true")
 
+    c2 = sub.add_parser("pci", help="the guest's PCI list against QEMU's")
+    c2.add_argument("--qmp", required=True)
+    c2.add_argument("--elf", required=True)
+    c2.add_argument("--timeout", type=float, default=10.0)
+    c2.add_argument("--quiet", action="store_true")
+
     sub.add_parser("selftest", help="prove the assertion can fail")
 
     args = ap.parse_args(argv)
@@ -1755,6 +1965,8 @@ def main(argv=None):
         if args.cmd == "sched":
             return do_sched(args.qmp, args.elf, args.timeout, args.quiet,
                             interval=args.interval)
+        if args.cmd == "pci":
+            return do_pci(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "dma":
             return do_dma(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "ticks":

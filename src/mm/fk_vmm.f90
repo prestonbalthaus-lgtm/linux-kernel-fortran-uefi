@@ -39,6 +39,7 @@ module fk_vmm_m
             FK_PTE_PWT, FK_PTE_PCD, FK_VMM_MMIO, FK_VMM_HEAP, FK_VMM_WC, &
             vmm_reserve_mmio, vmm_reserved_holes, vmm_map_mmio, &
             vmm_punch_physmap, FK_VMM_E_IS_RAM, FK_VMM_IOAPIC, &
+            FK_VMM_ECAM, &
             vmm_pat_arm, vmm_read_pat, FK_VMM_UC, FK_VMM_LAPIC, &
             vmm_init, vmm_activate, vmm_drop_identity, vmm_map_page, &
             vmm_translate, vmm_phys_of, vmm_pml4_phys, vmm_table_frames, &
@@ -99,6 +100,12 @@ module fk_vmm_m
   ! that can drift apart.
   integer(c_int64_t), parameter :: FK_VMM_IOAPIC = &
        FK_VMM_MMIO + int(z'21000000', c_int64_t)
+  ! 1 GiB into the MMIO window, clear of the two single pages above and with
+  ! room for the 256 MiB an MCFG allocation covering all 256 buses declares.
+  ! Derived from FK_VMM_MMIO like the others: three constants that must stay
+  ! inside one window are three things that can drift out of it.
+  integer(c_int64_t), parameter :: FK_VMM_ECAM = &
+       FK_VMM_MMIO + int(z'40000000', c_int64_t)
 
   ! PML4[258], the slot after the device window.  The kernel heap grows upward
   ! from here (roadmap 4.0).  A slot of its own rather than a hole inside the

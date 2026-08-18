@@ -24,6 +24,13 @@ module fk_kmain_m
                          acpi_set_limit, acpi_init, acpi_root_kind, &
                          acpi_root_phys, acpi_revision, acpi_table_count, &
                          acpi_find, acpi_table_length
+  use fk_mcfg_m,   only: FK_MCFG_OK, mcfg_parse, mcfg_count, mcfg_base, &
+                         mcfg_segment, mcfg_bus_start, mcfg_bus_end, mcfg_bytes
+  use fk_pcie_m,   only: FK_PCIE_NOT_FOUND, pcie_set_window, pcie_scan, &
+                         pcie_count, pcie_seen, pcie_overflowed, &
+                         pcie_bus, pcie_device, pcie_function, &
+                         pcie_vendor, pcie_devid, pcie_class, pcie_subclass, &
+                         pcie_progif, pcie_find_xhci, pcie_find_nvme
   use fk_madt_m,   only: FK_MADT_OK, madt_parse, madt_lapic_addr, &
                          madt_pcat_compat, madt_cpu_count, madt_cpu_enabled, &
                          madt_cpu_apic_id, madt_ioapic_count, &
@@ -82,7 +89,7 @@ module fk_kmain_m
                          vmm_physmap_top, FK_VMM_PHYSMAP, &
                          vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, &
                          vmm_read_pat, vmm_punch_physmap, FK_VMM_E_IS_RAM, &
-                         FK_VMM_IOAPIC
+                         FK_VMM_IOAPIC, FK_VMM_ECAM
   use fk_sched_m,  only: FK_SCHED_MAX, fk_task_runs, fk_sched_switches, &
                          sched_init, sched_spawn, sched_start, sched_current, &
                          sched_tasks
@@ -191,6 +198,22 @@ module fk_kmain_m
   integer(c_int64_t), volatile, save, bind(c, name="fk_ioapic_state") :: &
        fk_ioapic_state(0:5)
 
+  ! roadmap 4.2.  [0] magic  [1] ECAM phys  [2] bus range packed lo:hi
+  ! [3] functions kept  [4] functions seen  then one packed word per function:
+  ! bdf<<48 | vendor<<32 | device<<16 | class<<8 | subclass.  Prog-if is left
+  ! out on purpose -- 'info pci' does not print it, so a comparison against
+  ! QEMU cannot use it and a field nothing checks is a field nothing checks.
+  integer(c_int64_t), parameter :: FK_PCIE_MAGIC = int(z'5043494501', c_int64_t)
+  integer(c_int32_t), parameter :: FK_PCIE_SLOTS = 32_c_int32_t
+  integer(c_int64_t), volatile, save, bind(c, name="fk_pcie_devs") :: &
+       fk_pcie_devs(0:FK_PCIE_SLOTS + 4)
+
+  ! 'MCFG' packed little-endian, built the way FK_SIG_APIC is.
+  integer(c_int32_t), parameter :: FK_SIG_MCFG = &
+       ior(ior(iachar('M', c_int32_t), shiftl(iachar('C', c_int32_t), 8)), &
+           ior(shiftl(iachar('F', c_int32_t), 16), &
+               shiftl(iachar('G', c_int32_t), 24)))
+
   ! 'APIC' packed little-endian, built rather than written down.
   integer(c_int32_t), parameter :: FK_SIG_APIC = &
        ior(ior(iachar('A', c_int32_t), shiftl(iachar('P', c_int32_t), 8)), &
@@ -271,6 +294,49 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_PMM_TOTALS = &
        "Fortran Kernel: PMM frames total/free/unmanaged-bytes 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PMM_SLASH  = "/0x" // c_null_char
+
+  character(kind=c_char, len=*), parameter :: FK_PCIE_START = &
+       "Fortran Kernel: PCIe looking for the ECAM window (roadmap 4.2)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_NO_MCFG = &
+       "Fortran Kernel: no MCFG table; this machine has no ECAM window." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_MCFG_BAD = &
+       "Fortran Kernel: the MCFG table would not parse, status 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_WINDOW = &
+       "Fortran Kernel: ECAM base/segment/buses/bytes 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_PUNCH_BAD = &
+       "Fortran Kernel: the ECAM window could not be taken out of the linear map, status 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_MAP_BAD = &
+       "Fortran Kernel: the ECAM window could not be mapped, status 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_ALIAS_OK = &
+       "Fortran Kernel: the ECAM window has no write-back alias in the linear map." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_ALIAS_BAD = &
+       "Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_UC_OK = &
+       "Fortran Kernel: the ECAM mapping selects PWT and PCD, strong uncacheable." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_UC_BAD = &
+       "Fortran Kernel: the ECAM mapping is CACHED." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_COUNT = &
+       "Fortran Kernel: PCIe functions kept/seen 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_TRUNC = &
+       "Fortran Kernel: the PCIe list is TRUNCATED; the machine has more functions than slots." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_DEV = &
+       "Fortran Kernel: PCIe 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_DOT = "." // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_SP = " 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_NONE_YET = &
+       "Fortran Kernel: no xHCI and no NVMe on this bus (roadmap 5.1, 5.3)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_PCIE_WALKED = &
+       "Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2)." // &
+       FK_CRLF // c_null_char
 
   character(kind=c_char, len=*), parameter :: FK_IOA_START = &
        "Fortran Kernel: IOAPIC taking the timer off the 8259s (roadmap 3.3)." // &
@@ -1726,6 +1792,156 @@ contains
   ! allocator in the state pmm_verify left it, and before the scheduler, for the
   ! reason everything else here runs before the scheduler: nothing in the PMM
   ! takes a lock.
+  ! One function's identity, to COM1 and to the framebuffer.  The roadmap's
+  ! validation sentence names the GOP display specifically, so the console copy
+  ! is the deliverable and the serial one is what the gate greps.
+  subroutine pcie_report(i)
+    implicit none
+    integer(c_int32_t), intent(in) :: i
+
+    call serial_print_string(FK_PCIE_DEV)
+    call serial_print_hex(int(pcie_bus(i), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(pcie_device(i), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PCIE_DOT)
+    call serial_print_hex(int(pcie_function(i), c_int64_t), 1_c_int32_t)
+    call serial_print_string(FK_PCIE_SP)
+    call serial_print_hex(int(pcie_vendor(i), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(pcie_devid(i), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PCIE_SP)
+    call serial_print_hex(int(pcie_class(i), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(pcie_subclass(i), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(pcie_progif(i), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call console_print_hex(int(pcie_bus(i), c_int64_t), 2_c_int32_t)
+    call console_print_hex(int(pcie_device(i), c_int64_t), 2_c_int32_t)
+    call console_print_hex(int(pcie_function(i), c_int64_t), 1_c_int32_t)
+    call console_print_hex(int(pcie_vendor(i), c_int64_t), 4_c_int32_t)
+    call console_print_hex(int(pcie_devid(i), c_int64_t), 4_c_int32_t)
+  end subroutine pcie_report
+
+  ! roadmap 4.2.  AFTER acpi_bringup, which is what can find the table, and
+  ! after ioapic_bringup, which lands the punch primitive this needs.
+  subroutine pcie_bringup()
+    implicit none
+    integer(c_int64_t) :: mcfg_phys, mcfg_len, base, bytes, pte
+    integer(c_int32_t) :: st, i, n
+
+    fk_pcie_devs = 0_c_int64_t
+    call serial_print_string(FK_PCIE_START)
+
+    mcfg_phys = acpi_find(FK_SIG_MCFG)
+    ! NOT A FAILURE.  A machine with no MCFG has no ECAM window, which is a
+    ! fact about the machine: QEMU's default i440FX board emits four ACPI
+    ! tables and none of them is this one.
+    if (mcfg_phys == 0_c_int64_t) then
+       call serial_print_string(FK_PCIE_NO_MCFG)
+       return
+    end if
+
+    mcfg_len = acpi_table_length(mcfg_phys)
+    st = mcfg_parse(vmm_phys_to_virt(mcfg_phys), int(mcfg_len, c_int32_t))
+    if (st /= FK_MCFG_OK) then
+       call serial_print_string(FK_PCIE_MCFG_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    base  = mcfg_base(0_c_int32_t)
+    bytes = mcfg_bytes(0_c_int32_t)
+    call serial_print_string(FK_PCIE_WINDOW)
+    call serial_print_hex(base, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(mcfg_segment(0_c_int32_t), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(mcfg_bus_start(0_c_int32_t), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(mcfg_bus_end(0_c_int32_t), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(bytes, 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    st = vmm_punch_physmap(base, bytes)
+    if (st /= FK_VMM_OK) then
+       call serial_print_string(FK_PCIE_PUNCH_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    ! 4 KiB at a time and there is no other option: vmm_map_page has no large
+    ! page path and walk() refuses to shatter one.  256 MiB is 65536 entries
+    ! and about 512 KiB of page tables out of a 24 GiB machine.
+    st = vmm_map_mmio(FK_VMM_ECAM, base, bytes, FK_VMM_UC)
+    if (st /= FK_VMM_OK) then
+       call serial_print_string(FK_PCIE_MAP_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    if (vmm_translate(FK_VMM_PHYSMAP + base) == 0_c_int64_t) then
+       call serial_print_string(FK_PCIE_ALIAS_OK)
+    else
+       call serial_print_string(FK_PCIE_ALIAS_BAD)
+    end if
+
+    ! "Mapped" and "mapped UNCACHED" are different claims and the second is the
+    ! one that matters: a cached mapping of configuration space reads a stale
+    ! line for every device after the first.
+    pte = vmm_translate(FK_VMM_ECAM)
+    if (iand(pte, FK_PTE_PWT) /= 0_c_int64_t .and. &
+        iand(pte, FK_PTE_PCD) /= 0_c_int64_t) then
+       call serial_print_string(FK_PCIE_UC_OK)
+    else
+       call serial_print_string(FK_PCIE_UC_BAD)
+    end if
+
+    call pcie_set_window(FK_VMM_ECAM, mcfg_bus_start(0_c_int32_t), &
+                         mcfg_bus_end(0_c_int32_t))
+    n = pcie_scan()
+
+    call serial_print_string(FK_PCIE_COUNT)
+    call serial_print_hex(int(pcie_count(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(pcie_seen(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_NL)
+    if (pcie_overflowed() /= 0_c_int32_t) &
+         call serial_print_string(FK_PCIE_TRUNC)
+
+    do i = 0_c_int32_t, pcie_count() - 1_c_int32_t
+       call pcie_report(i)
+    end do
+
+    if (pcie_find_xhci() == FK_PCIE_NOT_FOUND .and. &
+        pcie_find_nvme() == FK_PCIE_NOT_FOUND) &
+         call serial_print_string(FK_PCIE_NONE_YET)
+
+    fk_pcie_devs(0) = FK_PCIE_MAGIC
+    fk_pcie_devs(1) = base
+    fk_pcie_devs(2) = ior(shiftl(int(mcfg_bus_start(0_c_int32_t), c_int64_t), 8), &
+                          int(mcfg_bus_end(0_c_int32_t), c_int64_t))
+    fk_pcie_devs(3) = int(pcie_count(), c_int64_t)
+    fk_pcie_devs(4) = int(pcie_seen(), c_int64_t)
+    do i = 0_c_int32_t, min(pcie_count(), FK_PCIE_SLOTS) - 1_c_int32_t
+       fk_pcie_devs(5 + i) = &
+            ior(ior(shiftl(ior(ior(shiftl(int(pcie_bus(i), c_int64_t), 8), &
+                                   shiftl(int(pcie_device(i), c_int64_t), 3)), &
+                               int(pcie_function(i), c_int64_t)), 48), &
+                    shiftl(int(pcie_vendor(i), c_int64_t), 32)), &
+                ior(shiftl(int(pcie_devid(i), c_int64_t), 16), &
+                    ior(shiftl(int(pcie_class(i), c_int64_t), 8), &
+                        int(pcie_subclass(i), c_int64_t))))
+    end do
+
+    if (n > 0_c_int32_t) call serial_print_string(FK_PCIE_WALKED)
+  end subroutine pcie_bringup
+
   ! The MADT's interrupt source override flags for one ISA IRQ, decoded into
   ! the IOAPIC's own polarity and trigger encodings.  ACPI 6.5 table 5.26: bits
   ! 1:0 are polarity (0 conforms, 1 active high, 3 active low) and bits 3:2 are
@@ -2377,6 +2593,8 @@ contains
     irq_status = irq_bringup()
 
     call ioapic_bringup()
+
+    call pcie_bringup()
 
     ! Needs a running clock, so it comes after the timer is live.
     call console_scroll_probe()
