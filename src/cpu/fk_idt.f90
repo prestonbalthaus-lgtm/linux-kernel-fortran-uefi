@@ -23,7 +23,7 @@ module fk_idt_m
   private
   public :: idt_init, idt_reload, isr_handler, irq_handler, fk_irq_spurious, &
             idt_set_panic_colors, idt_set_eoi_lapic, fk_lapic_spurious, &
-            FK_VECTOR_SPURIOUS
+            FK_VECTOR_SPURIOUS, FK_VECTOR_MSI, FK_MSI_LINE, fk_msi_count
 
   ! What boot/interrupts.S leaves on the stack, lowest address first.  Every
   ! field is a quadword, so the type needs no padding and the assembly needs no
@@ -90,6 +90,16 @@ module fk_idt_m
   ! real spurious vector pointing at a cleared descriptor, and the CPU's answer
   ! to a not-present gate is a #GP raised from inside interrupt delivery.
   integer(c_int32_t), parameter :: FK_VECTOR_SPURIOUS = 255_c_int32_t
+
+  ! Roadmap 5.1.  The first vector this kernel owns that is not a legacy line:
+  ! 0x30 sits above the 8259's 0x20..0x2F and below the spurious 0xFF.  The
+  ! stub pushes FK_MSI_LINE, one past the last real line, which is how
+  ! irq_handler tells a message from a wire.
+  integer(c_int32_t), parameter :: FK_VECTOR_MSI = int(z'30', c_int32_t)
+  integer(c_int32_t), parameter :: FK_MSI_LINE = FK_PIC_LINES
+
+  integer(c_int64_t), volatile, bind(c, name="fk_msi_count") :: &
+       fk_msi_count = 0_c_int64_t
 
   ! Which chip retires an interrupt.  0 is the 8259 pair and is correct right
   ! up until the IOAPIC is routed; anything else is the LAPIC's mapped base.
@@ -373,6 +383,12 @@ contains
     ! raised during delivery, which is a much worse day than a counter.
     call idt_set_gate(FK_VECTOR_SPURIOUS, fk_spurious_stub_addr())
 
+    ! Roadmap 5.1, and installed here for exactly the reason above: a device
+    ! given an MSI-X route can write its message the moment the entry is
+    ! unmasked, and a vector whose descriptor is still cleared makes that a #GP
+    ! during delivery.  The gate exists before the route does.
+    call idt_set_gate(FK_VECTOR_MSI, fk_irq_stub(FK_MSI_LINE))
+
     call idt_reload()
   end subroutine idt_init
 
@@ -575,6 +591,17 @@ contains
     ! would be interrogating a pair that is not delivering, and the LAPIC's
     ! spurious interrupt is vector 255 and never arrives in this routine at all
     ! -- boot/interrupts.S answers it without entering Fortran.
+    ! A MESSAGE, NOT A WIRE.  No 8259 line, no I/O APIC pin, nothing to ask
+    ! about a spurious in-service bit and no scheduler tick to run: count it,
+    ! retire it at the LAPIC, and go back.  The EOI is not optional -- a
+    ! message-signalled interrupt sets an in-service bit like any other, and
+    ! skipping it wedges every later interrupt at that priority.
+    if (line == FK_MSI_LINE) then
+       fk_msi_count = fk_msi_count + 1_c_int64_t
+       if (eoi_lapic /= 0_c_int64_t) call lapic_eoi(eoi_lapic)
+       return
+    end if
+
     if (eoi_lapic == 0_c_int64_t .and. &
         (line == FK_IRQ_SPURIOUS_MASTER .or. line == FK_IRQ_SPURIOUS_SLAVE)) then
        if (.not. btest(pic_isr(), line)) then

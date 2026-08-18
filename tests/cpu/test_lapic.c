@@ -31,6 +31,8 @@ int32_t lapic_lvt_lint1(int64_t base);
 int32_t lapic_lvt_error(int64_t base);
 int64_t lapic_msr_base(void);
 int32_t lapic_msr_enabled(void);
+int32_t lapic_msi_addr(int32_t dest);
+int32_t lapic_msi_data(int32_t vector);
 
 /* Supplied by boot/mmu.S in the kernel; by the model below here. */
 int64_t fk_rdmsr(int32_t msr);
@@ -445,6 +447,30 @@ int main(void)
 	page_check("init(B) left page A untouched");
 	lapic_eoi(BASE_B);
 	page_check("eoi(B) left page A untouched");
+
+	/* THE MESSAGE, and it is an address a device WRITES rather than a wire
+	 * it pulls. Nothing here touches the chip: it is bit layout, and the
+	 * two ways to get it wrong are shifting the destination into 19:12 by
+	 * the wrong amount and letting a destination above 255 climb into the
+	 * fixed 0FEEh prefix that makes the write land on the APIC bus at
+	 * all. */
+	FK_EQ("MSI address for CPU 0", 0xFEE00000u,
+	      (uint32_t)lapic_msi_addr(0), "0x%08X");
+	FK_EQ("CPU 1 is bit 12, not bit 0", 0xFEE01000u,
+	      (uint32_t)lapic_msi_addr(1), "0x%08X");
+	FK_EQ("CPU 5, the last of this machine's six", 0xFEE05000u,
+	      (uint32_t)lapic_msi_addr(5), "0x%08X");
+	FK_EQ("CPU 255 fills the field exactly", 0xFEEFF000u,
+	      (uint32_t)lapic_msi_addr(255), "0x%08X");
+	FK_EQ("and 256 does NOT reach the 0FEEh prefix", 0xFEE00000u,
+	      (uint32_t)lapic_msi_addr(256), "0x%08X");
+
+	FK_EQ("the data word is the vector", 0x30u,
+	      (uint32_t)lapic_msi_data(0x30), "0x%08X");
+	FK_EQ("delivery mode and trigger stay zero -- FIXED, EDGE", 0xFFu,
+	      (uint32_t)lapic_msi_data(0xFF), "0x%08X");
+	FK_EQ("nothing above the vector byte survives", 0x30u,
+	      (uint32_t)lapic_msi_data(0x8730), "0x%08X");
 
 	free(slab);
 	return fk_report("lapic");

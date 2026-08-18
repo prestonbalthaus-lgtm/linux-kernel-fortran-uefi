@@ -113,10 +113,17 @@ PCI_SLOTS = 32
 # the xHCI's BDF, the COMMAND it read back after the enable, the MSI-X triple
 # and BAR0.
 PCI_W_XHCI = PCI_SLOTS + 5
-PCI_WORDS = PCI_SLOTS + 10
+PCI_WORDS = PCI_SLOTS + 12
 # COMMAND bits: memory-space decode and bus master (pci_regs.h:42-43).
 PCI_CMD_MEMORY = 1 << 1
 PCI_CMD_MASTER = 1 << 2
+PCI_CMD_INTX_DISABLE = 1 << 10
+# Message control, in the high half of the dword at the capability.
+PCI_MSIX_ENABLE = 1 << 31
+PCI_MSIX_MASKALL = 1 << 30
+# roadmap 5.1: what the kernel programs into entry 0.
+MSI_ADDR_CPU0 = 0xFEE00000
+MSI_VECTOR = 0x30
 XHCI_CLASS_TEXT = "USB controller"
 PCI_MAGIC = 0x5043494501
 
@@ -1014,7 +1021,7 @@ def _bdf(k):
     return f"{k[0]:02x}:{k[1]:02x}.{k[2]}"
 
 
-def check_pci(words, pci_text):
+def check_pci(words, pci_text, dev=None):
     """Return a list of (ok, description).
 
     THE TWO LISTS ARE COMPARED AS SETS, not with one containing the other. A
@@ -1061,6 +1068,102 @@ def check_pci(words, pci_text):
         out.append((False, "  QEMU : " + " ".join(_bdf(k) for k in sorted(host))))
         out.append((False, "  guest: " + " ".join(_bdf(k) for k in sorted(guest))))
     out.extend(check_xhci(words, host))
+    out.extend(check_device_msix(dev))
+    out.extend(check_guest_agrees(words, dev))
+    return out
+
+
+def check_guest_agrees(words, dev):
+    """The two witnesses against each other.
+
+    The kernel prints what it read back off the device; `xp` reads what the
+    device model holds. A kernel that never wrote and printed the value it
+    meant to write passes its own check and fails this one.
+    """
+    out = []
+    if dev is None or dev.get("unmapped") or not words[PCI_W_XHCI]:
+        return out
+    msg = words[PCI_W_XHCI + 5]
+    g_lo = msg & 0xFFFFFFFF
+    g_data = (msg >> 32) & 0xFFFF
+    g_mask = (msg >> 48) & 1
+    lo, _hi, data, vctrl = dev["entry0"]
+    out.append((g_lo == lo and g_data == data and g_mask == (vctrl & 1),
+                f"the guest's read-back of entry 0 agrees with QEMU's device "
+                f"model (0x{g_lo:08X}/0x{g_data:02X}/{g_mask} against "
+                f"0x{lo:08X}/0x{data:02X}/{vctrl & 1})"))
+    ctrl = words[PCI_W_XHCI + 6] & 0xFFFF
+    out.append((((dev["cap0"] >> 16) & 0xFFFF) == ctrl,
+                f"and its message control 0x{ctrl:04X} is the one the device "
+                "holds"))
+    return out
+
+
+def parse_bar0(pci_text):
+    """BAR0 of the USB controller, as QEMU reports it.
+
+    Taken from the monitor rather than from the guest, because it is the
+    address the DEVICE decodes: if the two disagree, the kernel mapped
+    something that is not the controller.
+    """
+    blk = [b for b in pci_text.split("Bus  0, device") if "USB controller" in b]
+    if not blk:
+        return None
+    m = re.search(r"BAR0: 64 bit memory at 0x([0-9a-f]+)", blk[0])
+    return int(m.group(1), 16) if m else None
+
+
+def xp_words(client, addr, count):
+    """`xp` reads guest PHYSICAL addresses through the memory API, so it
+    dispatches to device models the way a guest access does -- which is how
+    this reads a device's MSI-X table and its configuration space rather than
+    RAM. An undecoded address answers "Cannot access memory", and that is a
+    real answer: a BAR whose memory-space decode is off is not mapped at all.
+    """
+    text = client.hmp_query(f"xp /{count}xw 0x{addr:X}")
+    if "Cannot access memory" in text:
+        return None
+    return [int(w, 16) for w in re.findall(r"0x([0-9a-f]{8})", text)]
+
+
+def check_device_msix(dev):
+    """The route as the DEVICE MODEL holds it, not as the guest reports it.
+
+    Every reading here comes back through `xp`, so it is QEMU's own state for
+    the controller: the guest could publish anything it liked and these would
+    still disagree with it.
+    """
+    out = []
+    if dev is None:
+        return out
+    if dev.get("unmapped"):
+        out.append((False, "the xHCI's BAR0 is not decoded: memory-space "
+                           "decode is off and the register block, MSI-X table "
+                           "included, is not mapped at all"))
+        return out
+
+    cmd = dev["cmd"] & 0xFFFF
+    out.append((bool(cmd & PCI_CMD_MEMORY) and bool(cmd & PCI_CMD_MASTER),
+                f"QEMU's own COMMAND for the device is 0x{cmd:04X}: decode "
+                "and bus mastering are on"))
+    out.append((bool(cmd & PCI_CMD_INTX_DISABLE),
+                "and INTx is disabled, so the legacy wire is gone"))
+
+    ctrl = dev["cap0"]
+    out.append((bool(ctrl & PCI_MSIX_ENABLE),
+                f"the capability reads 0x{(ctrl >> 16) & 0xFFFF:04X}: MSI-X is "
+                "ENABLED"))
+    out.append((not (ctrl & PCI_MSIX_MASKALL),
+                "and the function-wide mask is clear"))
+
+    lo, hi, data, vctrl = dev["entry0"]
+    out.append((lo == MSI_ADDR_CPU0,
+                f"table entry 0 addresses 0x{lo:08X}, the APIC of CPU 0"))
+    out.append((hi == 0, f"with a zero high half (0x{hi:08X})"))
+    out.append((data == MSI_VECTOR,
+                f"carries vector 0x{data:02X}"))
+    out.append((vctrl == 0,
+                f"and is UNMASKED (vector control 0x{vctrl:08X})"))
     return out
 
 
@@ -1118,6 +1221,39 @@ def check_xhci(words, host):
     return out
 
 
+def read_device_msix(client, words, pci_text):
+    """Read the controller's configuration space and MSI-X table out of QEMU.
+
+    ECAM is a memory region like any other, so `xp` reaches configuration space
+    through it, and the table through the BAR the device decodes. Nothing here
+    asks the guest anything except WHERE to look.
+    """
+    bdf = words[PCI_W_XHCI] & 0xFFFF
+    if not bdf:
+        return None
+    ecam = words[1]
+    cap = words[PCI_W_XHCI + 2] & 0xFFFF
+    if not ecam or cap < 0x40:
+        return None
+    cfg = ecam + ((bdf >> 8) << 20) + (((bdf >> 3) & 0x1F) << 15) + \
+        ((bdf & 7) << 12)
+
+    cmd = xp_words(client, cfg + 0x04, 1)
+    cap0 = xp_words(client, cfg + cap, 2)
+    if cmd is None or cap0 is None:
+        return None
+
+    bar = parse_bar0(pci_text)
+    tbl_off = cap0[1] & ~7
+    if bar is None:
+        return {"unmapped": True, "cmd": cmd[0], "cap0": cap0[0]}
+    entry = xp_words(client, bar + tbl_off, 4)
+    if entry is None:
+        return {"unmapped": True, "cmd": cmd[0], "cap0": cap0[0]}
+    return {"cmd": cmd[0], "cap0": cap0[0], "entry0": entry, "bar": bar,
+            "tbl_off": tbl_off}
+
+
 def do_pci(sock_path, elf, timeout, quiet):
     _v, paddr = symbol_phys_addr(elf, PCI_SYMBOL)
     tmp = tempfile.NamedTemporaryFile(prefix="fk-pci.", suffix=".bin",
@@ -1133,10 +1269,11 @@ def do_pci(sock_path, elf, timeout, quiet):
             raise QmpError(f"pmemsave wrote {len(raw)} bytes for {PCI_SYMBOL}")
         words = list(struct.unpack(f"<{PCI_WORDS}Q", raw))
         pci_text = client.hmp_query("info pci")
+        dev = read_device_msix(client, words, pci_text)
     finally:
         client.close()
         os.unlink(tmp.name)
-    results = check_pci(words, pci_text)
+    results = check_pci(words, pci_text, dev)
     if not report_hwstate(results, quiet):
         print(f"        {PCI_SYMBOL} at 0x{paddr:X}")
         return 1
@@ -1882,8 +2019,25 @@ def do_selftest():
     # COMMAND with decode and mastering set beside the I/O bit firmware left,
     # MSI-X at 0x90 with 16 entries in BAR 0, table at 0x3000, BAR0 decoded.
     XHCI_CMD_OK = 0x0107 | (0x0101 << 16) | (0x0107 << 32)
+    # ... the entry it read back off the device, and the control/command pair.
+    XHCI_MSG_OK = 0xFEE00000 | (0x30 << 32) | (0 << 48)
     XHCI_OK = [0x0010, XHCI_CMD_OK, 0x90 | (16 << 16) | (0 << 32), 0x3000,
-               0xFEBF0000]
+               0xFEBF0000, XHCI_MSG_OK, 0x800F | (0x0507 << 16)]
+    # What QEMU's device model holds, read back through xp: COMMAND, the
+    # capability dword, and the four dwords of table entry 0.
+    DEV_OK = {"cmd": 0x00100507, "cap0": 0x800F0011,
+              "entry0": [0xFEE00000, 0, 0x30, 0], "bar": 0xFEBF0000,
+              "tbl_off": 0x3000}
+
+    def dev(**kw):
+        d = dict(DEV_OK)
+        d["entry0"] = list(DEV_OK["entry0"])
+        for k, v in kw.items():
+            if k.startswith("e"):
+                d["entry0"][int(k[1:])] = v
+            else:
+                d[k] = v
+        return d
 
     def pci_words(fns=None, magic=PCI_MAGIC, base=0xB0000000, seen=None,
                   xhci=None):
@@ -1898,9 +2052,9 @@ def do_selftest():
             w[PCI_W_XHCI + i] = v
         return w
 
-    def expect_pci(ok_wanted, words, text, what):
+    def expect_pci(ok_wanted, words, text, what, device=None):
         nonlocal pass_n, fail_n
-        got = all(ok for ok, _ in check_pci(words, text))
+        got = all(ok for ok, _ in check_pci(words, text, device))
         if got == ok_wanted:
             print(f"  \033[32mPASS\033[0m  {what}")
             pass_n += 1
@@ -1979,8 +2133,45 @@ def do_selftest():
     expect_pci(False, pci_words(xhci=[0x0010, XHCI_CMD_OK, XHCI_OK[2], 0x600,
                                       0xFEBF0000 | 4]), Q35_PCI,
                "a BAR0 with its type bits left in is rejected")
-    expect_pci(True, pci_words(xhci=[0, 0, 0, 0, 0]), Q35_PCI,
+    expect_pci(True, pci_words(xhci=[0, 0, 0, 0, 0, 0, 0]), Q35_PCI,
                "a machine with no xHCI published skips the xHCI checks")
+
+    # roadmap 5.1, and these are the ones the guest cannot talk its way out
+    # of: every reading comes out of QEMU's device model through xp.
+    print("--- the route, as the DEVICE holds it ---")
+    expect_pci(True, pci_words(), Q35_PCI,
+               "a device whose table entry 0 is programmed and unmasked is "
+               "accepted", DEV_OK)
+    expect_pci(False, pci_words(), Q35_PCI,
+               "one whose entry is STILL MASKED is rejected -- a route the "
+               "device will never use", dev(e3=1))
+    expect_pci(False, pci_words(), Q35_PCI,
+               "one whose entry was never written is rejected", dev(e0=0))
+    expect_pci(False, pci_words(), Q35_PCI,
+               "one carrying a vector nothing installed is rejected",
+               dev(e2=0x99))
+    expect_pci(False, pci_words(), Q35_PCI,
+               "one whose high address half is not zero is rejected",
+               dev(e1=0xDEADBEEF))
+    expect_pci(False, pci_words(), Q35_PCI,
+               "one with MSI-X still disabled in its capability is rejected",
+               dev(cap0=0x000F0011))
+    expect_pci(False, pci_words(), Q35_PCI,
+               "one with the function-wide mask still set is rejected",
+               dev(cap0=0xC00F0011))
+    expect_pci(False, pci_words(), Q35_PCI,
+               "one whose INTx is still enabled is rejected",
+               dev(cmd=0x00100107))
+    expect_pci(False, pci_words(), Q35_PCI,
+               "a BAR that is not decoded at all is rejected", 
+               {"unmapped": True, "cmd": 0, "cap0": 0})
+
+    # THE TWO WITNESSES AGAINST EACH OTHER.
+    expect_pci(False, pci_words(xhci=XHCI_OK[:5] + [XHCI_MSG_OK, 0x800F |
+                                                    (0x0507 << 16)]),
+               Q35_PCI,
+               "a guest that reports a route the device does not hold is "
+               "rejected", dev(e2=0x31))
 
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0

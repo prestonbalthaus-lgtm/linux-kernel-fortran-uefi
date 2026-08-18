@@ -181,6 +181,19 @@ irq\line:
 	IRQ 14
 	IRQ 15
 
+/*
+ * ONE MORE, AND IT IS NOT A LINE (roadmap 5.1).  A message-signalled interrupt
+ * has no 8259 line and no I/O APIC pin: the device WRITES to the APIC's
+ * message address and the vector is whatever the MSI-X table entry says.  It
+ * still needs a stub, because a vector the IDT does not describe is a #GP the
+ * instant the first message lands.
+ *
+ * It pushes 16 -- one past the last real line -- so irq_handler can tell the
+ * two apart without a second entry point or a second frame layout.  The 8259
+ * spurious-line logic is indexed by line number and must not see this one.
+ */
+	IRQ 16
+
 	.type irq_common, @function
 irq_common:
 	PUSH_GPRS
@@ -346,5 +359,6 @@ isr_stub_table:
 irq_stub_table:
 	.quad	irq0,  irq1,  irq2,  irq3,  irq4,  irq5,  irq6,  irq7
 	.quad	irq8,  irq9,  irq10, irq11, irq12, irq13, irq14, irq15
+	.quad	irq16
 
 	.section .note.GNU-stack, "", @progbits
