@@ -1,8 +1,10 @@
 
 # PROPOSED NEXT MILESTONE -- AWAITING LEAD ARCHITECT APPROVAL
 
-Updated 2026-08-18. **4.1, 3.x, 3.3 and 4.2 have LANDED and are ticked.** 3.x gave
-the DMA allocator declared in 3.6 a body and a host-side proof of contiguity;
+Updated 2026-08-18. **4.1, 3.x, 3.3 and 4.2 have LANDED, are ticked, and are
+MERGED** -- PRs #16, #17 and #18 went in bottom-up at 17:19Z and master is
+76e6619, so nothing below is waiting on a branch. 3.x gave the DMA allocator
+declared in 3.6 a body and a host-side proof of contiguity;
 3.3 closed the 8259 half by routing IRQ0 through the I/O APIC, and found that
 both APIC modules had been reading device registers ONE BYTE AT A TIME through
 a pointer declared VOLATILE -- gfortran narrows such a load, and the LAPIC had
@@ -34,9 +36,25 @@ written without it, and 3.3 is where it gets used.
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 5.1 | the xHCI controller | 4.2 can find it and 3.x can give it contiguous memory; nothing else is in the way except the controller itself | an interrupt route for it -- there is no _PRT, so MSI-X, which is declared in fk_pcie_types and used by nothing |
+| 5.1 | the xHCI controller | two of its three original blockers are discharged: 4.2 finds it (`pcie_find_xhci`) and 3.x gives it contiguous memory (`pmm_alloc_contiguous`) | an interrupt route -- no _PRT, so MSI-X, declared in fk_pcie_types and written by nothing -- and the config WRITES and capability walk needed to enable one |
 | 2.2 | a framebuffer on the UEFI path | still none: GRUB sets no video mode under OVMF, so tag 8 is absent | GRUB's video modules in the EFI half of the ISO, or GOP through the EFI system table (tag 12, which IS present) |
 | 1.1 | the string half of the core library | unchanged and still owed | nothing; 6.1 and 6.4 cannot start without it |
+
+**WHAT 5.1 NEEDS BEFORE IT TOUCHES THE CONTROLLER, and it is 4.2's WHAT IS NOT
+DONE list coming due.** `fk_pcie.f90` reads configuration space and never writes
+it: no read-modify-write of the COMMAND register, so memory-space and bus-master
+decode cannot be turned on, and a controller that cannot master the bus cannot
+read a ring wherever it is put. No capability-list walk either, which is how the
+MSI-X capability is found before anything can enable it. Neither is xHCI work and
+both are 5.1's to pay.
+
+**AND THE GATE MOVES IN THE SAME CHANGE.** q35 has no xHCI unless the boot gate
+adds `-device qemu-xhci`, which takes the PCI function set from five to six --
+and 4.2 compares that set AS A SET, so the device and the expectation land
+together or the gate goes red for the right reason. `mmiocheck-boot` names
+fk_lapic.o and fk_ioapic.o explicitly rather than globbing, so an xHCI object is
+not policed by it as written, and the MMIO rule is exactly the one that cost 3.3
+a milestone.
 
 **TWO THINGS 4.1 CONFIRMED THAT HAD ONLY BEEN REASONED.** Type 4 of the MADT
 puts NMI on LINT1 for every processor -- which is exactly what 3.3 configured,
