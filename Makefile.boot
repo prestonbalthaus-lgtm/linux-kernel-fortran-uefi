@@ -111,6 +111,8 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/acpi/fk_mcfg.f90 \
                src/drivers/bus/fk_pcie_types.f90 \
                src/drivers/bus/fk_pcie.f90 \
+               src/drivers/usb/fk_xhci_types.f90 \
+               src/drivers/usb/fk_xhci.f90 \
                src/cpu/fk_sched.f90 \
                src/boot/fk_kmain.f90
 
@@ -351,10 +353,11 @@ selftest-boot: $(KERNEL)
 # fk_pcie.o joined the list at roadmap 4.2's debt: it is the first module in
 # the tree to WRITE a device register, and the scanner's pattern covers movb
 # and movw stores as well as narrowed loads.
-mmiocheck-boot: $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o $(BUILD)/fk_pcie.o
+mmiocheck-boot: $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o $(BUILD)/fk_pcie.o \
+                $(BUILD)/fk_xhci.o
 	@bash tools/mmiocheck.sh --selftest
 	@bash tools/mmiocheck.sh $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o \
-	                         $(BUILD)/fk_pcie.o
+	                         $(BUILD)/fk_pcie.o $(BUILD)/fk_xhci.o
 
 # Everything the boot path must survive inside the container. The remaining
 # gate -- does it actually boot -- needs a VM and therefore runs on the host:

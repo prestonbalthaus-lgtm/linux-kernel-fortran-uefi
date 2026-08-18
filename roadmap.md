@@ -1869,7 +1869,7 @@ Discovering what hardware actually exists on the Minisforum motherboard.
 
 Writing complex Fortran state machines to talk to modern Minisforum silicon.
 
-   * [ ] 5.1 xHCI Controller (USB 3.0)
+   * [x] 5.1 xHCI Controller (USB 3.0)
 
         Validation: Kernel initializes the xHCI controller found on the PCIe bus and establishes Ring Buffers in physical memory.
 
@@ -1946,11 +1946,55 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
         same rule 3.3 applied to the spurious vector, because a vector the IDT
         does not describe is a #GP during delivery.
 
-        WHAT IS LEFT IS THE CONTROLLER, and it is why this box is still open:
-        reset and the CNR wait, the scratchpad array, DCBAAP, the command ring,
-        the event ring and its ERST, R/S, and a NO-OP command whose completion
-        is polled out of the event ring. This box's validation line is about
-        ring buffers, and there are none.
+        AND THE CONTROLLER IS NOW UP, which is what this box was open on.
+        `src/drivers/usb/fk_xhci.f90` resets it, gives it a Device Context Base
+        Address Array, a command ring, an event ring and an ERST out of ONE
+        contiguous run from 3.x's allocator, arms both interrupt gates, sets
+        R/S, enqueues a NO-OP and reads the completion out of the event ring:
+
+            Fortran Kernel: xHCI caplength/version/slots/scratchpads/page 0x40/0x0100/0x0040/0x0000/0x00001000
+            Fortran Kernel: xHCI cmd/event/erst 0x0000000000348000/0x0000000000349000/0x000000000034A000
+            Fortran Kernel: the xHCI is RUNNING, USBSTS 0x00000000
+            Fortran Kernel: xHCI NO-OP trb/event/code/ptr 0x0000000000348000/0x21/0x01/0x0000000000348000
+            Fortran Kernel: the xHCI executed a command and reported it complete (roadmap 5.1).
+            Fortran Kernel: the xHCI's MSI-X interrupt ARRIVED, count 0x00000001
+
+        Event type 0x21 is a Command Completion Event, code 0x01 is SUCCESS,
+        and the pointer it carries is the address of the TRB that was
+        enqueued. THE LAST LINE IS THE ONE THAT HAD NEVER HAPPENED BEFORE:
+        every interrupt this kernel had taken until now came off a wire, and
+        that one is a message the controller WROTE to the APIC's address.
+
+        THE NUMBER THAT COST THE MOST WAS ERSTSZ. It counts SEGMENTS, and the
+        first version wrote the segment's length in TRBs into it -- 256 on a
+        controller whose HCSPARAMS2 allows one. The answer was not a refused
+        write or a diagnostic: USBSTS came back 0x00001000, HCE, the host
+        controller error bit, and nothing executed. The host suite had not
+        caught it because the model read the segment's size from the ERST
+        entry, which was right, and never looked at ERSTSZ at all; it does
+        now, and refuses with the same HCE the silicon used.
+
+        WHAT THE HOST SUITE IS, and it is not a register file. `test_xhci.c`
+        implements the parts of an xHC the bring-up talks to: HCRST is
+        self-clearing and returns the operational registers to their defaults,
+        CNR is held for three reads, and ringing doorbell 0 EXECUTES the ring
+        -- follows the cycle bit, follows the link TRB, toggles its own cycle
+        state and posts a completion event. That is what makes the lap-two
+        wrap assertable at all: a producer that never flips its cycle bit
+        works perfectly for 255 commands and then goes silent, with no error
+        anywhere, and only a model that wraps can see it.
+
+        RINGS GO THROUGH fk_readl/fk_writel TOO. They are RAM, not registers
+        -- but RAM a BUS MASTER writes, and gfortran narrowed the event TRB's
+        control dword to a one-byte load the first time they were reached
+        through a Fortran pointer. `tools/mmiocheck.sh` refused the object,
+        correctly, and fk_xhci.o is on its list.
+
+        NOT DONE, and none of it is in the way of 5.2: no slots are enabled,
+        no device contexts, no transfer rings, no port reset and nothing on
+        the wire. The scratchpad path is WRITTEN BUT UNEXERCISED -- qemu-xhci
+        reports zero scratchpad buffers, so the array is never allocated on
+        the machine the gate runs, and that is stated rather than hidden.
 
    * [ ] 5.2 USB HID Keyboard Driver
 

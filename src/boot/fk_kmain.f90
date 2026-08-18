@@ -38,6 +38,16 @@ module fk_kmain_m
                          pcie_msix_enable, pcie_msix_ctrl, pcie_intx_disable, &
                          FK_PCI_MSIX_E_ADDR_LO, FK_PCI_MSIX_E_DATA, &
                          FK_PCI_MSIX_E_VCTRL, FK_PCIE_OK
+  use fk_xhci_m,   only: FK_XHCI_OK, xhci_attach, xhci_reset, &
+                         xhci_config_slots, xhci_set_dcbaap, &
+                         xhci_cmd_ring_init, xhci_event_ring_init, &
+                         xhci_intr_enable, xhci_run, xhci_cmd_noop, &
+                         xhci_doorbell, xhci_event_poll, xhci_event_type, &
+                         xhci_event_comp, xhci_event_ptr, xhci_caplength, &
+                         xhci_version, xhci_max_slots, xhci_max_scratchpads, &
+                         xhci_usbsts, xhci_crcr, xhci_erdp, xhci_dcbaap, &
+                         xhci_halted, &
+                         xhci_page_size
   use fk_pcie_types_m, only: FK_PCI_CMD_MEMORY_BIT, FK_PCI_CMD_MASTER_BIT, &
                              FK_PCI_CMD_INTX_DISABLE_BIT, &
                              FK_PCI_MSIX_CTRL_ENABLE_BIT, &
@@ -60,7 +70,7 @@ module fk_kmain_m
   use fk_tss_m,    only: tss_init
   use fk_idt_m,    only: idt_init, fk_irq_spurious, idt_set_panic_colors, &
                          idt_set_eoi_lapic, fk_lapic_spurious, &
-                         FK_VECTOR_SPURIOUS, FK_VECTOR_MSI
+                         FK_VECTOR_SPURIOUS, FK_VECTOR_MSI, fk_msi_count
   use fk_ioapic_m, only: FK_IOAPIC_OK, FK_IOAPIC_POL_HIGH, FK_IOAPIC_POL_LOW, &
                          FK_IOAPIC_TRIG_EDGE, FK_IOAPIC_TRIG_LEVEL, &
                          ioapic_set_window, ioapic_id, ioapic_version, &
@@ -236,6 +246,26 @@ module fk_kmain_m
   ! reported size needs BAR SIZING, which 4.2 does not do.
   integer(c_int64_t), parameter :: FK_XHCI_WINDOW_BYTES = 65536_c_int64_t
 
+  ! roadmap 5.1.  [0] magic  [1] BAR0 phys  [2] the contiguous run  [3] command
+  ! ring  [4] event ring  [5] ERST  [6] the NO-OP TRB  [7] event type<<32|code
+  ! [8] the command pointer the event named  [9] USBSTS  [10] CRCR  [11] ERDP
+  ! [12] MSI-X interrupts taken  [13] caplength<<32|version  [14] slots<<32|
+  ! scratchpads  [15] the sequence's status  [16] CRCR and [17] DCBAAP and
+  ! [18] USBSTS as they read IMMEDIATELY AFTER THE RESET, before this kernel
+  ! programs anything -- firmware leaves all three non-zero, so a kernel that
+  ! skipped the reset publishes firmware's values and is refused
+  integer(c_int64_t), parameter :: FK_XHCIS_MAGIC = &
+       int(z'584843490501', c_int64_t)
+  integer(c_int64_t), volatile, save, bind(c, name="fk_xhci_state") :: &
+       fk_xhci_state(0:18)
+
+  ! Four pages, carved: DCBAA, command ring, event ring, ERST.  One run rather
+  ! than four allocations because one physical base is one thing for the host
+  ! to check, and page alignment already satisfies every alignment the
+  ! specification asks for here (64 bytes) plus the 64 KiB boundary rule.
+  integer(c_int64_t), parameter :: FK_XHCI_RING_PAGES = 4_c_int64_t
+  integer(c_int32_t), parameter :: FK_XHCI_RING_TRBS = 256_c_int32_t
+
   ! 'MCFG' packed little-endian, built the way FK_SIG_APIC is.
   integer(c_int32_t), parameter :: FK_SIG_MCFG = &
        ior(ior(iachar('M', c_int32_t), shiftl(iachar('C', c_int32_t), 8)), &
@@ -392,6 +422,35 @@ module fk_kmain_m
        FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_XHCI_CTRL = &
        "Fortran Kernel: xHCI MSI-X control/command 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_START = &
+       "Fortran Kernel: xHCI bringing the controller up (roadmap 5.1)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_NOMEM = &
+       "Fortran Kernel: the PMM refused a contiguous run for the xHCI rings." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_SEQ_BAD = &
+       "Fortran Kernel: the xHCI bring-up FAILED, status 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_CAPS = &
+       "Fortran Kernel: xHCI caplength/version/slots/scratchpads/page 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_RINGS = &
+       "Fortran Kernel: xHCI cmd/event/erst 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_RUNNING = &
+       "Fortran Kernel: the xHCI is RUNNING, USBSTS 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_NOOP = &
+       "Fortran Kernel: xHCI NO-OP trb/event/code/ptr 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_DONE = &
+       "Fortran Kernel: the xHCI executed a command and reported it complete (roadmap 5.1)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_NOEVENT = &
+       "Fortran Kernel: the xHCI never completed the NO-OP; no event arrived." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_IRQ = &
+       "Fortran Kernel: the xHCI's MSI-X interrupt ARRIVED, count 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_XHCI_NOIRQ = &
+       "Fortran Kernel: the xHCI completed its command but sent NO interrupt." // &
+       FK_CRLF // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PCIE_WALKED = &
        "Fortran Kernel: the PCIe bus was walked and every function reported (roadmap 4.2)." // &
        FK_CRLF // c_null_char
@@ -2166,10 +2225,179 @@ contains
         .not. btest(ctrl, FK_PCI_MSIX_CTRL_MASKALL_BIT) .and. &
         btest(cmd, FK_PCI_CMD_INTX_DISABLE_BIT)) then
        call serial_print_string(FK_XHCI_ROUTE_OK)
+       call xhci_start(bar)
     else
        call serial_print_string(FK_XHCI_ROUTE_BAD)
     end if
   end subroutine xhci_route
+
+  ! THE CONTROLLER (roadmap 5.1).  Reset it -- firmware has already driven it
+  ! and left CRCR, DCBAAP and ERSTBA pointing into memory the PMM is about to
+  ! hand out -- then give it a command ring, an event ring and a reason to
+  ! interrupt, and ask it to do the one thing that needs none of USB: a NO-OP.
+  subroutine xhci_start(bar)
+    implicit none
+    integer(c_int64_t), intent(in) :: bar
+    integer(c_int64_t) :: run, run_virt, dcbaa, cmd, evt, erst, trb, i
+    integer(c_int32_t) :: st, slots, spads, msi0
+    integer(c_int32_t), pointer :: dc(:)
+    type(c_ptr) :: cp
+
+    fk_xhci_state = 0_c_int64_t
+    fk_xhci_state(0) = FK_XHCIS_MAGIC
+    call serial_print_string(FK_XHCI_START)
+
+    st = xhci_attach(FK_VMM_XHCI)
+    if (st /= FK_XHCI_OK) then
+       call seq_failed(st)
+       return
+    end if
+
+    slots = xhci_max_slots()
+    spads = xhci_max_scratchpads()
+    call serial_print_string(FK_XHCI_CAPS)
+    call serial_print_hex(int(xhci_caplength(), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(xhci_version(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(slots, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(spads, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(xhci_page_size(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    run = pmm_alloc_contiguous(FK_XHCI_RING_PAGES)
+    if (run == 0_c_int64_t) then
+       call serial_print_string(FK_XHCI_NOMEM)
+       return
+    end if
+    run_virt = vmm_phys_to_virt(run)
+    dcbaa = run
+    cmd   = run + FK_PMM_PAGE_SIZE
+    evt   = run + 2_c_int64_t * FK_PMM_PAGE_SIZE
+    erst  = run + 3_c_int64_t * FK_PMM_PAGE_SIZE
+
+    ! The DCBAA is the driver's to zero: entry 0 is the scratchpad array
+    ! pointer when the controller asks for buffers, and 0 when it does not.
+    ! THIS MACHINE ASKS FOR NONE -- qemu-xhci reports zero scratchpad buffers
+    ! -- so the array is left zeroed and the buffer path is not exercised here.
+    cp = transfer(run_virt, cp)
+    call c_f_pointer(cp, dc, [FK_PMM_PAGE_SIZE / 4_c_int64_t])
+    do i = 1_c_int64_t, FK_PMM_PAGE_SIZE / 4_c_int64_t
+       dc(i) = 0_c_int32_t
+    end do
+
+    st = xhci_reset()
+    ! THE RESET IS THE ASSERTION, and it has to be read before anything else
+    ! is written or it cannot be told apart from a kernel that skipped it: the
+    ! values below are firmware's until the reset clears them, and this
+    ! kernel's a moment later.
+    fk_xhci_state(16) = xhci_crcr()
+    fk_xhci_state(17) = xhci_dcbaap()
+    fk_xhci_state(18) = int(xhci_usbsts(), c_int64_t)
+    if (st == FK_XHCI_OK) st = xhci_config_slots(slots)
+    if (st == FK_XHCI_OK) st = xhci_set_dcbaap(dcbaa)
+    if (st == FK_XHCI_OK) &
+         st = xhci_cmd_ring_init(vmm_phys_to_virt(cmd), cmd, FK_XHCI_RING_TRBS)
+    if (st == FK_XHCI_OK) &
+         st = xhci_event_ring_init(vmm_phys_to_virt(evt), evt, &
+                                   FK_XHCI_RING_TRBS, vmm_phys_to_virt(erst), &
+                                   erst)
+    if (st == FK_XHCI_OK) st = xhci_intr_enable()
+    if (st == FK_XHCI_OK) st = xhci_run()
+    if (st /= FK_XHCI_OK) then
+       call seq_failed(st)
+       return
+    end if
+
+    call serial_print_string(FK_XHCI_RINGS)
+    call serial_print_hex(cmd, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(evt, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(erst, 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_XHCI_RUNNING)
+    call serial_print_hex(int(xhci_usbsts(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    msi0 = int(fk_msi_count, c_int32_t)
+    trb = xhci_cmd_noop()
+    call xhci_doorbell(0_c_int32_t, 0_c_int32_t)
+
+    ! A bounded spin, not a sleep: there is no clock in this path.  The event
+    ! is posted by DMA and the interrupt arrives through the LAPIC, so neither
+    ! is guaranteed to have landed by the instruction after the doorbell.
+    st = FK_XHCI_OK
+    do i = 1_c_int64_t, 100000_c_int64_t
+       st = xhci_event_poll()
+       if (st == FK_XHCI_OK) exit
+    end do
+
+    fk_xhci_state(0) = FK_XHCIS_MAGIC
+    fk_xhci_state(1) = bar
+    fk_xhci_state(2) = run
+    fk_xhci_state(3) = cmd
+    fk_xhci_state(4) = evt
+    fk_xhci_state(5) = erst
+    fk_xhci_state(6) = trb
+    fk_xhci_state(7) = ior(shiftl(int(xhci_event_type(), c_int64_t), 32), &
+                           int(xhci_event_comp(), c_int64_t))
+    fk_xhci_state(8) = xhci_event_ptr()
+    fk_xhci_state(9) = int(xhci_usbsts(), c_int64_t)
+    fk_xhci_state(10) = xhci_crcr()
+    fk_xhci_state(11) = xhci_erdp()
+    fk_xhci_state(13) = ior(shiftl(int(xhci_caplength(), c_int64_t), 32), &
+                            int(xhci_version(), c_int64_t))
+    fk_xhci_state(14) = ior(shiftl(int(slots, c_int64_t), 32), &
+                            int(spads, c_int64_t))
+    fk_xhci_state(15) = int(st, c_int64_t)
+
+    call serial_print_string(FK_XHCI_NOOP)
+    call serial_print_hex(trb, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(xhci_event_type(), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(xhci_event_comp(), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(xhci_event_ptr(), 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    if (st == FK_XHCI_OK .and. xhci_event_comp() == 1_c_int32_t .and. &
+        xhci_event_ptr() == trb .and. trb /= 0_c_int64_t) then
+       call serial_print_string(FK_XHCI_DONE)
+    else
+       call serial_print_string(FK_XHCI_NOEVENT)
+    end if
+
+    ! The interrupt is a SEPARATE claim from the completion: the controller can
+    ! post an event and send no message, which is what an unarmed IMAN.IE or
+    ! USBCMD.INTE produces and what nothing on the console would otherwise show.
+    do i = 1_c_int64_t, 100000_c_int64_t
+       if (int(fk_msi_count, c_int32_t) /= msi0) exit
+    end do
+    fk_xhci_state(12) = fk_msi_count
+    if (int(fk_msi_count, c_int32_t) /= msi0) then
+       call serial_print_string(FK_XHCI_IRQ)
+       call serial_print_hex(fk_msi_count, 8_c_int32_t)
+       call serial_print_string(FK_NL)
+    else
+       call serial_print_string(FK_XHCI_NOIRQ)
+    end if
+  end subroutine xhci_start
+
+  subroutine seq_failed(st)
+    implicit none
+    integer(c_int32_t), intent(in) :: st
+
+    call serial_print_string(FK_XHCI_SEQ_BAD)
+    call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+    fk_xhci_state(0) = FK_XHCIS_MAGIC
+    fk_xhci_state(15) = int(st, c_int64_t)
+  end subroutine seq_failed
 
   ! The MADT's interrupt source override flags for one ISA IRQ, decoded into
   ! the IOAPIC's own polarity and trigger encodings.  ACPI 6.5 table 5.26: bits
