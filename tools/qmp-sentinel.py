@@ -90,12 +90,22 @@ GDT_LIMIT = 0x27                    # 5 slots: null, code, data, TSS lo, TSS hi
 # roadmap 3.2b. bind(c) in src/drivers/pit/fk_pit.f90, so the name survives.
 TICK_SYMBOL = "fk_tick_count"
 TICK_BYTES = 8
-# The master's line 0 is open and every other line on both chips is masked.
-# NOT 0xFF any more, and the change is the milestone: before 3.2b this kernel
-# could not have survived an interrupt, so masking everything was the only safe
-# state. A master IMR of 0xFF now means the timer was never let through.
-MASTER_IMR = 0xFE
+# Every line masked on BOTH chips, and as of roadmap 3.3 that is the milestone
+# rather than the absence of one. 3.2b moved the master to 0xFE because a
+# masked-everything chip meant the timer had never been let through; 3.3 gives
+# the timer to the IOAPIC instead, so 0xFF is once again the correct answer --
+# and this time it is asserted alongside an unmasked IOAPIC redirection entry
+# and a tick counter that is still advancing, which is what tells the two
+# states apart.
+MASTER_IMR = 0xFF
 SLAVE_IMR = 0xFF
+
+# roadmap 3.3. 'info pic' prints the IOAPIC's whole 24-entry redirection table
+# above the two pic lines, on the default machine and on q35 alike:
+#   pin 2  0x0000000000000020 dest=0 vec=32  active-hi edge   fixed  physical
+# The GSI the PIT was overridden to, and the vector the IDT installed for it.
+IOAPIC_GSI = 2
+IOAPIC_VECTOR = 0x20
 
 # roadmap 2.2/2.4. bind(c) in src/drivers/video/fk_fbinfo.f90: ten u64 words
 # describing the framebuffer the LOADER reported and the mapping the VMM built.
@@ -434,13 +444,18 @@ TR_RE = re.compile(r"^TR =([0-9a-fA-F]+) ([0-9a-fA-F]+) ([0-9a-fA-F]+) "
 GDT_RE = re.compile(r"^GDT=\s+([0-9a-fA-F]+) ([0-9a-fA-F]+)", re.M)
 PIC_RE = re.compile(r"^pic([01]):.*?\bimr=([0-9a-fA-F]{2})\b.*?"
                     r"\birq_base=([0-9a-fA-F]{2})\b", re.M)
+#   pin 2  0x0000000000010000 dest=0 vec=0   active-hi edge  masked fixed  physical
+# The tail is free-form words; "masked" is present exactly when the entry is.
+IOAPIC_PIN_RE = re.compile(r"^\s*pin\s+(\d+)\s+0x([0-9a-fA-F]+)\s+"
+                           r"dest=(\d+)\s+vec=(\d+)\s*(.*)$", re.M)
 
 
 def check_hwstate(regs_text, pic_text, tss_vaddr, tss_bytes=None,
                   ist1_want=None,
                   tr_sel=0x18, tss_limit=TSS_LIMIT, gdt_limit=GDT_LIMIT,
                   master=0x20, slave=0x28,
-                  master_imr=MASTER_IMR, slave_imr=SLAVE_IMR):
+                  master_imr=MASTER_IMR, slave_imr=SLAVE_IMR,
+                  ioapic_gsi=IOAPIC_GSI, ioapic_vector=IOAPIC_VECTOR):
     """Assert the CPU's and the 8259s' state. Returns [(ok, description)].
 
     Every check names the value it SAW, because a gate that only says which
@@ -520,6 +535,37 @@ def check_hwstate(regs_text, pic_text, tss_vaddr, tss_bytes=None,
                     f"(want 0x{want_base:02X})"))
         out.append((imr == want_imr,
                     f"8259 {who} IMR is 0x{imr:02X} (want 0x{want_imr:02X})"))
+
+    # roadmap 3.3. The kernel's own console can say it wrote a redirection
+    # entry, and an IOAPIC that ignored the write says exactly the same thing.
+    # This is the device model's answer.
+    pins = {int(g[0]): (int(g[1], 16), int(g[2]), int(g[3]), g[4])
+            for g in IOAPIC_PIN_RE.findall(pic_text)}
+    if not pins:
+        out.append((False, "'info pic' printed no IOAPIC redirection table"))
+    elif ioapic_gsi not in pins:
+        out.append((False, f"'info pic' printed no pin {ioapic_gsi} "
+                           f"(saw {len(pins)} pins)"))
+    else:
+        raw, dest, vec, tail = pins[ioapic_gsi]
+        out.append((vec == ioapic_vector,
+                    f"IOAPIC pin {ioapic_gsi} delivers vector {vec} "
+                    f"(want {ioapic_vector} = 0x{ioapic_vector:02X}, the IDT's "
+                    f"IRQ0 stub)"))
+        out.append((dest == 0,
+                    f"IOAPIC pin {ioapic_gsi} is aimed at APIC id {dest} "
+                    "(want 0: the bootstrap processor)"))
+        out.append(("masked" not in tail,
+                    f"IOAPIC pin {ioapic_gsi} is unmasked ({tail.strip()})"))
+        # EVERY OTHER PIN, and not as tidiness: an IOAPIC left with a second
+        # line open delivers a vector nothing installed a gate for, and the
+        # CPU's answer to that is a fault raised from inside delivery.
+        loose = [n for n, (_r, _d, _v, t) in sorted(pins.items())
+                 if n != ioapic_gsi and "masked" not in t]
+        out.append((not loose,
+                    f"every other IOAPIC pin is masked ({len(pins)} pins)"
+                    if not loose else
+                    f"IOAPIC pin(s) {loose} are unmasked and nothing routed them"))
     return out
 
 
@@ -1112,9 +1158,34 @@ HW_REGS_NO_TSS = (
     "TR =0000 0000000000000000 0000ffff 00008b00 DPL=0 TSS64-busy\n"
     "GDT=     ffffffff80107020 00000027\n"
 )
+# 'info pic' as QEMU 10.2.2 prints it: the IOAPIC's whole redirection table
+# first, then the two 8259s.  Built rather than pasted, because roadmap 3.3's
+# failure cases are all "one pin differs" and a 26-line literal per case would
+# hide which line that was.
+def _hw_ioapic(routed=IOAPIC_GSI, vec=IOAPIC_VECTOR, dest=0, also_open=None,
+               pins=24):
+    out = ["ioapic0: ver=0x11 id=0x00 sel=0x00"]
+    for n in range(pins):
+        if n == routed:
+            out.append(f"  pin {n:<2} 0x{vec:016X} dest={dest} vec={vec:<3} "
+                       "active-hi edge   fixed  physical")
+        elif n == also_open:
+            out.append(f"  pin {n:<2} 0x0000000000000030 dest=0 vec=48  "
+                       "active-hi edge   fixed  physical")
+        else:
+            out.append(f"  pin {n:<2} 0x0000000000010000 dest=0 vec=0   "
+                       "active-hi edge  masked fixed  physical")
+    out += ["  IRR      (none)", "  Remote IRR (none)"]
+    return "\n".join(out) + "\n"
+
+
+# roadmap 3.3's end state: GSI 2 carrying vector 0x20 to the BSP, every other
+# pin masked, and BOTH 8259s fully masked -- which before 3.3 would have meant
+# the timer was never let through and now means it goes somewhere else.
 HW_PIC_OK = (
+    _hw_ioapic() +
     "pic1: irr=00 imr=ff isr=00 hprio=0 irq_base=28 rr_sel=0 elcr=0c fnm=0\n"
-    "pic0: irr=00 imr=fe isr=00 hprio=0 irq_base=20 rr_sel=0 elcr=00 fnm=0\n"
+    "pic0: irr=00 imr=ff isr=00 hprio=0 irq_base=20 rr_sel=0 elcr=00 fnm=0\n"
 )
 # 104 bytes with IST1 at 0x24 and iomap_base 0x0068 at 0x66, as fk_tss.f90
 # builds it; the IST1 value is fk_df_stack + its st_size in the same image.
@@ -1127,6 +1198,7 @@ def _hw_tss(ist1=0xFFFFFFFF8010BDA0, iomap=0x68):
 
 
 HW_PIC_UNREMAPPED = (
+    _hw_ioapic() +
     "pic1: irr=00 imr=8e isr=00 hprio=0 irq_base=70 rr_sel=0 elcr=0c fnm=0\n"
     "pic0: irr=11 imr=b8 isr=00 hprio=0 irq_base=08 rr_sel=0 elcr=00 fnm=0\n"
 )
@@ -1202,17 +1274,52 @@ def do_selftest():
               "the 8259 state this VM boots with -- master on 0x08 -- is "
               "rejected")
     expect_hw(False, HW_REGS_OK,
-              spoil(HW_PIC_OK, "imr=fe isr=00 hprio=0 irq_base=20",
+              spoil(HW_PIC_OK, "imr=ff isr=00 hprio=0 irq_base=20",
                     "imr=00 isr=00 hprio=0 irq_base=20"),
               "a master that was remapped but never masked is rejected")
-    # roadmap 3.2b's, and the direction is the opposite one: fully masked was
-    # the CORRECT state until this milestone, so a gate that still accepts it
-    # would pass a kernel whose timer interrupt can never be delivered.
+    # roadmap 3.3 INVERTS 3.2b's case. Until 3.3 a master IMR of 0xFE was the
+    # correct state and 0xFF meant the timer could never be delivered; now the
+    # IOAPIC carries it and 0xFE means the line is live on BOTH chips at once,
+    # which is a double delivery whose second half is acknowledged at whichever
+    # chip the handler was told about -- leaving the other holding an
+    # in-service bit for ever.
     expect_hw(False, HW_REGS_OK,
-              spoil(HW_PIC_OK, "imr=fe isr=00 hprio=0 irq_base=20",
-                    "imr=ff isr=00 hprio=0 irq_base=20"),
-              "a master with IRQ0 still masked -- the pre-3.2b state -- is "
+              spoil(HW_PIC_OK, "imr=ff isr=00 hprio=0 irq_base=20",
+                    "imr=fe isr=00 hprio=0 irq_base=20"),
+              "a master with IRQ0 STILL open beside the IOAPIC is rejected")
+
+    # roadmap 3.3's own five. Every one of these is a machine on which the
+    # kernel's console prints exactly the same lines it prints when the
+    # routing worked.
+    expect_hw(False, HW_REGS_OK,
+              "pic1: irr=00 imr=ff isr=00 hprio=0 irq_base=28 rr_sel=0 "
+              "elcr=0c fnm=0\n"
+              "pic0: irr=00 imr=ff isr=00 hprio=0 irq_base=20 rr_sel=0 "
+              "elcr=00 fnm=0\n",
+              "monitor output with no IOAPIC table at all is rejected")
+    expect_hw(False, HW_REGS_OK,
+              _hw_ioapic(routed=99) +
+              "pic1: irr=00 imr=ff isr=00 hprio=0 irq_base=28 rr_sel=0 "
+              "elcr=0c fnm=0\n"
+              "pic0: irr=00 imr=ff isr=00 hprio=0 irq_base=20 rr_sel=0 "
+              "elcr=00 fnm=0\n",
+              "an IOAPIC with every pin still masked -- the route never "
+              "landed -- is rejected")
+    expect_hw(False, HW_REGS_OK,
+              spoil(HW_PIC_OK, "vec=32 ", "vec=33 "),
+              "a routed pin delivering the WRONG vector is rejected")
+    expect_hw(False, HW_REGS_OK,
+              spoil(HW_PIC_OK, "dest=0 vec=32", "dest=3 vec=32"),
+              "a routed pin aimed at a processor that is not the BSP is "
               "rejected")
+    expect_hw(False, HW_REGS_OK,
+              _hw_ioapic(also_open=11) +
+              "pic1: irr=00 imr=ff isr=00 hprio=0 irq_base=28 rr_sel=0 "
+              "elcr=0c fnm=0\n"
+              "pic0: irr=00 imr=ff isr=00 hprio=0 irq_base=20 rr_sel=0 "
+              "elcr=00 fnm=0\n",
+              "a SECOND pin left unmasked is rejected: it delivers a vector "
+              "no gate was installed for")
     expect_hw(False, HW_REGS_OK,
               spoil(HW_PIC_OK, "pic1: irr=00 imr=ff", "pic1: irr=00 imr=fe"),
               "a SLAVE with a line unmasked is rejected: nothing drives one")

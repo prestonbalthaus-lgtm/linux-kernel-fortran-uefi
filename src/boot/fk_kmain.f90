@@ -29,6 +29,7 @@ module fk_kmain_m
                          madt_cpu_apic_id, madt_ioapic_count, &
                          madt_ioapic_addr, madt_ioapic_gsi_base, &
                          madt_iso_count, madt_iso_src, madt_iso_gsi, &
+                         madt_iso_flags, &
                          madt_gsi_for_irq, madt_nmi_count, madt_nmi_lint, &
                          madt_skipped
   use fk_lapic_m,  only: lapic_init, lapic_msr_base, lapic_msr_enabled, &
@@ -38,8 +39,16 @@ module fk_kmain_m
                          lapic_lvt_lint0, lapic_lvt_lint1
   use fk_gdt_m,    only: gdt_init
   use fk_tss_m,    only: tss_init
-  use fk_idt_m,    only: idt_init, fk_irq_spurious, idt_set_panic_colors
-  use fk_pic_m,    only: pic_remap, pic_unmask, pic_imr
+  use fk_idt_m,    only: idt_init, fk_irq_spurious, idt_set_panic_colors, &
+                         idt_set_eoi_lapic, fk_lapic_spurious, &
+                         FK_VECTOR_SPURIOUS
+  use fk_ioapic_m, only: FK_IOAPIC_OK, FK_IOAPIC_POL_HIGH, FK_IOAPIC_POL_LOW, &
+                         FK_IOAPIC_TRIG_EDGE, FK_IOAPIC_TRIG_LEVEL, &
+                         ioapic_set_window, ioapic_id, ioapic_version, &
+                         ioapic_max_redir, ioapic_route, ioapic_mask, &
+                         ioapic_read_lo, ioapic_read_hi
+  use fk_pic_m,    only: pic_remap, pic_unmask, pic_imr, pic_disable, &
+                         FK_PIC1_VECTOR
   use fk_pit_m,    only: FK_PIT_HZ, FK_PIT_IRQ, pit_init, fk_tick_count, &
                          fk_first_rip, fk_first_rflags
   use fk_pmm_m,    only: FK_PMM_FRONT_EFI, pmm_front_end, &
@@ -72,7 +81,8 @@ module fk_kmain_m
                          FK_VMM_UC, FK_VMM_LAPIC, vmm_reserved_holes, &
                          vmm_physmap_top, FK_VMM_PHYSMAP, &
                          vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, &
-                         vmm_read_pat
+                         vmm_read_pat, vmm_punch_physmap, FK_VMM_E_IS_RAM, &
+                         FK_VMM_IOAPIC
   use fk_sched_m,  only: FK_SCHED_MAX, fk_task_runs, fk_sched_switches, &
                          sched_init, sched_spawn, sched_start, sched_current, &
                          sched_tasks
@@ -145,10 +155,14 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_PMM_FRONT_MB2_MSG = &
        "Fortran Kernel: PMM front end is the Multiboot2 memory map (tag 6)." // &
        FK_CRLF // c_null_char
-  ! 0xFF, the conventional spurious vector.  NOT installed in the IDT: every
-  ! LVT is masked and nothing routes through the LAPIC yet, so it cannot be
-  ! delivered.  Unmasking anything here without installing it first is a #GP.
-  integer(c_int32_t), parameter :: FK_LAPIC_SPURIOUS = 255_c_int32_t
+  ! The spurious vector is fk_idt_m's FK_VECTOR_SPURIOUS and is no longer named
+  ! twice.  It used to be a local 255 here with a comment saying it was NOT
+  ! installed in the IDT, which was true until roadmap 3.3: idt_init now puts
+  ! fk_spurious_stub on it, because the LAPIC starts delivering the moment SVR's
+  ! enable bit is set and a spurious interrupt into a cleared descriptor is a
+  ! #GP raised from inside delivery.  Two copies of the number would be two
+  ! things that can drift, and the gate and the stub would then disagree about
+  ! which vector they are talking about.
   ! roadmap 4.1.  Read out of guest memory by tools/qmp-sentinel.py, for the
   ! reason fk_panic_state and fk_boot_sentinel are: a console line is the
   ! kernel's opinion of itself, and the topology is the one thing here that a
@@ -170,6 +184,12 @@ module fk_kmain_m
        int(z'0DA10DA100000000', c_int64_t)
   integer(c_int64_t), volatile, save, bind(c, name="fk_dma_probe") :: &
        fk_dma_probe(0:3)
+
+  ! roadmap 3.3.  [0] magic  [1] IOAPIC phys  [2] gsi  [3] vector
+  ! [4] the redirection entry's low dword READ BACK  [5] both IMRs
+  integer(c_int64_t), parameter :: FK_IOA_MAGIC = int(z'494F4150494301', c_int64_t)
+  integer(c_int64_t), volatile, save, bind(c, name="fk_ioapic_state") :: &
+       fk_ioapic_state(0:5)
 
   ! 'APIC' packed little-endian, built rather than written down.
   integer(c_int32_t), parameter :: FK_SIG_APIC = &
@@ -251,6 +271,46 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_PMM_TOTALS = &
        "Fortran Kernel: PMM frames total/free/unmanaged-bytes 0x" // c_null_char
   character(kind=c_char, len=*), parameter :: FK_PMM_SLASH  = "/0x" // c_null_char
+
+  character(kind=c_char, len=*), parameter :: FK_IOA_START = &
+       "Fortran Kernel: IOAPIC taking the timer off the 8259s (roadmap 3.3)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_NONE = &
+       "Fortran Kernel: the MADT declared no IOAPIC; the 8259s keep the timer." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_PUNCH_BAD = &
+       "Fortran Kernel: the IOAPIC page could not be taken out of the linear map, status 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_MAP_BAD = &
+       "Fortran Kernel: the IOAPIC page could not be mapped, status 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_ALIAS_OK = &
+       "Fortran Kernel: the IOAPIC page has no write-back alias in the linear map." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_ALIAS_BAD = &
+       "Fortran Kernel: the IOAPIC page is STILL mapped write-back in the linear map." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_CHIP = &
+       "Fortran Kernel: IOAPIC id/version/entries 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_PIC_OFF = &
+       "Fortran Kernel: both 8259s report every line masked." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_PIC_ON = &
+       "Fortran Kernel: an 8259 REFUSED to mask." // FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_ROUTED = &
+       "Fortran Kernel: IOAPIC gsi/vector/readback 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_ROUTE_BAD = &
+       "Fortran Kernel: the IOAPIC did not accept the redirection entry, status 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_READBACK_BAD = &
+       "Fortran Kernel: the IOAPIC redirection entry did NOT read back as written." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_TICKING = &
+       "Fortran Kernel: the timer still ticks with both 8259s masked (roadmap 3.3)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_IOA_STOPPED = &
+       "Fortran Kernel: the timer STOPPED once the 8259s were masked." // &
+       FK_CRLF // c_null_char
 
   character(kind=c_char, len=*), parameter :: FK_DMA_START = &
        "Fortran Kernel: DMA asking the PMM for a contiguous run (roadmap 3.x)." // &
@@ -1666,6 +1726,159 @@ contains
   ! allocator in the state pmm_verify left it, and before the scheduler, for the
   ! reason everything else here runs before the scheduler: nothing in the PMM
   ! takes a lock.
+  ! The MADT's interrupt source override flags for one ISA IRQ, decoded into
+  ! the IOAPIC's own polarity and trigger encodings.  ACPI 6.5 table 5.26: bits
+  ! 1:0 are polarity (0 conforms, 1 active high, 3 active low) and bits 3:2 are
+  ! trigger (0 conforms, 1 edge, 3 level).  CONFORMS on the ISA bus means
+  ! active high and edge triggered, which is what the zero default gives -- so
+  ! the two "conforms" cases need no branch of their own, and hardcoding
+  ! edge/high for every line would be wrong the moment a level-triggered
+  ! override appears.
+  subroutine iso_decode(irq, polarity, trigger)
+    implicit none
+    integer(c_int32_t), intent(in)  :: irq
+    integer(c_int32_t), intent(out) :: polarity, trigger
+    integer(c_int32_t) :: i, f
+
+    polarity = FK_IOAPIC_POL_HIGH
+    trigger  = FK_IOAPIC_TRIG_EDGE
+    do i = 0_c_int32_t, madt_iso_count() - 1_c_int32_t
+       if (madt_iso_src(i) /= irq) cycle
+       f = madt_iso_flags(i)
+       if (ibits(f, 0_c_int32_t, 2_c_int32_t) == 3_c_int32_t) &
+            polarity = FK_IOAPIC_POL_LOW
+       if (ibits(f, 2_c_int32_t, 2_c_int32_t) == 3_c_int32_t) &
+            trigger = FK_IOAPIC_TRIG_LEVEL
+       return
+    end do
+  end subroutine iso_decode
+
+  ! roadmap 3.3.  AFTER irq_bringup, which proves the timer works through the
+  ! 8259s and leaves IRQ0 the only open line; this takes that same timer away
+  ! from them and proves it again on the other path, in the same boot.
+  subroutine ioapic_bringup()
+    implicit none
+    integer(c_int64_t) :: phys, t0, spins
+    integer(c_int32_t) :: st, gsi, vector, pol, trig, lo, want, imr
+
+    fk_ioapic_state = 0_c_int64_t
+    call serial_print_string(FK_IOA_START)
+
+    if (madt_ioapic_count() == 0_c_int32_t) then
+       call serial_print_string(FK_IOA_NONE)
+       return
+    end if
+    phys = madt_ioapic_addr(0_c_int32_t)
+
+    ! The linear map already covers this page write-back: the address came out
+    ! of an ACPI table, which could not be read until the map existed, so
+    ! vmm_reserve_mmio -- which runs before vmm_init -- was never reachable for
+    ! it.  Two memory types for one physical page is undefined (SDM Vol.3
+    ! 11.12.4), so the write-back one is removed before the uncached one is
+    ! made.
+    st = vmm_punch_physmap(phys, FK_PMM_PAGE_SIZE)
+    if (st /= FK_VMM_OK) then
+       call serial_print_string(FK_IOA_PUNCH_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    st = vmm_map_mmio(FK_VMM_IOAPIC, phys, FK_PMM_PAGE_SIZE, FK_VMM_UC)
+    if (st /= FK_VMM_OK) then
+       call serial_print_string(FK_IOA_MAP_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    ! What the punch was FOR, asserted rather than assumed: the linear map's
+    ! entry for this frame is gone.  A punch that silently did nothing leaves
+    ! every other line in this routine true.
+    if (vmm_translate(FK_VMM_PHYSMAP + phys) == 0_c_int64_t) then
+       call serial_print_string(FK_IOA_ALIAS_OK)
+    else
+       call serial_print_string(FK_IOA_ALIAS_BAD)
+    end if
+
+    call ioapic_set_window(FK_VMM_IOAPIC)
+    call serial_print_string(FK_IOA_CHIP)
+    call serial_print_hex(int(ioapic_id(), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(ioapic_version(), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(ioapic_max_redir(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    gsi    = madt_gsi_for_irq(FK_PIT_IRQ)
+    vector = FK_PIC1_VECTOR + FK_PIT_IRQ
+    call iso_decode(FK_PIT_IRQ, pol, trig)
+
+    ! BEFORE the route and not after it.  A line live on the 8259 and on the
+    ! IOAPIC at the same time is delivered twice, and the second delivery is
+    ! acknowledged at whichever chip the handler has been told about -- so the
+    ! other one holds an in-service bit for ever.
+    if (pic_disable() == 0_c_int32_t) then
+       call serial_print_string(FK_IOA_PIC_OFF)
+    else
+       call serial_print_string(FK_IOA_PIC_ON)
+    end if
+
+    st = ioapic_route(gsi, vector, lapic_id(FK_VMM_LAPIC), pol, trig)
+    if (st /= FK_IOAPIC_OK) then
+       call serial_print_string(FK_IOA_ROUTE_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    ! The acknowledgement moves LAST.  Until this call the handler is still
+    ! EOIing the 8259s, which is correct for every interrupt that arrived
+    ! before the route above and wrong for every one after it; the window
+    ! between the two is one instruction wide and interrupts are on.
+    call idt_set_eoi_lapic(FK_VMM_LAPIC)
+
+    lo   = ioapic_read_lo(gsi)
+    want = ior(iand(vector, 255_c_int32_t), 0_c_int32_t)
+    call serial_print_string(FK_IOA_ROUTED)
+    call serial_print_hex(int(gsi, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(vector, c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(lo, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+    if (ibits(lo, 0_c_int32_t, 8_c_int32_t) /= want .or. &
+        btest(lo, 16_c_int32_t)) &
+         call serial_print_string(FK_IOA_READBACK_BAD)
+
+    ! The whole milestone in one property.  Both chips are masked, so a tick
+    ! from here on can only have come through the IOAPIC -- and it has to have
+    ! been RETURNED from, or this loop is where the boot ends.
+    t0    = fk_tick_count
+    spins = 0_c_int64_t
+    do while (fk_tick_count < t0 + FK_TICK_TARGET .and. &
+              spins < FK_TICK_SPIN_LIMIT)
+       spins = spins + 1_c_int64_t
+    end do
+    if (fk_tick_count >= t0 + FK_TICK_TARGET) then
+       call serial_print_string(FK_IOA_TICKING)
+    else
+       call serial_print_string(FK_IOA_STOPPED)
+    end if
+
+    imr = pic_imr()
+    fk_ioapic_state(0) = FK_IOA_MAGIC
+    fk_ioapic_state(1) = phys
+    fk_ioapic_state(2) = int(gsi, c_int64_t)
+    fk_ioapic_state(3) = int(vector, c_int64_t)
+    fk_ioapic_state(4) = int(lo, c_int64_t)
+    fk_ioapic_state(5) = int(imr, c_int64_t)
+
+    call console_print_hex(int(gsi, c_int64_t), 4_c_int32_t)
+    call console_print_hex(int(vector, c_int64_t), 2_c_int32_t)
+    call console_print_hex(int(imr, c_int64_t), 8_c_int32_t)
+  end subroutine ioapic_bringup
+
   subroutine dma_bringup()
     implicit none
     integer(c_int64_t) :: phys, virt, i
@@ -1896,7 +2109,7 @@ contains
     call serial_print_hex(int(vmm_reserved_holes(), c_int64_t), 2_c_int32_t)
     call serial_print_string(FK_NL)
 
-    call lapic_init(FK_VMM_LAPIC, FK_LAPIC_SPURIOUS)
+    call lapic_init(FK_VMM_LAPIC, FK_VECTOR_SPURIOUS)
 
     ! Every number below is READ BACK OFF THE CHIP through the uncached
     ! mapping, not remembered from what was written -- the same rule fk_pic_m
@@ -2162,6 +2375,8 @@ contains
     call acpi_bringup(mbi)
 
     irq_status = irq_bringup()
+
+    call ioapic_bringup()
 
     ! Needs a running clock, so it comes after the timer is live.
     call console_scroll_probe()

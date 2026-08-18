@@ -208,6 +208,23 @@ Fortran Kernel: kzalloc returned memory that was already zero.
 Fortran Kernel: heap refused a double free, a stray pointer and a wrapped size.
 Fortran Kernel: heap tiles its window exactly, blocks/used/free 0x00000001/0x00000000/
 Fortran Kernel: heap coalesced every freed block back into one, largest free 0x'
+# roadmap 3.3. The chip/gsi lines carry live values and are prefixes; the three
+# VERDICTS are not, and they are what the gate asserts. "still ticks with both
+# 8259s masked" is the milestone: it is printed only after fk_tick_count has
+# been watched advancing on a machine where the legacy pair can no longer
+# deliver anything at all.
+FK_IOA_PASS_LINES=$'Fortran Kernel: IOAPIC taking the timer off the 8259s (roadmap 3.3).
+Fortran Kernel: the IOAPIC page has no write-back alias in the linear map.
+Fortran Kernel: both 8259s report every line masked.
+Fortran Kernel: the timer still ticks with both 8259s masked (roadmap 3.3).'
+FK_IOA_FAIL_LINES=$'Fortran Kernel: the MADT declared no IOAPIC; the 8259s keep the timer.
+Fortran Kernel: the IOAPIC page is STILL mapped write-back in the linear map.
+Fortran Kernel: an 8259 REFUSED to mask.
+Fortran Kernel: the IOAPIC redirection entry did NOT read back as written.
+Fortran Kernel: the timer STOPPED once the 8259s were masked.
+Fortran Kernel: the IOAPIC did not accept the redirection entry, status 0x
+Fortran Kernel: the IOAPIC page could not be taken out of the linear map, status 0x
+Fortran Kernel: the IOAPIC page could not be mapped, status 0x'
 # roadmap 3.x. The phys/pages line is a prefix -- the address is whatever the
 # allocator happened to return -- so what is asserted here is the VERDICT, and
 # the frames themselves are checked over QMP.
@@ -273,7 +290,8 @@ $FK_DMA_PASS_LINES
 $FK_SCHED_PASS_LINES
 $FK_LAPIC_PASS_LINES
 $FK_ACPI_PASS_LINES
-$FK_IRQ_PASS_LINES}"
+$FK_IRQ_PASS_LINES
+$FK_IOA_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
 $FK_VMM_FAIL_LINES
@@ -284,7 +302,8 @@ $FK_DMA_FAIL_LINES
 $FK_SCHED_FAIL_LINES
 $FK_LAPIC_FAIL_LINES
 $FK_ACPI_FAIL_LINES
-$FK_IRQ_FAIL_LINES}"
+$FK_IRQ_FAIL_LINES
+$FK_IOA_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a

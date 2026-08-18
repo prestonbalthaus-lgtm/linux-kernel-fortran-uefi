@@ -218,6 +218,39 @@ irq_common:
 	.size irq_common, . - irq_common
 
 /*
+ * The LAPIC's spurious vector, SVR bits 7:0, which is 0xFF here.
+ *
+ * IT GETS NO EOI, and that is the whole reason it is not an irq_stub entry.
+ * The local APIC does not set an in-service bit for a spurious interrupt, so
+ * an EOI here would retire whatever IS in service and that interrupt would
+ * never complete -- the same defect the 8259 spurious check in irq_handler
+ * exists to prevent, arriving by a different road.
+ *
+ * Counting and returning is the entire handler.  incq writes memory and
+ * clobbers RFLAGS, which IRETQ restores from the stack, so nothing needs
+ * saving and there is no C frame to build.
+ */
+	.globl fk_spurious_stub
+	.type fk_spurious_stub, @function
+fk_spurious_stub:
+	incq	fk_lapic_spurious(%rip)
+	iretq
+	.size fk_spurious_stub, . - fk_spurious_stub
+
+/*
+ * uint64_t fk_spurious_stub_addr(void);   result RAX
+ *
+ * Same reason as the two accessors below: Fortran cannot reference a symbol it
+ * does not itself define.
+ */
+	.globl fk_spurious_stub_addr
+	.type fk_spurious_stub_addr, @function
+fk_spurious_stub_addr:
+	leaq	fk_spurious_stub(%rip), %rax
+	ret
+	.size fk_spurious_stub_addr, . - fk_spurious_stub_addr
+
+/*
  * uint64_t fk_isr_stub(int32_t vec);   vec EDI, result RAX
  * uint64_t fk_irq_stub(int32_t line);  line EDI, result RAX
  *

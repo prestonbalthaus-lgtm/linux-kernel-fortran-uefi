@@ -22,7 +22,8 @@ module fk_idt_m
   implicit none
   private
   public :: idt_init, idt_reload, isr_handler, irq_handler, fk_irq_spurious, &
-            idt_set_panic_colors
+            idt_set_panic_colors, idt_set_eoi_lapic, fk_lapic_spurious, &
+            FK_VECTOR_SPURIOUS
 
   ! What boot/interrupts.S leaves on the stack, lowest address first.  Every
   ! field is a quadword, so the type needs no padding and the assembly needs no
@@ -77,6 +78,24 @@ module fk_idt_m
   ! that returned it would be treated as side-effect-free by the reader.
   integer(c_int64_t), volatile, bind(c, name="fk_irq_spurious") :: &
        fk_irq_spurious = 0_c_int64_t
+
+  ! roadmap 3.3.  Counted by boot/interrupts.S's fk_spurious_stub, which is
+  ! two instructions and never enters Fortran, so this is the only place the
+  ! count is visible from.
+  integer(c_int64_t), volatile, bind(c, name="fk_lapic_spurious") :: &
+       fk_lapic_spurious = 0_c_int64_t
+
+  ! Must equal SVR bits 7:0 as lapic_bringup programs them in
+  ! src/boot/fk_kmain.f90.  A gate installed at any other vector leaves the
+  ! real spurious vector pointing at a cleared descriptor, and the CPU's answer
+  ! to a not-present gate is a #GP raised from inside interrupt delivery.
+  integer(c_int32_t), parameter :: FK_VECTOR_SPURIOUS = 255_c_int32_t
+
+  ! Which chip retires an interrupt.  0 is the 8259 pair and is correct right
+  ! up until the IOAPIC is routed; anything else is the LAPIC's mapped base.
+  ! It is PASSED IN rather than named here because fk_vmm_m holds the one
+  ! definition of that address and is compiled after this module.
+  integer(c_int64_t), save :: eoi_lapic = 0_c_int64_t
 
   ! The console is reached through bind(c) names rather than USE association,
   ! deliberately.  A panic handler that USEd fk_console_m would drag the whole
@@ -218,6 +237,21 @@ module fk_idt_m
 
     ! Entry point of the trampoline for 8259 line n.  boot/interrupts.S.  A
     ! separate table from the exception one because it ends in IRETQ.
+    function fk_spurious_stub_addr() result(addr) &
+         bind(c, name="fk_spurious_stub_addr")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t) :: addr
+    end function fk_spurious_stub_addr
+    ! Declared and not USEd: fk_lapic.f90 is compiled AFTER this file in
+    ! FSRC_KERNEL, and reordering that chain to satisfy a use statement would
+    ! move every module below it.  This is the idiom fk_heap_m already uses to
+    ! reach pmm_alloc_contiguous.
+    subroutine lapic_eoi(base) bind(c, name="lapic_eoi")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t), intent(in), value :: base
+    end subroutine lapic_eoi
     function fk_irq_stub(line) result(addr) bind(c, name="fk_irq_stub")
       import :: c_int32_t, c_int64_t
       implicit none
@@ -333,6 +367,12 @@ contains
        call idt_set_gate(FK_PIC1_VECTOR + v, fk_irq_stub(v))
     end do
 
+    ! Installed unconditionally, and before the LAPIC is software-enabled
+    ! rather than after: the vector is live from the instant SVR's enable bit
+    ! is set, and a spurious interrupt into a cleared descriptor is a #GP
+    ! raised during delivery, which is a much worse day than a counter.
+    call idt_set_gate(FK_VECTOR_SPURIOUS, fk_spurious_stub_addr())
+
     call idt_reload()
   end subroutine idt_init
 
@@ -396,6 +436,16 @@ contains
   ! about to scroll a screen of ordinary boot text off the top, and the colour
   ! is what says at a glance which of the two the reader is looking at.
   !> Tell the panic handler what "white" and "red" are on this framebuffer.
+  ! Non-zero hands the acknowledgement to the LAPIC at BASE.  Called once, by
+  ! ioapic_bringup, and only after the redirection entry is in place: from this
+  ! instant the 8259 path is gone, and an outb to a masked chip retires nothing.
+  subroutine idt_set_eoi_lapic(base) bind(c, name="idt_set_eoi_lapic")
+    implicit none
+    integer(c_int64_t), intent(in), value :: base
+
+    eoi_lapic = base
+  end subroutine idt_set_eoi_lapic
+
   subroutine idt_set_panic_colors(fg, bg) bind(c, name="idt_set_panic_colors")
     implicit none
     integer(c_int32_t), intent(in), value :: fg, bg
@@ -519,7 +569,14 @@ contains
     ! service and the interrupt that owns it never completes.  pic_isr() returns
     ! the slave in bits 15:8 and the master in 7:0, so the bit to test is the
     ! line number itself for both cases.
-    if (line == FK_IRQ_SPURIOUS_MASTER .or. line == FK_IRQ_SPURIOUS_SLAVE) then
+    !
+    ! IT IS ALSO THE 8259'S OWN, and is skipped once the IOAPIC owns the line:
+    ! with both chips masked nothing reaches the CPU through them, pic_isr()
+    ! would be interrogating a pair that is not delivering, and the LAPIC's
+    ! spurious interrupt is vector 255 and never arrives in this routine at all
+    ! -- boot/interrupts.S answers it without entering Fortran.
+    if (eoi_lapic == 0_c_int64_t .and. &
+        (line == FK_IRQ_SPURIOUS_MASTER .or. line == FK_IRQ_SPURIOUS_SLAVE)) then
        if (.not. btest(pic_isr(), line)) then
           fk_irq_spurious = fk_irq_spurious + 1_c_int64_t
           ! A spurious SLAVE interrupt still reached the CPU through the
@@ -539,7 +596,17 @@ contains
     ! The switch below returns into a DIFFERENT stack and this routine is not
     ! reached again on this path; an EOI after it would be an EOI that never
     ! runs, and the timer would fire exactly once for the whole boot.
-    call pic_eoi(line)
+    !
+    ! WHICH CHIP is roadmap 3.3's: an interrupt delivered through the IOAPIC is
+    ! retired at the LAPIC, and an outb to a masked 8259 retires nothing at all.
+    ! The symptom of getting this wrong is the same in both directions -- one
+    ! interrupt and then silence -- which is why the switch is one branch here
+    ! rather than a second copy of this routine.
+    if (eoi_lapic /= 0_c_int64_t) then
+       call lapic_eoi(eoi_lapic)
+    else
+       call pic_eoi(line)
+    end if
 
     ! roadmap 4.0.  sched_tick returns the frame to resume on -- its own
     ! argument if there is nothing to switch to -- so a kernel with no
