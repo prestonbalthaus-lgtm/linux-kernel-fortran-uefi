@@ -530,7 +530,12 @@ fi
 echo
 echo "=== no 2 MiB segment padding (the -z max-page-size flag is doing its job) ==="
 # Catches a missing -z max-page-size, which pads each of the three PT_LOADs to
-# 2 MiB.  Image is 25600 bytes today, 25248 without io.S and the serial driver.
+# 2 MiB.  This link is 162088 bytes at roadmap 6.1 -- it was 25600 when the
+# comment was written, and the number is worth keeping current because the
+# ceiling below is fixed while the image is not.  NOTE it is not the same
+# artifact as build/boot/kernel.elf (157264 bytes): this script links every
+# src/**/fk_*.f90 whether kernel_main calls it or not, and Makefile.boot links
+# only the boot path.
 sz=$(stat -c%s "$K")
 if [ "$sz" -lt 262144 ]; then ok "image is $sz bytes (< 256 KiB)"
 else bad "image is $sz bytes -- looks like 2 MiB segment padding crept back in"; fi

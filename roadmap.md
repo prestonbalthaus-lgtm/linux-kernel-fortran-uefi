@@ -1,7 +1,7 @@
 
 # PROPOSED NEXT MILESTONE -- AWAITING LEAD ARCHITECT APPROVAL
 
-Updated 2026-08-18. **4.1, 3.x, 3.3 and 4.2 have LANDED, are ticked, and are
+Updated 2026-08-19. **4.1, 3.x, 3.3 and 4.2 have LANDED, are ticked, and are
 MERGED** -- PRs #16, #17 and #18 went in bottom-up at 17:19Z and master is
 76e6619, so nothing below is waiting on a branch. 3.x gave the DMA allocator
 declared in 3.6 a body and a host-side proof of contiguity;
@@ -32,12 +32,19 @@ That grep now answers differently, which is the whole of the milestone:
 IRQ0 is overridden to GSI 2. No IOAPIC redirection entry for the timer can be
 written without it, and 3.3 is where it gets used.
 
+**2026-08-19: 1.1 AND 6.1 ARE BOTH IN, and the table below is what replaced them.**
+1.1's string half -- strlen, strcpy, strcmp, strncmp -- was the oldest unpaid debt
+in the tree and 6.1 could not start without it. 6.1 then landed the VFS: four
+`bind(c)` primitives, a dentry tree, and a path walk that turns `/bin/init` into
+a handle without reading a single block.
+
 **Next, in order, with what each is really waiting on:**
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 6.1 | the VFS | all three hardware pillars are up: 2.2 draws, 5.2 reads keys, 5.3 reads blocks | `strlen`/`strcpy`/`strcmp`, which 1.1 still owes and which nothing else is waiting on |
-| 1.1 | the string half of the core library | unchanged and still owed | nothing; 6.1 and 6.4 cannot start without it |
+| 6.2 | the filesystem driver (ext2 or FAT32) | 5.3 reads blocks off the NVMe drive and 6.1 gives it one seam to replace | nothing. `vfs_lookup` is the function whose MISS has to start meaning "read the directory", and `s_priv`/`i_priv` are already declared for the block number |
+| 6.3 | the syscall ABI trap | independent of 6.2 and can be done in either order | nothing |
+| 6.4 | the ELF loader | 1.1 paid its string half, which is what it was waiting on | 6.2, because there is nothing to load a binary OUT of until a real filesystem is mounted |
 
 **WHAT 5.1 NEEDED BEFORE IT COULD TOUCH THE CONTROLLER, AND IT IS PAID.** 4.2
 read configuration space and never wrote it, so the COMMAND register could not
@@ -110,6 +117,13 @@ gate asserts six PMM verdicts each with a FAIL twin out of seven FAIL lines in
 all, mb2-selftest injects eight defects and five of them still get past
 grub2-file, and the image `-z max-page-size` protects is 68 KiB.
 
+Four of those numbers have since moved and the sentence above is deliberately
+NOT edited: it records what the #27 sweep MEASURED, and substituting today's
+values would claim that sweep measured numbers it never saw.  As of 6.1
+(2026-08-19) the layout gate links 43 modules and makes 176 checks, and
+`build/boot/kernel.elf` is 154 KiB.  The live statements of both are in 0.1 and
+0.2, which is where a reader should take them from.
+
 **Corrections made in the 4.1 pass**: 3.3's "WHAT IS NOT DONE, and
 4.1 owns most of it" -- 4.1 has landed, and what remained was 3.3's own doing
 rather than 4.1's parsing; and 3.6's "DMA memory ... is still not smuggled into
@@ -136,7 +150,7 @@ Before any Fortran is written, the autonomous build environment must be establis
         Validation: Script properly aligns .text, .data, and .bss sections for a 64-bit ELF kernel.
 
         DONE: `linker.ld`. Proven, not asserted -- `tools/linkscript-test.sh` links the
-        REAL 36 modules under KFLAGS and checks 175 properties (`make linkscript`, also
+        REAL 43 modules under KFLAGS and checks 176 properties (`make linkscript`, also
         part of `make audit`). .text/.rodata/.data/.bss each start on a 4 KiB boundary in
         their own PT_LOAD (RE / R / RW), so the VMM (3.5) can set per-section permissions
         without two sections sharing a page. VMA 0xFFFFFFFF80100000 is forced by
@@ -153,7 +167,9 @@ Before any Fortran is written, the autonomous build environment must be establis
         (`./tools/run.sh kernel`, or `iso`, `bootgate`), separate from ./Makefile so the
         Phase 1 differential harness cannot be disturbed by boot work. It passes
         `-z max-page-size=0x1000`, without which GNU ld pads every PT_LOAD to 2 MiB and
-        the 68 KiB kernel becomes multi-megabyte.
+        the 154 KiB kernel becomes multi-megabyte.  (68 KiB when this box was written;
+        `build/boot/kernel.elf` is 157264 bytes at 6.1.  The gate's `< 256 KiB`
+        assertion still passes, which is the flag doing its job.)
 
         One deviation from the wording: `-ffreestanding` is NOT passed. It is a C-only
         flag; f951 does not accept it. The property it stands for -- no libc, no
@@ -371,6 +387,8 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
         contains `#undef memcmp`, which defeats a -D on the command line. So
         `fk_string.f90` exports fk_memset..fk_memcmp and is the file under test, and
         `fk_string_abi.f90` -- kernel-image only -- exports the four C names and forwards.
+        Roadmap 1.1 put four more of each in the same two files on the same terms, so
+        both now carry eight; the split is unchanged and is what makes that possible.
 
         `tests/lib/test_string.c` diffs them against the vendor source over a guarded
         arena, and the same count under `kflags-test`. It was 36747535 checks at this
@@ -2146,9 +2164,64 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
 
 Preparing the kernel to host external C applications.
 
-   * [ ] 6.1 The Virtual File System (VFS)
+   * [x] 6.1 The Virtual File System (VFS)
 
         Validation: A Fortran tree structure can abstract drives into a standard / directory hierarchy.
+
+        DONE 2026-08-19. `src/fs/fk_vfs_types.f90` carries the four `bind(c)` primitives --
+        superblock, inode, dentry, file -- and `src/fs/fk_vfs.f90` the pools, the tree and
+        the walk. `/bin/init` resolves; `/bin/init/` is refused with -ENOTDIR. NOTHING
+        READS A BLOCK, which is 6.2's job and is why the seam below exists.
+
+        HANDLES INTO STATIC POOLS, NOT POINTERS INTO A HEAP. The heap takes no lock and
+        stops allocating before `sched_start` (3.6's box says so), so a tree that outlives
+        bring-up cannot live in it, and `03-guidelines.md` forbids a dynamically allocated
+        array without explicit lifecycle management anyway. Every link is a 1-based INDEX
+        and `FK_VFS_NONE = 0` is the null. That makes the lifecycle TESTABLE rather than
+        asserted -- allocate to exhaustion, get -ENOMEM, free one, allocate again, and the
+        slot comes back -- leaves no pointer for gfortran to narrow, and puts the whole
+        tree in four `.bss` objects a host test and the QMP sentinel can both read at a
+        known symbol. 64 inodes, 64 dentries, 16 files, 4 superblocks: 21.3 KiB, NOBITS.
+
+        THE WALK IS `fs/namei.c:2537-2557`, the byte-at-a-time `hash_name`, whose loop
+        condition `while (c && c != '/')` is the whole separator rule. The word-at-a-time
+        variant above it is x86 page-safety machinery for a hot path this kernel does not
+        have. A TRAILING SLASH IS NOT STRIPPED: Linux does not strip it either, and
+        `lookup_last` (:2782) tests the byte that survives -- stripping it during
+        tokenisation is the one shortcut that silently loses -ENOTDIR on `/bin/init/`.
+        And the non-final -ENOTDIR check is on the RESULT of a component (:2662-2667),
+        not on the directory it was looked up in; check it first and `/file/..` answers
+        the root.
+
+        NO OPS TABLE, and that is a decision rather than an omission. Linux dispatches
+        `lookup` through `inode_operations` because it has many filesystems to dispatch
+        between; there are none here, so the seam is ONE function -- `vfs_lookup`, walking
+        the child list and comparing (length, bytes) the way `dentry_cmp` does. 6.2 is the
+        first caller for which a MISS means "read the directory off the disk", and that is
+        where the indirection earns itself. `s_priv` and `i_priv` are declared and unread.
+
+        FOUR CHANNELS, and one of them exists for a defect the others cannot see.
+        `tests/fs/test_vfs.c` is 157 checks with NO `ORACLE_` variable -- `fs/namei.c` is
+        entangled with the mount table, RCU and credentials and nothing extractable
+        survives -- so the constants come from the vendor's own uapi headers, the walk is
+        a 29-row table citing `fs/namei.c` line by line, and the LAYOUT is diffed against
+        the C compiler: the pools are `bind(c)` arrays and the test writes through its own
+        mirror structs at indices 0, 1 and N-1 and reads back through the Fortran
+        accessors, so a wrong field offset OR a wrong array stride is a wrong value.
+        Mutation M109 inserts a spare field into `fk_inode_t`: every accessor still
+        compiles, `/bin/init` still resolves, and only that channel notices.
+
+        The fourth is the boot, and its claim is narrow: the same walk under KFLAGS,
+        against the real `fk_strlen`, on a machine taking timer interrupts. These are PASS
+        lines on EVERY machine including `FK_MACHINE=pc` -- the first milestone for which
+        that is true, because the VFS touches no bus and no device.
+
+        `docs/HARNESS-VALIDATION-PHASE6.md` carries the mutation table: 11 cases, 11
+        refused, one of them BY TIMEOUT. That one is worth the sentence: M106 leaves a
+        removed dentry on its parent's child list, the slot is reallocated, the list
+        closes into a cycle and `vfs_lookup` walks it forever. A caught defect that
+        arrives as a HANG, which is `docs/HARNESS-VALIDATION.md`'s oldest recorded lesson
+        -- written in Phase 1 and unheeded until a mutation table needed it.
 
    * [ ] 6.2 Basic File System Driver (e.g., ext2 or FAT32)
 

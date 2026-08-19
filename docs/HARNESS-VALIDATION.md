@@ -193,7 +193,9 @@ terminator the two operands are unrelated arena bytes.
 M97 does not change the answer. It is a `strlen` that returns the exactly
 correct length for every input and touches one byte past the terminator on its
 way out. The control run, with the guard page's section removed and the defect
-left in:
+left in (measured before the `(size_t)-1` column landed, so reproducing it today
+gives ~92,760,374 rather than this number -- the point is the second word, not
+the first):
 
     string    89317214 checks, 0 mismatches  [PASS]
 
