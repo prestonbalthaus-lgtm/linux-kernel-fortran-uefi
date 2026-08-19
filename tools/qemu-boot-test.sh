@@ -293,6 +293,24 @@ Fortran Kernel: VFS dentries/inodes in use 0x
 Fortran Kernel: the VFS resolved /bin/init and refused /bin/init/ (roadmap 6.1).'
 FK_VFS_FAIL_LINES=$'Fortran Kernel: the VFS bring-up FAILED, status 0x'
 
+# Roadmap 6.2.  UNLIKE 6.1's, these are machine-DEPENDENT, and that is the
+# whole difference between the two boxes: 6.1 mounts a tree in memory and 6.2
+# reads one off a drive, so on the board with no drive the correct behaviour is
+# to say so.  The lines below are therefore the FK_MACHINE=pc set on that board
+# and the mounted set everywhere else -- both are PASS lines, and neither is
+# ever allowed to be absent.
+if [[ "${FK_MACHINE:-q35}" == pc ]]; then
+  FK_EXT2_PASS_LINES=$'Fortran Kernel: no NVMe drive, so no filesystem to mount (roadmap 6.2).'
+else
+  FK_EXT2_PASS_LINES=$'Fortran Kernel: mounting ext2 off the NVMe drive (roadmap 6.2).
+Fortran Kernel: ext2 bsize/isize/blocks/inodes 0x
+Fortran Kernel: ext2 sb/root/itab 0x
+Fortran Kernel: /bin/init ino/size/LBA 0x
+Fortran Kernel: ext2 blocks read/dentries filled 0x
+Fortran Kernel: a cache miss reached the disk and /bin/init came back (roadmap 6.2).'
+fi
+FK_EXT2_FAIL_LINES=$'Fortran Kernel: the ext2 bring-up FAILED, status 0x'
+
 FK_PCIE_FAIL_LINES=$'Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map.
 Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
 Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route.
@@ -410,7 +428,8 @@ $FK_IOA_PASS_LINES
 $FK_PCIE_PASS_LINES
 $FK_KBD_PASS_LINES
 $FK_NVME_PASS_LINES
-$FK_VFS_PASS_LINES}"
+$FK_VFS_PASS_LINES
+$FK_EXT2_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
 $FK_VMM_FAIL_LINES
@@ -426,7 +445,8 @@ $FK_IOA_FAIL_LINES
 $FK_PCIE_FAIL_LINES
 $FK_KBD_FAIL_LINES
 $FK_NVME_FAIL_LINES
-$FK_VFS_FAIL_LINES}"
+$FK_VFS_FAIL_LINES
+$FK_EXT2_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a
@@ -509,6 +529,14 @@ CHECK_VFS="${FK_CHECK_VFS:-1}"
 CHECK_NVME="${FK_CHECK_NVME:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_NVME=0
 [[ "$CHECK_NVME" != 0 ]] && say "nvme check : sector 0, read at its physical base and diffed against the image"
+# roadmap 6.2. OFF ON FK_MACHINE=pc for the same reason the NVMe check is: that
+# board is given no storage controller, so there is no filesystem to mount and
+# the guest correctly says so instead of failing. The VFS check above stays on
+# there -- 6.1 touches no bus and no device, and 6.2 is the first Phase 6 box
+# for which that stops being true.
+CHECK_EXT2="${FK_CHECK_EXT2:-1}"
+[[ "$MACHINE" == pc ]] && CHECK_EXT2=0
+[[ "$CHECK_EXT2" != 0 ]] && say "ext2 check : /bin/init off the drive, against an independent host-side walk"
 CHECK_KBD="${FK_CHECK_KBD:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_KBD=0
 [[ "$CHECK_KBD" != 0 ]] && say "kbd check  : key presses injected over QMP, decoded and rendered by the guest"
@@ -733,6 +761,12 @@ assertion_summary() {
       else                           say "  NVMe sector 0    : FAIL  see the NVMe assertions above"
       fi
     fi
+    if [[ "$CHECK_EXT2" != 0 ]]; then
+      if   (( EXT2_OK == 1 )); then  say "  ext2 /bin/init   : PASS  the miss path read the disk and found it"
+      elif (( EXT2_RAN == 0 )); then say "  ext2 /bin/init   : FAIL  the guest died before it could be asked"
+      else                           say "  ext2 /bin/init   : FAIL  see the ext2 assertions above"
+      fi
+    fi
     if [[ "$CHECK_KBD" != 0 ]]; then
       if   (( KBD_OK == 1 )); then  say "  USB keyboard     : PASS  keys were pressed, decoded and rendered"
       elif (( KBD_RAN == 0 )); then say "  USB keyboard     : FAIL  the guest died before it could be asked"
@@ -791,19 +825,24 @@ QEMU_ARGS=(
 # a fixture nobody can read a diff of, and its contents are the assertion --
 # sector 0 carries a known 16-byte prologue and a signature the guest has no
 # way to guess. Rebuilt whenever it is missing, so the gate is self-contained.
-NVME_IMG="${FK_NVME_IMG:-build/boot/nvme-disk.img}"
+# roadmap 6.2. THE SAME DISK NOW CARRIES A FILESYSTEM, and the two milestones
+# do not collide because ext2 does not use the first 1024 bytes: it reserves
+# them for a boot block and puts its superblock at byte 1024. 5.3's prologue,
+# boot signature and sector-1 marker all live inside that reserved space, so
+# every assertion 5.3 makes about sector 0 still holds byte for byte.
+#
+# tools/gen-ext2-oracle.sh is the SAME generator the host suite uses, so the
+# filesystem the guest parses and the filesystem `make test` parses are built
+# by one script and one mke2fs. It also writes the debugfs answers next to the
+# image, which is where the checks below get their expectations.
+NVME_IMG="${FK_NVME_IMG:-build/boot/ext2-fixture.img}"
 if [[ "$MACHINE" != pc ]]; then
   if [[ ! -f "$NVME_IMG" ]]; then
     mkdir -p "$(dirname "$NVME_IMG")"
-    python3 - "$NVME_IMG" <<'PYIMG'
-import sys
-SECTORS, SZ = 2048, 512
-d = bytearray(SECTORS * SZ)
-d[0:16] = bytes(range(16))          # the prologue the guest prints
-d[510:512] = b"\x55\xaa"            # a boot signature, so sector 0 looks real
-d[512:528] = b"FORTRAN-KERNEL!!"    # sector 1, to catch an off-by-one LBA
-open(sys.argv[1], "wb").write(bytes(d))
-PYIMG
+    bash tools/gen-ext2-oracle.sh "$(dirname "$NVME_IMG")" >/dev/null || {
+      say "FAIL: could not build the ext2 disk image (is e2fsprogs installed?)"
+      exit 1
+    }
   fi
   QEMU_ARGS+=( -drive "file=$NVME_IMG,format=raw,if=none,id=nvm"
                -device nvme,drive=nvm,serial=fk1234 )
@@ -998,6 +1037,19 @@ if [[ "$CHECK_NVME" != 0 && "$MODE" == gate ]]; then
   fi
 fi
 
+EXT2_RAN=0; EXT2_OK=0
+if [[ "$CHECK_EXT2" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    EXT2_RAN=1
+    rule
+    say "--- ext2: a cache miss that reached the disk, against a host-side walk ---"
+    if python3 "$SENTINEL" ext2 --qmp "$SOCK" --elf "$KERNEL" \
+               --image "$NVME_IMG" --timeout 15; then
+      EXT2_OK=1
+    fi
+  fi
+fi
+
 KBD_RAN=0; KBD_OK=0
 if [[ "$CHECK_KBD" != 0 && "$MODE" == gate ]]; then
   if qemu_alive; then
@@ -1132,6 +1184,8 @@ KBD_BAD=0
 if [[ "$CHECK_KBD" != 0 && "$MODE" == gate ]] && (( KBD_OK == 0 )); then KBD_BAD=1; fi
 NVME_BAD=0
 if [[ "$CHECK_NVME" != 0 && "$MODE" == gate ]] && (( NVME_OK == 0 )); then NVME_BAD=1; fi
+EXT2_BAD=0
+if [[ "$CHECK_EXT2" != 0 && "$MODE" == gate ]] && (( EXT2_OK == 0 )); then EXT2_BAD=1; fi
 VFS_BAD=0
 if [[ "$CHECK_VFS" != 0 && "$MODE" == gate ]] && (( VFS_OK == 0 )); then VFS_BAD=1; fi
 PCI_BAD=0
@@ -1141,7 +1195,7 @@ if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
    && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )) \
    && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )) && (( DMA_BAD == 0 )) \
    && (( PCI_BAD == 0 )) && (( XHCI_BAD == 0 )) && (( KBD_BAD == 0 )) \
-   && (( NVME_BAD == 0 )) && (( VFS_BAD == 0 )); then
+   && (( NVME_BAD == 0 )) && (( VFS_BAD == 0 )) && (( EXT2_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule

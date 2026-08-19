@@ -18,11 +18,22 @@
 #                                     tools/gen-font-8x16.py. Both must run
 #                                     where the build runs, or the gate proves
 #                                     something about the host instead.
+#   e2fsprogs                         mke2fs and debugfs, for the ext2 host
+#                                     suite (roadmap 6.2). THE POINT IS THAT
+#                                     THE FIXTURE IS BUILT BY SOMEONE ELSE: if
+#                                     this tree both formatted the image and
+#                                     parsed it, a misconception shared by the
+#                                     two would agree with itself and the suite
+#                                     would go green on it. debugfs is the
+#                                     second opinion on what mke2fs wrote --
+#                                     the same standard roadmap 4.1 set when it
+#                                     walked the ACPI tables in Python before
+#                                     believing the Fortran.
 FROM fedora:44
 RUN dnf -y install --setopt=install_weak_deps=False \
         gcc gcc-gfortran make binutils diffutils findutils \
         grub2-tools grub2-tools-extra grub2-pc-modules grub2-efi-x64-modules \
         xorriso mtools \
-        python3 \
+        python3 e2fsprogs \
     && dnf clean all
 WORKDIR /work

@@ -42,6 +42,8 @@ module fk_vfs_m
   public :: vfs_dentry_parent, vfs_dentry_inode, vfs_dentry_child, &
             vfs_dentry_sib, vfs_dentry_len, vfs_dentry_name, vfs_is_dir
   public :: vfs_inode_mode, vfs_inode_size, vfs_inode_ino, vfs_inode_nlink
+  public :: vfs_inode_priv, vfs_inode_set_priv, vfs_inode_set_meta
+  public :: vfs_super_priv, vfs_super_set_priv, vfs_fills
   public :: vfs_file_inode, vfs_file_pos
   public :: vfs_dentries_used, vfs_inodes_used, vfs_files_used, vfs_super_magic
 
@@ -64,6 +66,36 @@ module fk_vfs_m
 
   integer(c_int64_t), save :: next_ino = 1_c_int64_t
   integer(c_int32_t), save :: mounted = FK_VFS_NONE
+
+  ! THE MISS PATH (roadmap 6.2), and it is resolved by the LINKER rather than
+  ! by a table of function pointers.  6.1's header promised that vfs_lookup
+  ! would be the one seam and that an ops table would be indirection with a
+  ! single entry; this is that promise kept.  src/fs/fk_ext2.f90 defines the
+  ! symbol for the kernel and tests/fs/test_ext2.c defines it for the host
+  ! suite, exactly as boot/io.S and the driver tests each define fk_readl.
+  !
+  ! A filesystem that has not mounted returns FK_VFS_NONE and the lookup misses
+  ! as it always did, which is what keeps tests/fs/test_vfs.c's 6.1 assertions
+  ! true without a filesystem underneath them.
+  interface
+    function fk_vfs_fill(parent, name, len) result(d) &
+         bind(c, name="fk_vfs_fill")
+      import :: c_int32_t, c_ptr
+      implicit none
+      integer(c_int32_t), intent(in), value :: parent, len
+      type(c_ptr), intent(in), value        :: name
+      integer(c_int32_t)                    :: d
+    end function fk_vfs_fill
+  end interface
+
+  ! WITHOUT THIS FLAG THE MISS PATH RECURSES FOREVER.  vfs_add calls vfs_lookup
+  ! to enforce -EEXIST, and the filler's whole job is to call vfs_add; so a
+  ! filler invoked from inside its own vfs_add re-enters immediately and the
+  ! stack is gone.  It arrives as a HANG, not a wrong answer, which is
+  ! docs/HARNESS-VALIDATION.md's oldest lesson and why the mutation runner has
+  ! a per-case timeout.
+  logical, save :: filling = .false.
+  integer(c_int64_t), save :: fills = 0_c_int64_t
 
 contains
 
@@ -204,6 +236,8 @@ contains
     end do
     next_ino = 1_c_int64_t
     mounted = FK_VFS_NONE
+    filling = .false.
+    fills = 0_c_int64_t
   end subroutine vfs_reset
 
   ! Creates the superblock AND its root, because a superblock with no root is a
@@ -453,7 +487,36 @@ contains
        end if
        c = dentries(c)%d_sib
     end do
+
+    ! THE CACHE MISS, and this is the whole of 6.2's wiring into 6.1.  A name
+    ! that is not in the tree is not yet an answer: it is a question for the
+    ! filesystem, which reads the parent's directory off the disk and calls
+    ! vfs_add.  Only a name that is on neither is FK_VFS_NONE.
+    !
+    ! A DIRECTORY IS THE ONLY THING WORTH ASKING ABOUT.  Filling from a
+    ! non-directory would hand the filesystem a parent whose i_priv is a file's
+    ! inode number and let it parse a file's contents as directory entries.
+    if (filling) return
+    if (vfs_is_dir(parent) == 0_c_int32_t) return
+    filling = .true.
+    c = fk_vfs_fill(parent, name, len)
+    filling = .false.
+    fills = fills + 1_c_int64_t
+    ! vfs_lookup's contract is "a handle, or FK_VFS_NONE" -- every caller in
+    ! this file tests it against FK_VFS_NONE and nothing tests its sign.  A
+    ! filler's negative errno is therefore FLATTENED here rather than leaked
+    ! into a walk that would treat -ENOENT as a live dentry.
+    if (c > FK_VFS_NONE) then
+       if (dentry_ok(c)) d = c
+    end if
   end function vfs_lookup
+
+  function vfs_fills() result(v) bind(c, name="vfs_fills")
+    implicit none
+    integer(c_int64_t) :: v
+
+    v = fills
+  end function vfs_fills
 
   ! ---- the walk -------------------------------------------------------------
 
@@ -729,6 +792,85 @@ contains
     v = 0_c_int32_t
     if (inode_ok(i)) v = inodes(i)%i_nlink
   end function vfs_inode_nlink
+
+  ! i_priv AND s_priv, WRITTEN AT LAST (roadmap 6.2).  6.1 declared both and
+  ! read neither, and said so; the filesystem driver is the caller they were
+  ! declared for.  i_priv carries the ext2 inode NUMBER and s_priv the block
+  ! that group 0's inode table starts at.  Neither meaning is known here, and
+  ! that is the point of an opaque field.
+  function vfs_inode_priv(i) result(v) bind(c, name="vfs_inode_priv")
+    implicit none
+    integer(c_int32_t), intent(in), value :: i
+    integer(c_int64_t) :: v
+
+    v = 0_c_int64_t
+    if (inode_ok(i)) v = inodes(i)%i_priv
+  end function vfs_inode_priv
+
+  function vfs_inode_set_priv(i, v) result(status) &
+       bind(c, name="vfs_inode_set_priv")
+    implicit none
+    integer(c_int32_t), intent(in), value :: i
+    integer(c_int64_t), intent(in), value :: v
+    integer(c_int32_t) :: status
+
+    status = -FK_E_BADF
+    if (.not. inode_ok(i)) return
+    inodes(i)%i_priv = v
+    status = 0_c_int32_t
+  end function vfs_inode_set_priv
+
+  ! vfs_add DERIVES mode and size for a directory -- it forces size to 0 and
+  ! nlink to 2, because a tree built in memory has no other source for them.
+  ! A tree read off a disk does, so this overwrites both with what the on-disk
+  ! inode says.  It deliberately does NOT touch i_nlink: vfs_add's link
+  ! accounting is what keeps vfs_remove correct, and a disk's count includes
+  ! entries this tree has not read.
+  function vfs_inode_set_meta(i, mode, size) result(status) &
+       bind(c, name="vfs_inode_set_meta")
+    implicit none
+    integer(c_int32_t), intent(in), value :: i, mode
+    integer(c_int64_t), intent(in), value :: size
+    integer(c_int32_t) :: status
+
+    status = -FK_E_BADF
+    if (.not. inode_ok(i)) return
+    status = -FK_E_INVAL
+    ! The file TYPE is fixed when the dentry is created, because vfs_add's
+    ! nlink accounting and every is-a-directory test downstream already
+    ! branched on it.  Changing it here would leave the tree describing a
+    ! directory whose parent was never credited with its "..".
+    if (iand(mode, FK_S_IFMT) /= iand(inodes(i)%i_mode, FK_S_IFMT)) return
+    if (size < 0_c_int64_t) return
+    inodes(i)%i_mode = mode
+    inodes(i)%i_size = size
+    status = 0_c_int32_t
+  end function vfs_inode_set_meta
+
+  function vfs_super_priv(sb) result(v) bind(c, name="vfs_super_priv")
+    implicit none
+    integer(c_int32_t), intent(in), value :: sb
+    integer(c_int64_t) :: v
+
+    v = 0_c_int64_t
+    if (sb < 1_c_int32_t .or. sb > FK_VFS_SUPERS) return
+    if (supers(sb)%s_flags /= FK_VFS_LIVE) return
+    v = supers(sb)%s_priv
+  end function vfs_super_priv
+
+  function vfs_super_set_priv(sb, v) result(status) &
+       bind(c, name="vfs_super_set_priv")
+    implicit none
+    integer(c_int32_t), intent(in), value :: sb
+    integer(c_int64_t), intent(in), value :: v
+    integer(c_int32_t) :: status
+
+    status = -FK_E_BADF
+    if (sb < 1_c_int32_t .or. sb > FK_VFS_SUPERS) return
+    if (supers(sb)%s_flags /= FK_VFS_LIVE) return
+    supers(sb)%s_priv = v
+    status = 0_c_int32_t
+  end function vfs_super_set_priv
 
   function vfs_file_inode(f) result(v) bind(c, name="vfs_file_inode")
     implicit none

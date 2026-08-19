@@ -32,19 +32,41 @@ That grep now answers differently, which is the whole of the milestone:
 IRQ0 is overridden to GSI 2. No IOAPIC redirection entry for the timer can be
 written without it, and 3.3 is where it gets used.
 
-**2026-08-19: 1.1 AND 6.1 ARE BOTH IN, and the table below is what replaced them.**
-1.1's string half -- strlen, strcpy, strcmp, strncmp -- was the oldest unpaid debt
-in the tree and 6.1 could not start without it. 6.1 then landed the VFS: four
-`bind(c)` primitives, a dentry tree, and a path walk that turns `/bin/init` into
-a handle without reading a single block.
+**2026-08-19 (later): 6.2 IS IN.** 1.1 and 6.1 landed earlier the same day -- the
+string half, then the VFS -- and 6.2 is what they were for: a `vfs_lookup` MISS
+now means "read the directory off the NVMe drive", which is the promise 6.1's
+header made in as many words.
+
+**6.3 IS DONE AND IS NOT ON MASTER RIGHT NOW**, which is why its box below is
+still open. It landed as PR #35 and was then REVERTED by PR #36, so master's
+tree went back to exactly `ff80fe0`'s. It comes back as a revert OF that revert,
+because `phase6/syscall-trap`'s commits are already ancestors of master and
+re-merging the branch would bring nothing -- git considers them merged and says
+`Already up to date`.
+
+That is worth writing down rather than discovering twice: **reverting a merge
+does not un-merge the branch.** The branch is still in the history, so the only
+way to bring the work back is to revert the revert. The two milestones were
+built off the same master deliberately -- they share no code -- and this one was
+rebased onto the post-revert master and re-verified on the rebased tip rather
+than inheriting a green earned on a base that no longer exists.
+
+**The number 6.2 exists for**, printed by the running kernel off a real
+controller, and matched by `debugfs` reading the same image:
+
+    Fortran Kernel: /bin/init ino/size/LBA 0x0000000D/0x0000001C/0x00000066
+
+Inode 13, 28 bytes, LBA 102. `debugfs` says inode 13, 28 bytes, block 51, which
+at a 1 KiB block is LBA 102.
 
 **Next, in order, with what each is really waiting on:**
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 6.2 | the filesystem driver (ext2 or FAT32) | 5.3 reads blocks off the NVMe drive and 6.1 gives it one seam to replace | nothing. `vfs_lookup` is the function whose MISS has to start meaning "read the directory", and `s_priv`/`i_priv` are already declared for the block number |
-| 6.3 | the syscall ABI trap | independent of 6.2 and can be done in either order | nothing |
-| 6.4 | the ELF loader | 1.1 paid its string half, which is what it was waiting on | 6.2, because there is nothing to load a binary OUT of until a real filesystem is mounted |
+| 6.3 | the syscall ABI trap | DONE. Landed as #35, reverted by #36, and returns as a revert of that revert | nothing but the button |
+| 6.4 | the ELF loader | BOTH prerequisites are now paid: 1.1 gave it strings and 6.2 gives it something to load a binary out of | nothing. It is also where the SINGLY-INDIRECT BLOCK gets written -- 6.2 implements twelve direct blocks, 12 KiB, which will not hold a BusyBox and refuses `-EFBIG` rather than truncating |
+| 7.1 | the Ring 3 drop | 6.3 built the path and stopped one step short of it on purpose | 6.3 landing |
+| 7.2 | boot /bin/init (BusyBox) | 6.2 can find it and 6.4 will load it | 6.4, and 6.4's indirect block |
 
 **WHAT 5.1 NEEDED BEFORE IT COULD TOUCH THE CONTROLLER, AND IT IS PAID.** 4.2
 read configuration space and never wrote it, so the COMMAND register could not
@@ -2223,9 +2245,69 @@ Preparing the kernel to host external C applications.
         arrives as a HANG, which is `docs/HARNESS-VALIDATION.md`'s oldest recorded lesson
         -- written in Phase 1 and unheeded until a mutation table needed it.
 
-   * [ ] 6.2 Basic File System Driver (e.g., ext2 or FAT32)
+   * [x] 6.2 Basic File System Driver (e.g., ext2 or FAT32)
 
         Validation: Kernel can read the directory structure of the NVMe drive and locate a specific file.
+
+        DONE 2026-08-19. `src/fs/fk_ext2.f90` and `fk_ext2_types.f90` parse the format,
+        `fk_blkdev.f90` is one buffer and one block at a time, and `fk_blkdev_nvme.f90` puts
+        5.3's controller under it. 6.1 promised `vfs_lookup` would be the one seam and that a
+        MISS would one day mean "read the directory off the disk"; that is now what it means,
+        and nothing above it changed shape to allow it. Off the running machine:
+
+            Fortran Kernel: ext2 bsize/isize/blocks/inodes 0x00000400/0x00000100/0x00000400/0x00000080
+            Fortran Kernel: /bin/init ino/size/LBA 0x0000000D/0x0000001C/0x00000066
+            Fortran Kernel: ext2 blocks read/dentries filled 0x0000000F/0x00000006
+
+        Inode 13, 28 bytes, LBA 102 -- and `debugfs` says inode 13, 28 bytes, block 51, which
+        at a 1 KiB block is LBA 102.
+
+        ext2 RATHER THAN FAT32, and the deciding reason is the seam. `vfs_lookup` compares
+        (LENGTH, BYTES) -- `dcache.h`'s `dentry_cmp` -- and FAT stores short names uppercased
+        and matches them case-INSENSITIVELY, so a FAT driver must either fold case INSIDE
+        that comparison, changing what the seam means for everyone, or reassemble long names
+        to recover a byte-exact one. ext2 names are byte-exact on disk. Three lesser reasons:
+        FAT32 is not legally FAT32 below 65525 clusters, which would take the gate's 1 MiB
+        fixture past 33 MiB; ext2's root is inode 2, a CONSTANT (`ext2.h:162`), where FAT32's
+        is a chain to be walked; and the constants oracle was already in the tree.
+
+        ONE DISK CARRIES BOTH MILESTONES. ext2 reserves its first 1024 bytes for a boot block
+        and puts its superblock at byte 1024 (`super.c:933-937`), so 5.3's prologue, boot
+        signature and sector-1 marker all live in space the filesystem does not use and every
+        assertion 5.3 makes still holds byte for byte.
+
+        THE ORACLE IS e2fsprogs, WHICH IS THE POINT. `tools/gen-ext2-oracle.sh` builds the
+        fixture with `mke2fs` and reads the expected answers back with `debugfs`;
+        `qmp-sentinel.py` gained an INDEPENDENT ext2 walker in Python. Three readers of the
+        same bytes must agree -- 4.1's standard -- so a parser and a formatter written by one
+        hand cannot agree on a shared misconception. The LAYOUT has its own oracle again: the
+        four on-disk structs are CUT VERBATIM out of `fs/ext2/ext2.h`, which cannot simply be
+        included because it pulls in `linux/fs.h` and `linux/mm.h`.
+
+        THE FIVE REFUSALS ARE `dir.c:118-131`'s, in its order, and the first is why the walk
+        terminates: `rec_len` 0 is an offset that never advances, so a driver without it does
+        not answer wrongly, it HANGS.
+
+        TWELVE DIRECT BLOCKS AND NO INDIRECTION, named here as a debt rather than discovered
+        later: 12 KiB covers every directory the gate builds and will not cover a BusyBox.
+        6.4 writes the singly-indirect block, and a file this driver cannot reach is REFUSED
+        with -EFBIG rather than silently truncated.
+
+        TWO DEFECTS FOUND IN OTHER BOXES. ROADMAP 5.3's COMPLETION WAIT WAS TOO SHORT and is
+        fixed here because this is what found it: its 2,000,000-iteration spin expired in 3
+        of 31 boots, only ever on a host running back-to-back VMs, and surfaced as
+        FK_NVME_E_CMD -- the controller blamed for a completion that had not arrived. An
+        empty spin measures HOST CPU time, not device time. 0 of 14 at 200,000,000. And a
+        DIAGNOSTIC THAT NAMED THE WRONG MECHANISM cost an hour: `ext2_bringup` reported its
+        own steps as -1..-4, which collides with `fk_ext2.f90`'s -1..-14, so an unreadable
+        superblock and a missing buffer said the same thing and the allocator was
+        investigated for a fault it did not have.
+
+        187 host checks (the VFS's own 157 -> 171) and 24 new sentinel self-test assertions.
+        `docs/HARNESS-VALIDATION-PHASE6.md` carries the mutation table: 21 cases, 20 refused,
+        one documented escape. The table earned its keep on its FIRST run -- 14 caught and 6
+        through, of which four were one mistake, an assertion too coarse to tell two
+        mechanisms apart, and two were bugs in the runner.
 
    * [ ] 6.3 Syscall ABI Trap
 

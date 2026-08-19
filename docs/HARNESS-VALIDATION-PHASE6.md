@@ -191,3 +191,135 @@ Kill by PID.
 - **Concurrency is not addressed at all.** The pools take no lock, exactly as
   `fk_heap_m` does not, and the bring-up runs before `sched_start` for the same
   reason.
+
+---
+
+# Roadmap 6.2: does the ext2 driver's test actually catch bugs?
+
+6.1 had no C function to diff against and said so. 6.2 has something better,
+and the difference is the whole reason this section is short: **the filesystem
+was built by someone else.**
+
+`tools/gen-ext2-oracle.sh` makes the fixture with `mke2fs` and reads the
+expected inode numbers, sizes and block numbers back out with `debugfs`.
+`tools/qmp-sentinel.py` walks the same image AGAIN, in Python, sharing no line
+with `src/fs/fk_ext2.f90`. Three readers of the same bytes have to agree.
+
+`docs/HARNESS-VALIDATION-PHASE2.md`'s warning -- a model and a module that
+share a misconception agree -- does not apply to a model written by e2fsprogs.
+
+## Four channels
+
+### 1. The fixture, and it is not this tree's
+
+Every expected value in `build/ext2-fixture.h` came out of `debugfs` and
+`dumpe2fs`. The guest's printed answer on a live NVMe controller
+(`/bin/init ino/size/LBA 0x0000000D/0x0000001C/0x00000066`) is inode 13, 28
+bytes, LBA 102 -- and `debugfs` says inode 13, 28 bytes, block 51, which at a
+1 KiB block is LBA 102.
+
+**The fixture is formatted with 256-byte inodes on purpose.** A driver that
+hardcodes `EXT2_GOOD_OLD_INODE_SIZE` reads every inode after the first at the
+wrong offset, and only a filesystem whose inodes are not 128 bytes can tell.
+That is M115.
+
+### 2. The layout oracle is the vendor's own structs
+
+`gen-ext2-oracle.sh` CUTS the four on-disk structs verbatim out of
+`fs/ext2/ext2.h` and the test diffs every offset the driver uses against
+`offsetof` over them. `ext2.h` cannot be included -- it pulls in `linux/fs.h`,
+`linux/mm.h` and `linux/highmem.h` -- so extraction is what gets its layout
+without its dependencies. A vendor bump that moves a field turns this red rather
+than turning the parse subtly wrong.
+
+**The extraction is counted, not assumed.** The first draft lost nine of
+twenty-six constants to a `"[ \t]"` that reached `grep` as backslash-t rather
+than as a tab, and the generated header looked perfectly healthy: the missing
+constants simply were not asserted on, so the suite stayed green while proving
+less than it claimed. That is roadmap 1.1's oracle falling through to glibc, in
+a new costume. Every name is now checked by name and the total is checked as a
+count.
+
+### 3. The refusals are `dir.c`'s, and each names which one fired
+
+`ext2_check_folio` (`dir.c:118-131`) makes five checks; the driver makes the
+same five in the same order, and `ext2_last_status()` reports which one.
+
+That accessor exists because a mutation table demanded it. The first version of
+the corruption rows asserted only that the walk did not resolve, and TWO defects
+escaped: with the alignment refusal removed, and with the spans-the-block
+refusal removed, the walk still failed -- for a DIFFERENT reason. An assertion
+that cannot tell two mechanisms apart cannot notice that the right one is gone.
+
+### 4. The seam is exercised from above, and counted
+
+`vfs_resolve("/bin/init")` is called with NOTHING in the dentry tree, so every
+component is a cache miss that had to reach the disk. `blk_reads()` and
+`vfs_fills()` are what turn "it returned the right handle" into "it read the
+disk to get it" -- a driver that invented the answer returns the same handle.
+
+## Mutations
+
+`tools/mutate-ext2.sh`. 21 cases; 20 refused, 1 documented escape.
+
+| # | Injected defect | Detected? | How it surfaced |
+|---|---|---|---|
+| M110 | no lower bound on `rec_len` at all | **yes, by TIMEOUT** | the offset never advances; the walk does not answer wrongly, it never answers |
+| M111 | `rec_len & 3` accepted | **no -- and rightly** | see below |
+| M112 | a name may run past its own record | yes | `a name_len too big for its rec_len is refused: C=1 F=0` |
+| M113 | a record may span the block end | yes | `...as corruption: C=-9 F=-10` |
+| M114 | an entry may name an impossible inode | yes | `an inode past s_inodes_count is refused: C=1 F=0` |
+| M115 | the inode size is hardcoded to 128 | yes | `inode size, against dumpe2fs: C=256 F=128` |
+| M116 | an unimplemented incompat feature accepted | yes | `META_BG is refused: C=-5 F=2` |
+| M117 | a dirty filesystem is mounted | yes | `a filesystem that is not clean is refused: C=-3 F=2` |
+| M118 | the descriptor table is sought in the wrong block | yes | `inode table block, against dumpe2fs: C=5 F=51` |
+| M119 | a reserved inode can be handed out | yes | `inode 1 is reserved and refused: C=-8 F=0` |
+| M120 | a directory joins `i_dir_acl` into its size | yes | needed a fixture with a NON-ZERO one; see below |
+| M121 | a filesystem larger than its device is mounted | yes | `a block count with the top bit set is refused: C=-7 F=2` |
+| M122 | a failed read leaves the previous block readable | yes | `and the stale block is no longer readable: C=-1 F=128` |
+| M123 | an offset past the block reads as 0, not as absent | yes | `the byte above it does not: C=-1 F=0` |
+| M124 | a 32-bit on-disk count is read SIGNED | yes | `a block count with the top bit set is refused: C=-7 F=-1` |
+| M125 | the miss path can re-enter itself | **yes** | `vfs_add` calls `vfs_lookup` calls the filler; the stack is gone |
+| M126 | a file is asked for its directory entries | yes | **the fill COUNTER only** -- the answer is identical |
+| M127 | the filler's errno is returned as a dentry | yes | **the vfs suite only** -- `fk_ext2.f90` never returns a negative |
+| M128 | the starting LBA is a block number | yes | `the starting LBA: C=102 F=51` |
+| M129 | a directory needing indirection is truncated | yes | the name is there and the driver cannot see it |
+
+### M111 escapes and it is right to
+
+Same shape as 1.1's M93 and 5.2's M71. `dir.c:124` refuses a `rec_len` that is
+not a multiple of four because no `EXT2_DIR_REC_LEN` can produce one -- it is an
+INTEGRITY SIGNAL, not a bound. With the other four refusals present, a `rec_len`
+of 13 is accepted by this check's absence and then caught downstream: the walk
+lands mid-record, reads a garbage header, and fails as corruption anyway. The
+OUTCOME is identical, so no assertion this suite can make separates the two.
+
+Manufacturing a fixture where it differs would be testing the fixture. The
+check is kept because the vendor keeps it and because it is one comparison.
+
+### Six escapes on the first run, and five were the suite's fault
+
+The table earned its keep the first time it ran: 14 caught, 6 through. Four of
+the six were one mistake -- an assertion too coarse to distinguish mechanisms --
+and the fixes are what the channels above describe. The other two were bugs in
+the RUNNER, and both are worth carrying forward:
+
+**`run_case` restores the tree before it returns.** A second `run_case` in the
+same case function therefore runs against a CLEAN tree: it tests the baseline
+and reports the pass as an escape. M126-vfs and M127 were both that, and both
+were fine.
+
+**`nohup ... &` inside a backgrounded wrapper gets orphaned and killed.** A run
+launched that way died mid-case with M110 applied, and the next invocation
+correctly refused to start because the tree differed from HEAD. The guard that
+6.1 added is what turned a silent corruption into a loud refusal.
+
+### M120 needed a fixture change, not a test change
+
+Every directory `mke2fs` produces carries a zero in `i_dir_acl`, so joining it
+as a size's high half changed nothing and the defect escaped. `i_size_high` and
+`i_dir_acl` are the SAME WORD (`ext2.h:344`): a directory with an ACL block has
+a block number where a regular file keeps the top 32 bits of its size. mke2fs
+will not produce one without xattrs, so the test writes one.
+
+---
