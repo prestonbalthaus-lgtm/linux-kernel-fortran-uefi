@@ -32,19 +32,38 @@ That grep now answers differently, which is the whole of the milestone:
 IRQ0 is overridden to GSI 2. No IOAPIC redirection entry for the timer can be
 written without it, and 3.3 is where it gets used.
 
-**2026-08-19: 1.1 AND 6.1 ARE BOTH IN, and the table below is what replaced them.**
-1.1's string half -- strlen, strcpy, strcmp, strncmp -- was the oldest unpaid debt
-in the tree and 6.1 could not start without it. 6.1 then landed the VFS: four
-`bind(c)` primitives, a dentry tree, and a path walk that turns `/bin/init` into
-a handle without reading a single block.
+**2026-08-19 (later): 6.2 AND 6.3 ARE BOTH IN.** 1.1 and 6.1 landed earlier the
+same day -- the string half, then the VFS -- and this pair is what they were for.
+6.2 makes a `vfs_lookup` MISS mean "read the directory off the NVMe drive", which
+is the promise 6.1's header made in as many words; 6.3 makes a `SYSCALL`
+instruction land in a Fortran handler and come back.
+
+**The number 6.2 exists for**, printed by the running kernel off a real
+controller, and matched by `debugfs` reading the same image:
+
+    Fortran Kernel: /bin/init ino/size/LBA 0x0000000D/0x0000001C/0x00000066
+
+Inode 13, 28 bytes, LBA 102. `debugfs` says inode 13, 28 bytes, block 51, which
+at a 1 KiB block is LBA 102.
+
+**And the number 6.3 exists for**, which is two numbers and the second is the
+interesting one:
+
+    Fortran Kernel: syscall calls/nr/ret 0x00000001/0x00000001/0x00000005
+    Fortran Kernel: RFLAGS on entry/masked survivors 0x00000002/0x00000000
+
+The caller was provably interruptible (`RFLAGS = 0x282`) and the handler was
+entered at `0x02` -- bit 1 alone, which is architecturally always set. Not one
+of FMASK's fourteen flags survived, and IF is the one that makes the software
+stack switch safe at all.
 
 **Next, in order, with what each is really waiting on:**
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 6.2 | the filesystem driver (ext2 or FAT32) | 5.3 reads blocks off the NVMe drive and 6.1 gives it one seam to replace | nothing. `vfs_lookup` is the function whose MISS has to start meaning "read the directory", and `s_priv`/`i_priv` are already declared for the block number |
-| 6.3 | the syscall ABI trap | independent of 6.2 and can be done in either order | nothing |
-| 6.4 | the ELF loader | 1.1 paid its string half, which is what it was waiting on | 6.2, because there is nothing to load a binary OUT of until a real filesystem is mounted |
+| 6.4 | the ELF loader | BOTH prerequisites are now paid: 1.1 gave it strings and 6.2 gives it something to load a binary out of | nothing. It is also where the SINGLY-INDIRECT BLOCK gets written -- 6.2 implements twelve direct blocks, 12 KiB, which will not hold a BusyBox and refuses `-EFBIG` rather than truncating |
+| 7.1 | the Ring 3 drop | 6.3 built the path and stopped one step short of it on purpose | nothing. It is FIVE edits and one box: add the three user descriptors at selectors 0x28/0x30/0x38 (GDT slots 5-7, the first free after the TSS pair), fill in `STAR[63:48]`, change the two selectors the syscall stub pushes into its frame, make `sys_exit` stop returning, and DELETE `sysretcheck-boot` -- which exists only to keep a zero sysret half honest |
+| 7.2 | boot /bin/init (BusyBox) | 6.2 can find it and 6.4 will load it | 6.4, and 6.4's indirect block |
 
 **WHAT 5.1 NEEDED BEFORE IT COULD TOUCH THE CONTROLLER, AND IT IS PAID.** 4.2
 read configuration space and never wrote it, so the COMMAND register could not
