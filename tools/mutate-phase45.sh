@@ -24,6 +24,8 @@ echo "logs: $OUT"
 FILES="src/acpi/fk_acpi.f90 src/acpi/fk_madt.f90 src/acpi/fk_mcfg.f90 \
        src/drivers/bus/fk_pcie.f90 src/drivers/bus/fk_pcie_types.f90 \
        src/drivers/usb/fk_xhci.f90 src/drivers/usb/fk_xhci_types.f90 \
+       src/drivers/usb/fk_usb_kbd.f90 src/drivers/usb/fk_usb_hid.f90 \
+       src/drivers/usb/fk_usb_types.f90 src/cpu/fk_idt.f90 \
        src/mm/fk_vmm.f90 src/boot/fk_kmain.f90"
 
 restore() { git checkout -- $FILES 2>/dev/null; }
@@ -234,8 +236,75 @@ case_M64() {
   run_case M64-run-stop-never-set
 }
 
+
+# --- roadmap 5.2: the USB HID keyboard ---------------------------------------
+case_M65() {
+  subst src/drivers/usb/fk_usb_kbd.f90 \
+    $'    status = xhci_port_reset(port)\n' \
+    $'    status = FK_XHCI_OK\n'
+  run_case M65-port-never-reset
+}
+case_M66() {
+  subst src/drivers/usb/fk_xhci.f90 \
+    $'    call fk_writel(port_addr(port), &\n                   ior(iand(fk_readl(port_addr(port)), &\n                            FK_XHCI_PORTSC_PRESERVE), bits))' \
+    $'    call fk_writel(port_addr(port), &\n                   ior(fk_readl(port_addr(port)), bits))'
+  run_case M66-portsc-read-modify-write
+}
+case_M67() {
+  subst src/drivers/usb/fk_usb_kbd.f90 \
+    $'    call xhci_dcbaa_set(dcbaa_virt, slot_id, dctx_phys)\n' ''
+  run_case M67-dcbaa-slot-never-written
+}
+case_M68() {
+  subst src/drivers/usb/fk_usb_kbd.f90 \
+    $'    call xhci_slot_ctx_init(ictx_virt, speed, port, DCI_EP1_IN)' \
+    $'    call xhci_slot_ctx_init(ictx_virt, speed, port, DCI_EP0)'
+  run_case M68-context-entries-left-at-one
+}
+case_M69() {
+  subst src/drivers/usb/fk_usb_kbd.f90 \
+    $'    call xhci_ictx_flags(ictx_virt, ior(1_c_int32_t, shiftl(1_c_int32_t, &\n                                                            DCI_EP1_IN)), &\n                         0_c_int32_t)' \
+    $'    call xhci_ictx_flags(ictx_virt, 1_c_int32_t, 0_c_int32_t)'
+  run_case M69-add-flag-A3-not-set
+}
+case_M70() {
+  subst src/drivers/usb/fk_usb_kbd.f90 \
+    $'    call xhci_doorbell(slot_id, DCI_EP1_IN)' \
+    $'    call xhci_doorbell(slot_id, DCI_EP0)'
+  run_case M70-doorbell-at-dci-1-not-3
+}
+case_M71() {
+  subst src/drivers/usb/fk_xhci.f90 \
+    $'    v = fk_readl(ir0(FK_XHCI_IR_IMAN_OFF))\n    v = ibset(v, FK_XHCI_IMAN_IP_BIT)\n    call fk_writel(ir0(FK_XHCI_IR_IMAN_OFF), v)\n\n    do i = 1_c_int32_t, FK_XHCI_TR_MAX * 64_c_int32_t' \
+    $'    do i = 1_c_int32_t, FK_XHCI_TR_MAX * 64_c_int32_t'
+  run_case M71-iman-ip-never-cleared
+}
+case_M72() {
+  subst src/drivers/usb/fk_usb_kbd.f90 \
+    $'    status = ctrl(ior(FK_USB_TYPE_CLASS, FK_USB_RECIP_INTERFACE), &\n                  FK_HID_REQ_SET_PROTOCOL, FK_HID_BOOT_PROTOCOL, iface, &\n                  0_c_int64_t, 0_c_int32_t, 0_c_int32_t)\n    if (status /= FK_XHCI_OK) return\n' ''
+  run_case M72-set-protocol-removed
+}
+case_M73() {
+  subst src/drivers/usb/fk_usb_kbd.f90 \
+    $'    mods = rpt_byte(w, FK_USB_HID_MOD_OFF)' \
+    $'    mods = 0_c_int32_t'
+  run_case M73-modifier-byte-ignored
+}
+case_M74() {
+  subst src/drivers/usb/fk_usb_kbd.f90 \
+    $'       if (held(prev_rpt, usage)) cycle\n' ''
+  run_case M74-previous-report-not-subtracted
+}
+case_M75() {
+  subst src/drivers/usb/fk_usb_kbd.f90 \
+    $'    if (.not. armed) return\n\n    n = xhci_drain()' \
+    $'    n = xhci_drain()\n    if (.not. armed) return'
+  run_case M75-isr-drains-before-it-owns-the-ring
+}
+
 CASES="baseline M40 M41 M42 M43 M44 M45 M46 M47 M48 M49 M50 M51 \
-       M52 M53 M54 M55 M56 M57 M58 M59 M60 M61 M62 M63 M64"
+       M52 M53 M54 M55 M56 M57 M58 M59 M60 M61 M62 M63 M64 \
+       M65 M66 M67 M68 M69 M70 M71 M72 M73 M74 M75"
 
 trap 'restore' EXIT INT TERM
 for c in $CASES; do

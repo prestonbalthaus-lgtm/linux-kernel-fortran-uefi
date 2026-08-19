@@ -42,7 +42,7 @@ module fk_kmain_m
                          xhci_config_slots, xhci_set_dcbaap, &
                          xhci_cmd_ring_init, xhci_event_ring_init, &
                          xhci_intr_enable, xhci_run, xhci_cmd_noop, &
-                         xhci_doorbell, xhci_event_poll, xhci_event_type, &
+                         xhci_doorbell, xhci_cmd_wait, xhci_event_type, &
                          xhci_event_comp, xhci_event_ptr, xhci_caplength, &
                          xhci_version, xhci_max_slots, xhci_max_scratchpads, &
                          xhci_usbsts, xhci_crcr, xhci_erdp, xhci_dcbaap, &
@@ -2369,11 +2369,13 @@ contains
     ! A bounded spin, not a sleep: there is no clock in this path.  The event
     ! is posted by DMA and the interrupt arrives through the LAPIC, so neither
     ! is guaranteed to have landed by the instruction after the doorbell.
-    st = FK_XHCI_OK
-    do i = 1_c_int64_t, 100000_c_int64_t
-       st = xhci_event_poll()
-       if (st == FK_XHCI_OK) exit
-    end do
+    !
+    ! AND IT WAITS FOR *THIS* TRB, not for the first event on the ring.  With a
+    ! device attached the controller also posts Port Status Change events, and
+    ! a loop that took whatever arrived first read one of those as a failed
+    ! command -- intermittently, which is the worst way to find out.  Before
+    ! roadmap 5.2 there was no device and nothing else to arrive.
+    st = xhci_cmd_wait(trb)
 
     fk_xhci_state(0) = FK_XHCIS_MAGIC
     fk_xhci_state(1) = bar

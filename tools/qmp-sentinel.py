@@ -1568,9 +1568,15 @@ def check_usbkbd(words, xwords, dcbaa_blob, dctx_blob, stride, want_chars,
     # THE KEYSTROKES. Two, deliberately: a handler that never clears the
     # interrupter's IP bit delivers exactly one and then goes silent forever,
     # and one keystroke is indistinguishable from a working keyboard.
+    # NOT "so IMAN.IP is being cleared". Mutation M71 removed the IP clear and
+    # this count did not move: QEMU's xHCI does not gate further messages on
+    # it, so repeated delivery is evidence of repeated delivery and nothing
+    # more. The IP clear is required by xHCI 1.2 5.5.2.1 and is kept on the
+    # specification's authority, not this gate's -- see
+    # HARNESS-VALIDATION-PHASE5.md.
     out.append((words[18] >= 2,
-                f"{words[18]} transfer events arrived on EP1 -- more than one, "
-                "so IMAN.IP is being cleared and messages keep coming"))
+                f"{words[18]} transfer events arrived on EP1: the endpoint "
+                "keeps delivering, not just once"))
     out.append((words[20] >= len(want_chars),
                 f"{words[20]} character(s) were rendered to the console"))
     got = words[21] & ((1 << (8 * len(want_chars))) - 1)
@@ -1582,8 +1588,10 @@ def check_usbkbd(words, xwords, dcbaa_blob, dctx_blob, stride, want_chars,
                 f"(want {_chars(want, len(want_chars))}) -- injected with "
                 "sendkey, decoded by the guest from the wire"))
     # THE EIGHT BYTES OFF THE WIRE, not the character they decoded to. The
-    # second injected key is shift-a, so the device's boot report carries the
-    # left-shift bit in the modifier byte and usage 0x04 in the first key slot.
+    # injection ends with 'b' released while 'a' is STILL HELD, so the last
+    # report carrying a key is {a} with no modifier -- which is also the proof
+    # that a held key really does reappear in a later report, since 'a' was
+    # pressed two reports earlier.
     out.append((words[19] == want_report,
                 f"the last boot report with a key in it is "
                 f"0x{words[19]:016X} (want 0x{want_report:016X}: modifier "
@@ -1644,8 +1652,20 @@ def do_xhci(sock_path, elf, timeout, quiet):
     return 0
 
 
-def do_usbkbd(sock_path, elf, timeout, quiet, keys=("a", "shift-a"),
-              chars="aA", report=0x0000000000040002):
+# EVERY KEY IS AN EXPLICIT DOWN AND UP, and sendkey is not used at all.
+# sendkey presses and releases a whole combination on its own timing, so which
+# reports the guest's poll actually samples is a race -- observed, more than
+# once: shift-a decoding as 'a' because the modifier had already been released
+# by the time the report was sampled. Separate events with a gap between them
+# make the sequence of reports a fact rather than a hope, and they are the only
+# way to HOLD one key while another arrives, which is what the rollover
+# subtraction needs to be exercised at all.
+DEFAULT_KEYS = (("shift", True), ("a", True), ("a", False), ("shift", False),
+                ("a", True), ("b", True), ("b", False), ("a", False))
+
+
+def do_usbkbd(sock_path, elf, timeout, quiet, keys=DEFAULT_KEYS,
+              chars="Aab", report=0x0000000000040000):
     """Wait for the guest to arm EP1, inject keys, and assert what it did.
 
     THE WAIT IS NOT POLITENESS. Injecting before the endpoint is armed sends
@@ -1680,13 +1700,21 @@ def do_usbkbd(sock_path, elf, timeout, quiet, keys=("a", "shift-a"),
                   f"(fk_usbkbd_state[22] = {words[22]}, status {words[23]})")
             return 1
 
-        for k in keys:
-            client.hmp(f"sendkey {k}")
+        # 'a' is still held when 'b' arrives, which is what makes the
+        # report's six usage slots behave as the SET they are: a driver that
+        # does not subtract the previous report renders the held key again on
+        # every one. Measured -- with press-and-release only, mutating the
+        # subtraction away left the gate green.
+        for code, down in keys:
+            client.execute("input-send-event", {"events": [
+                {"type": "key", "data": {"down": down,
+                                         "key": {"type": "qcode",
+                                                 "data": code}}}]})
             time.sleep(0.3)
 
         deadline = time.monotonic() + timeout
         words = state()
-        while words[18] < len(keys) and time.monotonic() < deadline:
+        while words[20] < len(chars) and time.monotonic() < deadline:
             time.sleep(0.2)
             words = state()
 
@@ -2766,9 +2794,9 @@ def main(argv=None):
     k.add_argument("--elf", required=True)
     k.add_argument("--timeout", type=float, default=30.0)
     k.add_argument("--quiet", action="store_true")
-    k.add_argument("--keys", default="a,shift-a")
-    k.add_argument("--chars", default="aA")
-    k.add_argument("--report", default="0x40002")
+    k.add_argument("--keys", default="shift+,a+,a-,shift-,a+,b+,b-,a-")
+    k.add_argument("--chars", default="Aab")
+    k.add_argument("--report", default="0x40000")
 
     m = sub.add_parser("dma", help="assert the DMA run at its physical base")
     m.add_argument("--qmp", required=True)
@@ -2822,7 +2850,8 @@ def main(argv=None):
             return do_xhci(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "usbkbd":
             return do_usbkbd(args.qmp, args.elf, args.timeout, args.quiet,
-                             keys=tuple(args.keys.split(",")),
+                             keys=tuple((k[:-1], k[-1] == "+")
+                                        for k in args.keys.split(",")),
                              chars=args.chars,
                              report=int(args.report, 0))
         if args.cmd == "ticks":

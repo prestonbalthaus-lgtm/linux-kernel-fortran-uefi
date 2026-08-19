@@ -56,12 +56,12 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 SENTINEL="tools/qmp-sentinel.py"
-# roadmap 5.2. TWO keys, and one of them carries a modifier: a handler that
-# never clears the interrupter's IP bit delivers exactly ONE and then goes
-# silent, and one keystroke is indistinguishable from a working keyboard.
-KBD_KEYS="${FK_KBD_KEYS:-a,shift-a}"
-KBD_CHARS="${FK_KBD_CHARS:-aA}"
-KBD_REPORT="${FK_KBD_REPORT:-0x40002}"
+# roadmap 5.2. Eight key EVENTS, not two keystrokes: shift-a proves the
+# modifier byte is read, and holding 'a' down while 'b' arrives proves the
+# previous report is subtracted. A trailing "+" is a press and "-" a release.
+KBD_KEYS="${FK_KBD_KEYS:-shift+,a+,a-,shift-,a+,b+,b-,a-}"
+KBD_CHARS="${FK_KBD_CHARS:-Aab}"
+KBD_REPORT="${FK_KBD_REPORT:-0x40000}"
 KBD_TIMEOUT="${FK_KBD_TIMEOUT:-30}"
 ISO="${FK_ISO:-build/boot/fortran-kernel.iso}"
 KERNEL="${FK_KERNEL:-build/boot/kernel.elf}"
@@ -472,7 +472,7 @@ CHECK_XHCI="${FK_CHECK_XHCI:-1}"
 [[ "$CHECK_XHCI" != 0 ]] && say "xhci check : the command and event rings, read where the controller wrote them"
 CHECK_KBD="${FK_CHECK_KBD:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_KBD=0
-[[ "$CHECK_KBD" != 0 ]] && say "kbd check  : two keystrokes injected with sendkey, decoded by the guest"
+[[ "$CHECK_KBD" != 0 ]] && say "kbd check  : key presses injected over QMP, decoded and rendered by the guest"
 CHECK_PCI="${FK_CHECK_PCI:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_PCI=0
 [[ "$CHECK_PCI" != 0 ]] && say "pci check  : the guest's own enumeration against QEMU's info pci, as sets"
@@ -683,7 +683,7 @@ assertion_summary() {
       fi
     fi
     if [[ "$CHECK_KBD" != 0 ]]; then
-      if   (( KBD_OK == 1 )); then  say "  USB keyboard     : PASS  two keys were injected, decoded and rendered"
+      if   (( KBD_OK == 1 )); then  say "  USB keyboard     : PASS  keys were pressed, decoded and rendered"
       elif (( KBD_RAN == 0 )); then say "  USB keyboard     : FAIL  the guest died before it could be asked"
       else                          say "  USB keyboard     : FAIL  see the HID assertions above"
       fi
