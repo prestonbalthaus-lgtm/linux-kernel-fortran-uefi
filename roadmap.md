@@ -222,25 +222,56 @@ Before any Fortran is written, the autonomous build environment must be establis
 
 Bypassing Fortran's reliance on the OS and successfully handing control from UEFI to the Fortran entry point.
 
-  *  [ ] 1.1 The Core Library Translation (Completed)
+  *  [x] 1.1 The Core Library Translation
 
         Validation: String manipulation and math modules exist without libgfortran.
 
-        CAUTION -- THIS BOX IS OVER-TICKED, and it is now HALF paid rather than
-        unpaid. Only the MATH half was ever delivered: `src/lib/math/` has 7 modules plus
-        `src/lib/fk_bcd.f90`. `docs/AUDIT-PHASE1.md` flagged the rest already: "Phase 1
-        delivered no string handlers ... any Phase 2 planning that assumes lib/string.c is
-        already translated is working from a wrong inventory."
+        DONE at last, on 2026-08-19, and it took three passes to get there. This box was
+        ticked when Phase 1 closed and it should not have been: only the MATH half existed
+        -- `src/lib/math/` has 7 modules plus `src/lib/fk_bcd.f90` -- and
+        `docs/AUDIT-PHASE1.md` said so at the time: "Phase 1 delivered no string handlers
+        ... any Phase 2 planning that assumes lib/string.c is already translated is working
+        from a wrong inventory." That audit is dated 2026-08-12 and stays as written.
 
         PAID BY 1.3 (2026-08-13): the four MEMORY intrinsics -- memset, memcpy, memmove
-        and memcmp -- are translated from vendor `lib/string.c` and diffed against it.
+        and memcmp.
 
-        STILL OWED: the STRING half. There is no strlen, strcpy, strcmp or strncmp in the
-        tree. ACPI signature matching at 4.1 can use the memcmp that now exists, so this
-        does not block Phase 4; the VFS paths at 6.1 and the ELF loader at 6.4 cannot, and
-        it does block those. `mk/string.mk` and `tests/shims/string/` already select
-        functions out of the vendor file with its own `__HAVE_ARCH_*` guards, so adding a
-        handler is now a fragment edit and a Fortran module, not a new harness.
+        PAID IN FULL (2026-08-19): the STRING half. `fk_strlen`, `fk_strcpy`, `fk_strcmp`
+        and `fk_strncmp` in `src/lib/fk_string.f90`, with the C spellings forwarded from
+        `src/lib/fk_string_abi.f90`. The oracle side was FOUR DELETIONS: `mk/string.mk`
+        already selected functions out of the vendor file with that file's own
+        `__HAVE_ARCH_*` guards, so dropping `_STRLEN`, `_STRCPY`, `_STRCMP` and `_STRNCMP`
+        brought exactly those bodies in -- zero warnings, zero undefined symbols, measured
+        before a line was written. 92,765,576 checks, 0 mismatches.
+
+        TWO THINGS IT FOUND THAT ARE WORTH MORE THAN THE FUNCTIONS.
+
+        The oracle was GLIBC for one run. `build/oracle-string.o` depended on
+        `lib/string.c` and nothing else, so deleting the four guards did not rebuild it:
+        the symbols were absent, the link fell through to the C library, and every case
+        was diffing Fortran against libc. It went red only because `lib/string.c` returns
+        the SIGN (`c1 < c2 ? -1 : 1`, :285) and glibc returns the DIFFERENCE -- a
+        translation that happened to return the difference would have gone GREEN against
+        the wrong oracle. `Makefile` now carries `MKDEPS := $(MAKEFILE_LIST)` so every
+        object depends on the fragments, and `chk_oracle_identity()` asserts the sign
+        convention before any case runs.
+
+        And a real bug in the translation: Fortran's `c_size_t` is a SIGNED int64 while
+        C's `size_t` is unsigned, so `strncmp(a, b, SIZE_MAX)` arrived negative and
+        `count <= 0` returned 0 without comparing anything. The test's `(size_t)-1` column
+        is the only thing that sees it. The same signedness is UNTESTABLE in 1.3's four
+        intrinsics -- an `n` of `SIZE_MAX` makes the oracle read 16 exabytes and the
+        process dies before it can disagree -- and is deliberately left alone.
+
+        THE GUARD PAGE IS THE OTHER HALF OF THE SUITE. The arena catches a WRITE outside
+        the destination window and is blind to a READ past the terminator, which is how
+        all four of these fail while still returning the right answer. Two mmap'd pages,
+        the upper one `PROT_NONE`, the terminator on the last readable byte, and a SIGSEGV
+        handler that turns the fault into a mismatch line. `strncmp` with `count == 0`
+        runs against a pointer into the UNMAPPED page. Measured rather than argued: with
+        the page's section removed, a `strlen` that reads one byte past the terminator
+        passes 89,317,214 assertions; with it back it is caught on the first case.
+        `docs/HARNESS-VALIDATION.md` carries the table.
 
   *  [ ] 1.2 Multiboot2 / EFI Assembly Stub  (Multiboot2 half only)
 
@@ -342,16 +373,17 @@ Bypassing Fortran's reliance on the OS and successfully handing control from UEF
         `fk_string_abi.f90` -- kernel-image only -- exports the four C names and forwards.
 
         `tests/lib/test_string.c` diffs them against the vendor source over a guarded
-        arena: 36747535 checks, 0 mismatches, and the same count under `kflags-test`.
-        `mk/string.mk` selects the four functions out of lib/string.c using that file's
-        OWN `__HAVE_ARCH_*` guards -- 27 of them defined, four left alone -- so the
-        bodies being diffed are untouched vendor code. The test checks the returned
+        arena, and the same count under `kflags-test`. It was 36747535 checks at this
+        milestone; roadmap 1.1 added the string half to the SAME test and it now prints
+        92765576. `mk/string.mk` selects the functions out of lib/string.c using that
+        file's OWN `__HAVE_ARCH_*` guards -- 27 defined and four left alone at 1.3, 23 and
+        eight since 1.1 -- so the bodies being diffed are untouched vendor code. The test checks the returned
         pointer and the bytes OUTSIDE [dest, dest+n) as well as the copy itself, and
         memcmp's exact int rather than its sign, because lib/string.c returns the
         difference of two UNSIGNED chars: 0x80 against 0x00 is +128.
 
-        The string HALF of roadmap 1.1's debt is still open. strlen, strcpy and friends
-        are not translated; 1.3 needed the four memory intrinsics and delivered those.
+        1.3 needed the four MEMORY intrinsics and delivered those; the string half was
+        still open when this box closed and stayed open until 2026-08-19. See 1.1.
 
   *  [x] 1.4 The Kernel Panic Handler
 
