@@ -53,6 +53,8 @@ static long fill_calls;
 static int32_t fill_last_len;
 static char fill_last_name[NAME_MAX + 1];
 
+static int32_t fill_answer;
+
 int32_t fk_vfs_fill(int32_t parent, const char *name, int32_t len)
 {
 	(void)parent;
@@ -62,7 +64,7 @@ int32_t fk_vfs_fill(int32_t parent, const char *name, int32_t len)
 		memcpy(fill_last_name, name, (size_t)len);
 		fill_last_name[len] = '\0';
 	}
-	return 0;
+	return fill_answer;
 }
 
 /* The mirrors. Field for field with src/fs/fk_vfs_types.f90. */
@@ -557,6 +559,25 @@ static void test_miss_path(void)
 	FK_EQ("a name inside a file misses", 0, vfs_lookup(f, "x", 1), "%d");
 	FK_EQ("and the filesystem is not asked", before, (int32_t)fill_calls,
 	      "%d");
+
+	/* WHAT A FILESYSTEM MAY HAND BACK, and every one of these rows exists
+	 * because a mutation escaped without it. vfs_lookup's contract is "a
+	 * handle, or FK_VFS_NONE" -- every caller in fk_vfs.f90 tests it
+	 * against FK_VFS_NONE and nothing tests its sign. src/fs/fk_ext2.f90
+	 * happens never to return a negative, so removing the flattening
+	 * changed nothing and the suite stayed green; a filler that reports
+	 * -ENOENT the way the rest of this tree does would have been read as
+	 * live dentry number 2. */
+	fill_answer = -2;
+	FK_EQ("a filler's negative errno is not a dentry", 0,
+	      vfs_lookup(r, "gone", 4), "%d");
+	fill_answer = 9999;
+	FK_EQ("nor is a handle outside the pool", 0,
+	      vfs_lookup(r, "gone", 4), "%d");
+	fill_answer = 7;
+	FK_EQ("nor is a handle to a slot nothing allocated", 0,
+	      vfs_lookup(r, "gone", 4), "%d");
+	fill_answer = 0;
 
 	/* vfs_reset must clear the counter, or a second mount inherits the
 	 * first one's tally. */

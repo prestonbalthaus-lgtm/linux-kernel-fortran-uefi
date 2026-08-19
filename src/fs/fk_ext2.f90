@@ -75,7 +75,7 @@ module fk_ext2_m
             ext2_blocks_per_group, ext2_inodes_count, ext2_blocks_count, &
             ext2_first_ino, ext2_group_count, ext2_inode_table
   public :: ext2_stat, ext2_stat_mode, ext2_stat_size, ext2_stat_links, &
-            ext2_stat_block, ext2_first_lba
+            ext2_stat_block, ext2_first_lba, ext2_last_status
 
   integer(c_int32_t), parameter :: FK_EXT2_OK = 0_c_int32_t
   integer(c_int32_t), parameter :: FK_EXT2_E_IO = -1_c_int32_t
@@ -110,6 +110,17 @@ module fk_ext2_m
   integer(c_int64_t), save :: sb_gd_table = 0_c_int64_t
   integer(c_int64_t), save :: sb_inode_table0 = 0_c_int64_t
   integer(c_int32_t), save :: mounted_sb = FK_VFS_NONE
+
+  ! WHY THE LAST OPERATION FAILED, and it exists because a mutation table said
+  ! it had to.  Roadmap 6.2's first suite asserted only that a corrupt
+  ! directory did not resolve -- `vfs_resolve(...) <= 0` -- and TWO defects
+  ! escaped it: with the alignment refusal removed, and with the spans-the-
+  ! block refusal removed, the walk still failed, just for a different reason,
+  ! and an assertion that cannot tell the mechanisms apart cannot tell that the
+  ! right one was removed.  This is the same class as the Fortress port's
+  ! AccessorUnsupported note: a diagnostic that describes the wrong mechanism
+  ! puts the reader, or the test, in the wrong place.
+  integer(c_int32_t), save :: last_status = FK_EXT2_OK
 
   ! The most recently read inode.  A single slot rather than a cache: the block
   ! buffer under it is also a single slot, so a second inode held here could
@@ -511,13 +522,17 @@ contains
 
     call c_f_pointer(name, nb, [int(len, c_size_t)])
 
-    if (ext2_stat(parent_ino) /= FK_EXT2_OK) return
+    last_status = ext2_stat(parent_ino)
+    if (last_status /= FK_EXT2_OK) return
+    last_status = FK_EXT2_E_NOTDIR
     if (iand(st_mode, FK_S_IFMT) /= FK_S_IFDIR) return
-    if (dir_find(nb, len, child_ino) /= FK_EXT2_OK) return
+    last_status = dir_find(nb, len, child_ino)
+    if (last_status /= FK_EXT2_OK) return
 
     ! THE PARENT'S BLOCK BUFFER IS GONE AFTER THIS, and it does not matter:
     ! everything still needed from the directory is in child_ino.
-    if (ext2_stat(child_ino) /= FK_EXT2_OK) return
+    last_status = ext2_stat(child_ino)
+    if (last_status /= FK_EXT2_OK) return
     mode = st_mode
     size = st_size
 
@@ -551,6 +566,7 @@ contains
 
     mounted_sb = FK_VFS_NONE
     status = read_super()
+    last_status = status
     if (status /= FK_EXT2_OK) then
        sb = status
        return
@@ -603,6 +619,13 @@ contains
     if (st_block(0) == 0_c_int64_t) return
     v = st_block(0) * int(sb_sectors_per_block, c_int64_t)
   end function ext2_first_lba
+
+  function ext2_last_status() result(v) bind(c, name="ext2_last_status")
+    implicit none
+    integer(c_int32_t) :: v
+
+    v = last_status
+  end function ext2_last_status
 
   function ext2_mounted_sb() result(v) bind(c, name="ext2_mounted_sb")
     implicit none

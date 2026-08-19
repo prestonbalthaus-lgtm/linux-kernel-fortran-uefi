@@ -90,11 +90,21 @@ case_baseline() { run_case baseline-ext2; run_case baseline-vfs build/run-vfs; }
 
 # THE HANG.  rec_len 0 never advances the offset.  A driver without this does
 # not answer wrongly; it does not answer.
+# TWO REFUSALS AT ONCE, and that is the correction the first run forced.
+# Removing the minimum-rec_len check ALONE escaped, because dir.c:126's
+# name_len check catches rec_len 0 as a side effect: 8 + 1 > 0. The property
+# under test is that the walk TERMINATES, and to isolate it both of the checks
+# that happen to bound rec_len from below have to go. With them both gone the
+# offset never advances and the case is caught BY TIMEOUT, which is the only
+# way this defect can present.
 case_M110() {
   subst src/fs/fk_ext2.f90 \
     $'          if (rec < FK_E2_DIR_MIN_REC) return' \
     $'          if (rec < 0_c_int32_t) return'
-  run_case M110-no-minimum-rec_len-so-the-walk-never-terminates
+  subst src/fs/fk_ext2.f90 \
+    $'          if (FK_E2_DE_NAME + nlen > rec) return' \
+    $'          if (.false.) return'
+  run_case M110-no-lower-bound-on-rec_len-so-the-walk-never-terminates
 }
 
 case_M111() {
@@ -228,7 +238,11 @@ case_M126() {
   subst src/fs/fk_vfs.f90 \
     $'    if (vfs_is_dir(parent) == 0_c_int32_t) return\n    filling = .true.' \
     $'    filling = .true.'
+  # BOTH SUITES. The answer is identical with this guard removed -- fk_ext2.f90
+  # refuses the same thing one layer down -- so only the FILL COUNTER can see
+  # it, and both suites assert on that counter.
   run_case M126-a-file-is-asked-for-its-directory-entries
+  run_case M126-vfs-a-file-is-asked-for-its-directory-entries build/run-vfs
 }
 
 # A negative errno leaked out of the filler would be read as a live dentry

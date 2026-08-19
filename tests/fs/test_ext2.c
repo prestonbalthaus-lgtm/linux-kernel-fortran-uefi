@@ -115,6 +115,7 @@ int64_t ext2_stat_size(void);
 int32_t ext2_stat_links(void);
 int64_t ext2_stat_block(int32_t k);
 int64_t ext2_first_lba(int32_t inode_h);
+int32_t ext2_last_status(void);
 
 void    vfs_reset(void);
 int32_t vfs_resolve(const char *path);
@@ -476,8 +477,15 @@ static void test_seam(void)
 	 * Filling from a file would hand the parser a file's contents to read
 	 * as directory records. */
 	d = vfs_resolve("/bin/init");
+	fills_before = vfs_fills();
 	FK_EQ("looking a name up inside a file misses", 0,
 	      vfs_lookup(d, "x", 1), "%d");
+	/* AND THE FILESYSTEM IS NEVER ASKED. Two guards refuse this -- one in
+	 * vfs_lookup and one in fk_vfs_fill -- so the ANSWER is the same with
+	 * either removed and only the counter distinguishes them. Without this
+	 * row, deleting the VFS-side guard escaped the whole suite. */
+	FK_EQ("without the filesystem being asked at all",
+	      (long long)fills_before, (long long)vfs_fills(), "%lld");
 
 	/* An I/O error must not be reported as "no such file": the name may
 	 * well be there. */
@@ -622,6 +630,14 @@ static void test_dir_refusals(void)
 	long bin_dir = (long)FIX_BIN_BLOCK * FIX_BLOCK_SIZE;
 	int32_t d;
 
+	/* EACH ROW ASSERTS WHICH REFUSAL FIRED, and that is a correction the
+	 * mutation table forced. The first version of these checks asked only
+	 * that the walk did not resolve, and two defects escaped it: with the
+	 * alignment refusal removed, and with the spans-the-block refusal
+	 * removed, the walk still failed -- for a different reason -- and an
+	 * assertion that cannot tell the mechanisms apart cannot notice that
+	 * the right one is gone. ext2_last_status() is what names it. */
+
 	/* THE HANG CASE. rec_len 0 is an offset that never advances; a walk
 	 * without dir.c:122's check does not answer wrongly, it never answers.
 	 * If this test times out rather than failing, that check is gone. */
@@ -629,16 +645,19 @@ static void test_dir_refusals(void)
 	poke16(bin_dir + 4, 0);
 	FK_EQ("rec_len 0 is refused and terminates", 1,
 	      vfs_resolve("/bin/init") <= 0, "%d");
+	FK_EQ("...as corruption", E2_CORRUPT, ext2_last_status(), "%d");
 
 	remount();
 	poke16(bin_dir + 4, 8);
 	FK_EQ("rec_len below the header size is refused", 1,
 	      vfs_resolve("/bin/init") <= 0, "%d");
+	FK_EQ("...as corruption", E2_CORRUPT, ext2_last_status(), "%d");
 
 	remount();
 	poke16(bin_dir + 4, 13);
 	FK_EQ("an unaligned rec_len is refused", 1,
 	      vfs_resolve("/bin/init") <= 0, "%d");
+	FK_EQ("...as corruption", E2_CORRUPT, ext2_last_status(), "%d");
 
 	/* dir.c:126. The first record is ".", rec_len 12, name_len 1. Raising
 	 * name_len past what rec_len can hold makes the name run into the next
@@ -647,6 +666,7 @@ static void test_dir_refusals(void)
 	disk[bin_dir + 6] = 200;
 	FK_EQ("a name_len too big for its rec_len is refused", 1,
 	      vfs_resolve("/bin/init") <= 0, "%d");
+	FK_EQ("...as corruption", E2_CORRUPT, ext2_last_status(), "%d");
 
 	/* dir.c:128. A record whose length carries it past the end of the
 	 * block. */
@@ -654,12 +674,14 @@ static void test_dir_refusals(void)
 	poke16(bin_dir + 4, FIX_BLOCK_SIZE + 4);
 	FK_EQ("a record that spans the block end is refused", 1,
 	      vfs_resolve("/bin/init") <= 0, "%d");
+	FK_EQ("...as corruption", E2_CORRUPT, ext2_last_status(), "%d");
 
 	/* dir.c:130. An inode number no inode table entry can hold. */
 	remount();
 	poke32(bin_dir + 0, 0x7FFFFFFF);
 	FK_EQ("an inode past s_inodes_count is refused", 1,
 	      vfs_resolve("/bin/init") <= 0, "%d");
+	FK_EQ("...as corruption", E2_CORRUPT, ext2_last_status(), "%d");
 
 	/* And with none of that done, the same walk succeeds -- otherwise every
 	 * row above would pass against a driver that simply never works. */
@@ -675,6 +697,28 @@ static void test_dir_refusals(void)
 	       (FIX_BIN_INO - 1) * FIX_INODE_SIZE + 4, 13 * FIX_BLOCK_SIZE);
 	FK_EQ("a directory needing indirection is refused, not truncated", 1,
 	      vfs_resolve("/bin/init") <= 0, "%d");
+
+	/* ext2.h:344's ALIAS, and it escaped the first table because every
+	 * directory in the fixture carries a zero there -- joining a zero high
+	 * half changes nothing. i_size_high and i_dir_acl are the SAME WORD, so
+	 * a directory with an ACL block has a number in the place a regular
+	 * file keeps the top 32 bits of its size. Written here rather than
+	 * formatted in, because mke2fs will not produce one without xattrs. */
+	remount();
+	poke32((long)FIX_INODE_TABLE * FIX_BLOCK_SIZE +
+	       (FIX_BIN_INO - 1) * FIX_INODE_SIZE + 108, 0x1234);
+	FK_EQ("stat /bin with a non-zero i_dir_acl", E2_OK,
+	      ext2_stat(FIX_BIN_INO), "%d");
+	FK_EQ("a directory's size ignores that word entirely",
+	      (long long)FIX_BLOCK_SIZE, (long long)ext2_stat_size(), "%lld");
+	/* And the same word on a REGULAR file is the high half and is used. */
+	remount();
+	poke32((long)FIX_INODE_TABLE * FIX_BLOCK_SIZE +
+	       (FIX_INIT_INO - 1) * FIX_INODE_SIZE + 108, 1);
+	FK_EQ("stat /bin/init with a non-zero i_size_high", E2_OK,
+	      ext2_stat(FIX_INIT_INO), "%d");
+	FK_EQ("a regular file's size joins it", (long long)FIX_INIT_SIZE +
+	      (1LL << 32), (long long)ext2_stat_size(), "%lld");
 
 	/* A block number past the end of the filesystem in i_block[0]. */
 	remount();
