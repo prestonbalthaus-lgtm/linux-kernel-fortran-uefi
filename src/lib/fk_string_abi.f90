@@ -7,9 +7,17 @@
 !
 ! Separate OBJECT as well as separate module: Makefile.boot links this one and
 ! ./Makefile's string test does not.
+!
+! Roadmap 1.1 adds strlen/strcpy/strcmp/strncmp here for a DIFFERENT reason
+! from the four above.  Nothing in gcc emits a call to strlen out of a Fortran
+! loop -- measured, see fk_string.f90's header -- so these four are not here to
+! satisfy the compiler.  They are here because the C spelling is the one a
+! future C payload and every reader expects, and because the split that keeps
+! the differential test linkable has to hold for the whole file or not at all.
 module fk_string_abi_m
   use, intrinsic :: iso_c_binding, only: c_int32_t, c_size_t, c_ptr
-  use fk_string_m, only: fk_memset, fk_memcpy, fk_memmove, fk_memcmp
+  use fk_string_m, only: fk_memset, fk_memcpy, fk_memmove, fk_memcmp, &
+                         fk_strlen, fk_strcpy, fk_strcmp, fk_strncmp
   implicit none
   private
   ! PUBLIC even though nothing in Fortran ever calls them: these four exist to
@@ -18,6 +26,7 @@ module fk_string_abi_m
   ! export and is right to -- a module whose exports are all private is one
   ! whose symbols leave the image by accident.
   public :: c_memset, c_memcpy, c_memmove, c_memcmp
+  public :: c_strlen, c_strcpy, c_strcmp, c_strncmp
 
 contains
 
@@ -57,5 +66,38 @@ contains
 
     r = fk_memcmp(cs, ct, n)
   end function c_memcmp
+
+  function c_strlen(s) result(n) bind(c, name="strlen")
+    implicit none
+    type(c_ptr), intent(in), value :: s
+    integer(c_size_t) :: n
+
+    n = fk_strlen(s)
+  end function c_strlen
+
+  function c_strcpy(dest, src) result(r) bind(c, name="strcpy")
+    implicit none
+    type(c_ptr), intent(in), value :: dest, src
+    type(c_ptr) :: r
+
+    r = fk_strcpy(dest, src)
+  end function c_strcpy
+
+  function c_strcmp(cs, ct) result(r) bind(c, name="strcmp")
+    implicit none
+    type(c_ptr), intent(in), value :: cs, ct
+    integer(c_int32_t) :: r
+
+    r = fk_strcmp(cs, ct)
+  end function c_strcmp
+
+  function c_strncmp(cs, ct, count) result(r) bind(c, name="strncmp")
+    implicit none
+    type(c_ptr), intent(in), value :: cs, ct
+    integer(c_size_t), intent(in), value :: count
+    integer(c_int32_t) :: r
+
+    r = fk_strncmp(cs, ct, count)
+  end function c_strncmp
 
 end module fk_string_abi_m
