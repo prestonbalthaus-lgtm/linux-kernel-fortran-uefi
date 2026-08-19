@@ -16,7 +16,7 @@
 module fk_kmain_m
   use, intrinsic :: iso_c_binding, only: c_int32_t, c_int64_t, c_char, &
                                          c_null_char, c_funloc, c_ptr, &
-                                         c_f_pointer
+                                         c_f_pointer, c_loc
   use fk_serial_m, only: FK_SERIAL_COM1, serial_init, serial_print_string, &
                          serial_print_hex
   use fk_panic_m,  only: panic_code
@@ -108,6 +108,10 @@ module fk_kmain_m
                          fk_fb_info, fb_probe, fb_pixel_pack, fb_note_mapping
   use fk_gop_renderer_m, only: vga_init_framebuffer, vga_fill_rect, &
                          vga_width, vga_height, vga_print_string
+  use fk_vfs_m, only: vfs_reset, vfs_mount, vfs_root, vfs_add, vfs_resolve, &
+                      vfs_dentry_inode, vfs_inode_ino, vfs_inode_size, &
+                      vfs_inode_mode, vfs_dentries_used, vfs_inodes_used
+  use fk_vfs_types_m, only: FK_S_IFDIR, FK_S_IFREG, FK_E_NOTDIR
   use fk_console_m, only: FK_CON_OK, console_init, console_write, &
                          console_print_hex, console_cols, console_rows, &
                          console_ready, fk_console_scrolls
@@ -502,6 +506,44 @@ module fk_kmain_m
        int(z'4E564D450503', c_int64_t)
   integer(c_int64_t), volatile, save, bind(c, name="fk_nvme_state") :: &
        fk_nvme_state(0:20)
+
+  ! roadmap 6.1
+  character(kind=c_char, len=*), parameter :: FK_VFS_START = &
+       "Fortran Kernel: mounting the VFS root (roadmap 6.1)." // FK_CRLF // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_TREE = &
+       "Fortran Kernel: VFS sb/root/bin/init 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_NODE = &
+       "Fortran Kernel: /bin/init ino/size/mode 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_POOLS = &
+       "Fortran Kernel: VFS dentries/inodes in use 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_DONE = &
+       "Fortran Kernel: the VFS resolved /bin/init and refused /bin/init/ (roadmap 6.1)." // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_BAD = &
+       "Fortran Kernel: the VFS bring-up FAILED, status 0x" // c_null_char
+
+  ! The paths are PARAMETERs so gfortran folds the concatenation into one
+  ! .rodata string; in executable code it may lower // to a memmove call.
+  character(kind=c_char, len=*), parameter :: FK_VFS_P_INIT = &
+       "/bin/init" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_P_SLASH = &
+       "/bin/init/" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_N_BIN = "bin" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_N_ETC = "etc" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_N_INIT = "init" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_VFS_N_FSTAB = &
+       "fstab" // c_null_char
+
+  ! [0] magic [1] sb [2] root [3] /bin [4] /bin/init [5] its inode number
+  ! [6] its size [7] its mode [8] dentries in use [9] inodes in use
+  ! [10] what /bin/init/ answered, which must be -ENOTDIR [11] sequence status
+  ! Longest string path_copy is asked to carry is "/bin/init/" plus its NUL.
+  integer(c_int32_t), parameter :: FK_VFS_PBUF = 16_c_int32_t
+  integer(c_int64_t), parameter :: FK_VFSS_MAGIC = &
+       int(z'5646530601', c_int64_t)
+  integer(c_int64_t), volatile, save, bind(c, name="fk_vfs_state") :: &
+       fk_vfs_state(0:11)
 
   ! roadmap 5.2
   character(kind=c_char, len=*), parameter :: FK_KBD_START = &
@@ -3013,6 +3055,144 @@ contains
     fk_dma_probe(3) = FK_DMA_SEED
   end subroutine dma_bringup
 
+  ! roadmap 6.1.  A tree built in memory, not read off the disk: 6.2 is the
+  ! filesystem driver and this is the layer it plugs into.  What the boot adds
+  ! over the host suite is that the walk runs against the REAL fk_strlen, under
+  ! KFLAGS, on a machine that is taking timer interrupts while it does it.
+  subroutine vfs_bringup()
+    implicit none
+    integer(c_int32_t) :: sb, root, bin, etc_d, init_d, ino_h, probe
+    character(kind=c_char), target :: pbuf(FK_VFS_PBUF)
+
+    fk_vfs_state = 0_c_int64_t
+    call serial_print_string(FK_VFS_START)
+    call vfs_reset()
+
+    sb = vfs_mount(FK_VFSS_MAGIC, 4096_c_int64_t, 1_c_int32_t)
+    if (sb <= 0_c_int32_t) then
+       call vfs_failed(sb)
+       return
+    end if
+    root = vfs_root(sb)
+
+    call path_copy(FK_VFS_N_BIN, pbuf)
+    bin = vfs_add(root, c_loc(pbuf(1)), 3_c_int32_t, &
+                  ior(FK_S_IFDIR, int(o'755', c_int32_t)), 0_c_int64_t)
+    if (bin <= 0_c_int32_t) then
+       call vfs_failed(bin)
+       return
+    end if
+    call path_copy(FK_VFS_N_ETC, pbuf)
+    etc_d = vfs_add(root, c_loc(pbuf(1)), 3_c_int32_t, &
+                    ior(FK_S_IFDIR, int(o'755', c_int32_t)), 0_c_int64_t)
+    if (etc_d <= 0_c_int32_t) then
+       call vfs_failed(etc_d)
+       return
+    end if
+    call path_copy(FK_VFS_N_INIT, pbuf)
+    init_d = vfs_add(bin, c_loc(pbuf(1)), 4_c_int32_t, &
+                     ior(FK_S_IFREG, int(o'755', c_int32_t)), 4096_c_int64_t)
+    if (init_d <= 0_c_int32_t) then
+       call vfs_failed(init_d)
+       return
+    end if
+    call path_copy(FK_VFS_N_FSTAB, pbuf)
+    if (vfs_add(etc_d, c_loc(pbuf(1)), 5_c_int32_t, &
+                ior(FK_S_IFREG, int(o'644', c_int32_t)), 64_c_int64_t) &
+        <= 0_c_int32_t) then
+       call vfs_failed(-1_c_int32_t)
+       return
+    end if
+
+    ! The whole point of the milestone, and it is resolved by NAME rather than
+    ! compared against the handle vfs_add returned by luck: the walk has to
+    ! tokenise the path, find "bin" in the root's child list and "init" in
+    ! bin's, and arrive at the same dentry.
+    call path_copy(FK_VFS_P_INIT, pbuf)
+    if (vfs_resolve(c_loc(pbuf(1))) /= init_d) then
+       call vfs_failed(-2_c_int32_t)
+       return
+    end if
+
+    ! And the refusal, which is the half a resolver is most likely to get
+    ! wrong: /bin/init is a file, so a trailing slash is -ENOTDIR.
+    call path_copy(FK_VFS_P_SLASH, pbuf)
+    probe = vfs_resolve(c_loc(pbuf(1)))
+    if (probe /= -FK_E_NOTDIR) then
+       call vfs_failed(-3_c_int32_t)
+       return
+    end if
+
+    ino_h = vfs_dentry_inode(init_d)
+
+    call serial_print_string(FK_VFS_TREE)
+    call serial_print_hex(int(sb, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(root, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(bin, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(init_d, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_VFS_NODE)
+    call serial_print_hex(vfs_inode_ino(ino_h), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(vfs_inode_size(ino_h), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(vfs_inode_mode(ino_h), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_VFS_POOLS)
+    call serial_print_hex(int(vfs_dentries_used(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(vfs_inodes_used(), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    fk_vfs_state(0) = FK_VFSS_MAGIC
+    fk_vfs_state(1) = int(sb, c_int64_t)
+    fk_vfs_state(2) = int(root, c_int64_t)
+    fk_vfs_state(3) = int(bin, c_int64_t)
+    fk_vfs_state(4) = int(init_d, c_int64_t)
+    fk_vfs_state(5) = vfs_inode_ino(ino_h)
+    fk_vfs_state(6) = vfs_inode_size(ino_h)
+    fk_vfs_state(7) = int(vfs_inode_mode(ino_h), c_int64_t)
+    fk_vfs_state(8) = int(vfs_dentries_used(), c_int64_t)
+    fk_vfs_state(9) = int(vfs_inodes_used(), c_int64_t)
+    fk_vfs_state(10) = int(probe, c_int64_t)
+    fk_vfs_state(11) = 0_c_int64_t
+
+    call serial_print_string(FK_VFS_DONE)
+    call serial_print_string(FK_NL)
+  end subroutine vfs_bringup
+
+  subroutine vfs_failed(st)
+    implicit none
+    integer(c_int32_t), intent(in) :: st
+
+    call serial_print_string(FK_VFS_BAD)
+    call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+    fk_vfs_state(0) = FK_VFSS_MAGIC
+    fk_vfs_state(11) = int(st, c_int64_t)
+  end subroutine vfs_failed
+
+  ! A parameter string copied into storage whose address can be taken.  c_loc
+  ! needs a TARGET and a named constant is not one; a character SCALAR with a
+  ! length parameter is not interoperable either, so the copy lands in an array
+  ! of c_char and the caller takes the address of its first element.
+  subroutine path_copy(s, buf)
+    implicit none
+    character(kind=c_char, len=*), intent(in) :: s
+    character(kind=c_char), intent(out) :: buf(:)
+    integer(c_int32_t) :: k, n
+
+    n = min(int(len(s), c_int32_t), int(size(buf), c_int32_t))
+    do k = 1_c_int32_t, n
+       buf(k) = s(k:k)
+    end do
+  end subroutine path_copy
+
   subroutine acpi_bringup(mbi)
     implicit none
     integer(c_int64_t), intent(in) :: mbi
@@ -3481,6 +3661,8 @@ contains
     status = heap_bringup()
 
     call dma_bringup()
+
+    call vfs_bringup()
 
     ! roadmap 4.0's second half.  Last, because from here on this routine is
     ! one of three threads rather than the only one, and everything above

@@ -99,6 +99,8 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/mm/fk_efi_mmap.f90 \
                src/mm/fk_pmm.f90 \
                src/lib/fk_string.f90 \
+               src/fs/fk_vfs_types.f90 \
+               src/fs/fk_vfs.f90 \
                src/drivers/video/fk_fbinfo.f90 \
                src/drivers/video/fk_font_8x16.f90 \
                src/drivers/video/fk_gop_renderer.f90 \
