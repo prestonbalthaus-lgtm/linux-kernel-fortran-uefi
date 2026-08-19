@@ -276,8 +276,35 @@ case_S133() {
   boot_case S133-boot-the-syscall-tail-does-not-skip-int_no-and-err_code
 }
 
+# THE GATE THAT HAD NEVER REFUSED.  sysretcheck-boot asserts a NEGATIVE -- that
+# the image contains no SYSRET -- and a check of that shape passes trivially
+# when it is broken, so its green means nothing until it has been shown going
+# red.  This one needs no boot and no QEMU: the gate is an objdump.
+#
+# Its second assertion, `grep -q iretq boot/interrupts.S`, is NOT tested here
+# and cannot usefully be: irq_common has carried an IRETQ since roadmap 3.2b,
+# so that grep succeeds whatever the syscall stub's tail becomes. It is
+# decoration; the objdump half is the gate. S133 is what actually covers the
+# stub's tail, and it needs a boot to do it.
+case_S134() {
+  subst boot/interrupts.S \
+    $'fk_do_syscall:\n\tsyscall\n\tret' \
+    $'fk_do_syscall:\n\tsyscall\n\tsysretq\n\tret'
+  local rc line
+  timeout -k 10 900 ./tools/run.sh sysretcheck-boot >"$OUT/S134.log" 2>&1
+  rc=$?
+  line=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/S134.log" | grep -aE "FAIL|OK " \
+         | head -2 | tr -d '\r' | sed 's/^ *//' | paste -sd'|')
+  if [ $rc -eq 0 ]; then
+    echo "S134-a-SYSRET-in-the-image: gate PASSED  <-- ESCAPE :: $line"
+  else
+    echo "S134-a-SYSRET-in-the-image: gate FAILED (caught) :: $line"
+  fi
+  restore
+}
+
 CASES="baseline S110 S111 S112 S113 S114 S115 S116 S117 S118 S119 \
-       S120 S121 S122 S123 S124 S125 S130 S131 S132 S133"
+       S120 S121 S122 S123 S124 S125 S134 S130 S131 S132 S133"
 
 SELECT="$*"
 want_case() {
