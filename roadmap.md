@@ -37,11 +37,19 @@ string half, then the VFS -- and 6.2 is what they were for: a `vfs_lookup` MISS
 now means "read the directory off the NVMe drive", which is the promise 6.1's
 header made in as many words.
 
-**6.3 IS DONE AND IS NOT ON THIS BRANCH.** It is `phase6/syscall-trap`, PR #35,
-and its box below is still open here because its tick travels with it. The two
-were built off the same master deliberately -- they share no code and the
-stacked-PR lesson is three days old -- so whichever merges second gets rebased,
-re-verified on the rebased tip, and brings the other tick with it.
+**6.3 IS DONE AND IS NOT ON MASTER RIGHT NOW**, which is why its box below is
+still open. It landed as PR #35 and was then REVERTED by PR #36, so master's
+tree went back to exactly `ff80fe0`'s. It comes back as a revert OF that revert,
+because `phase6/syscall-trap`'s commits are already ancestors of master and
+re-merging the branch would bring nothing -- git considers them merged and says
+`Already up to date`.
+
+That is worth writing down rather than discovering twice: **reverting a merge
+does not un-merge the branch.** The branch is still in the history, so the only
+way to bring the work back is to revert the revert. The two milestones were
+built off the same master deliberately -- they share no code -- and this one was
+rebased onto the post-revert master and re-verified on the rebased tip rather
+than inheriting a green earned on a base that no longer exists.
 
 **The number 6.2 exists for**, printed by the running kernel off a real
 controller, and matched by `debugfs` reading the same image:
@@ -55,7 +63,7 @@ at a 1 KiB block is LBA 102.
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 6.3 | the syscall ABI trap | DONE, on `phase6/syscall-trap` as PR #35 | review, and a rebase if this branch lands first |
+| 6.3 | the syscall ABI trap | DONE. Landed as #35, reverted by #36, and returns as a revert of that revert | nothing but the button |
 | 6.4 | the ELF loader | BOTH prerequisites are now paid: 1.1 gave it strings and 6.2 gives it something to load a binary out of | nothing. It is also where the SINGLY-INDIRECT BLOCK gets written -- 6.2 implements twelve direct blocks, 12 KiB, which will not hold a BusyBox and refuses `-EFBIG` rather than truncating |
 | 7.1 | the Ring 3 drop | 6.3 built the path and stopped one step short of it on purpose | 6.3 landing |
 | 7.2 | boot /bin/init (BusyBox) | 6.2 can find it and 6.4 will load it | 6.4, and 6.4's indirect block |
