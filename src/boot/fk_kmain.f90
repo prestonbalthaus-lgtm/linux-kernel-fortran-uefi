@@ -2684,8 +2684,12 @@ contains
     call serial_print_string(FK_PMM_SLASH)
     call serial_print_hex(madt_ioapic_addr(0_c_int32_t), 16_c_int32_t)
     call serial_print_string(FK_PMM_SLASH)
+    ! EIGHT DIGITS, not four.  A GSI base read from the wrong offset picks up
+    ! the IOAPIC's own address, 0xFEC00000, whose low sixteen bits are zero --
+    ! so at four digits a wrong answer printed exactly like the right one and
+    ! mutation M44 walked through the gate.
     call serial_print_hex(int(madt_ioapic_gsi_base(0_c_int32_t), c_int64_t), &
-                          4_c_int32_t)
+                          8_c_int32_t)
     call serial_print_string(FK_NL)
 
     call serial_print_string(FK_MADT_ISO)

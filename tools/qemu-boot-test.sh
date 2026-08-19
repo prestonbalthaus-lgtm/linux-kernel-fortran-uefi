@@ -136,7 +136,7 @@ RWX'
 # the only fact in this run derived from TWO sources -- the MADT's own header
 # and the IA32_APIC_BASE readback from 3.3.
 FK_ACPI_PASS_LINES=$'Fortran Kernel: MADT cpus total/enabled/skipped 0x0006/0x0006/0x0000
-Fortran Kernel: MADT ioapics/first-addr/gsi-base 0x0001/0x00000000FEC00000/0x0000
+Fortran Kernel: MADT ioapics/first-addr/gsi-base 0x0001/0x00000000FEC00000/0x00000000
 Fortran Kernel: MADT overrides/IRQ0-GSI 0x0005/0x0002
 Fortran Kernel: MADT NMI entries/LINT 0x0001/0x01
 Fortran Kernel: MADT and IA32_APIC_BASE agree on 0x00000000FEE00000'
