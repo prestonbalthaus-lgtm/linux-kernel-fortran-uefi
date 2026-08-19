@@ -66,7 +66,9 @@ run_case() {
   line=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$name.log" \
          | grep -aE "^(QEMU EXITED|THE HARDWARE|COM1 CARRIED|Sentinel assertion)|^  FAIL  |^      (MISSING|PRESENT)  :|^    no  " \
          | head -3 | tr -d '\r' | sed 's/^ *//' | paste -sd'|')
-  if [ $rc -eq 0 ]; then echo "$name: boot gate PASSED  <-- ESCAPE :: $line"
+  if [ $rc -eq 0 ]; then
+    if [ "$name" = baseline ]; then echo "$name: boot gate PASSED :: $line"
+    else echo "$name: boot gate PASSED  <-- ESCAPE :: $line"; fi
   else                   echo "$name: boot gate FAILED (caught) :: $line"; fi
   restore
 }
