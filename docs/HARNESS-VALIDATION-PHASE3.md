@@ -264,7 +264,10 @@ Both escapes bound what the boot gate proves. Frame *layout* is proven by the
 cross-check table above, not by the grep.
 
 **What no mutation here covers.** IST1 only: `ist2..ist7` are zero and no other
-vector asks for a stack, so NMI and #MC still arrive on the faulting stack. And
+vector asks for a stack, so NMI and #MC still arrive on the faulting stack.
+Superseded for NMI by 3.3's prerequisite work: vector 2 asks for one too and
+`fk_nmi_stack` is on IST2. `ist3..ist7` are still zero, #MC still arrives on the
+faulting stack, and no mutation here touches IST2. And
 every result above is QEMU's device model, not silicon — `elcr`, real 8259
 timing, and a real TSS-descriptor cache are all unexercised.
 
@@ -372,7 +375,7 @@ different door: there it was mtime, here it was an exit status.
 Three channels again, and a fourth that is new: a host suite that can read the
 kernel's own bitmap.
 
-### 1. The host suite (`build/run-pmm`, 390 checks)
+### 1. The host suite (`build/run-pmm`, 390 checks at this milestone — 746 today)
 
 `tests/mm/test_pmm.c` assembles real Multiboot2 information structures byte by
 byte, hands their address to `pmm_init`, and then compares `fk_pmm_bitmap`
@@ -436,6 +439,10 @@ anywhere else:
     PASS  fk_kernel_phys_start returns __kernel_phys_start = 0x100000
     PASS  fk_kernel_phys_end returns __kernel_phys_end = 0x314000
 
+Two of those seven track the image's size and have moved with it: the gate
+prints 2246560 bytes of NOBITS and `__kernel_phys_end = 0x33a000` on the current
+tree. The other five still read exactly as above.
+
 `FK_PMM_IDMAP_BYTES` is the `KERNEL_VMA` problem again: an assembler `.set`
 cannot be imported into Fortran, so the value is duplicated and diffed here. If
 this one drifts, the check that refuses an unmapped MBI accepts it instead.
@@ -452,7 +459,7 @@ not opt-in, because the shipped image prints them:
 
     Fortran Kernel: PMM reserved and ACPI frames are all marked used.
     Fortran Kernel: PMM locked the kernel image and the loader map out.
-    Fortran Kernel: PMM allocated 5 contiguous frames.
+    Fortran Kernel: PMM allocated 5 distinct, aligned frames.
     Fortran Kernel: PMM freed and reclaimed the same 5 frames.
     Fortran Kernel: PMM refused a double, unaligned and locked free.
     Fortran Kernel: PMM rewound its scan cursor to a freed frame.
@@ -576,7 +583,11 @@ machine word is testing the word, not the algorithm.**
   That is roadmap 3.5's, and until then an allocation above the identity window
   is a number, not memory.
 * **`pmm_verify` assumes at least 101 free frames at the bottom of RAM** — 5 for
-  the contiguity test and 96 for the cursor one. QEMU's low region has 158, and
+  the alloc/reclaim test and 96 for the cursor one. What it is no longer allowed
+  to assume is that they are ADJACENT: the UEFI map fragments the low region, so
+  the verdict says distinct and aligned rather than contiguous, and the cursor
+  test frees the addresses it remembered rather than recomputing them from the
+  base. QEMU's low region has 158, and
   a conventional PC's has about the same, so this holds everywhere the kernel
   has run. On a machine whose first available region is smaller the block would
   not be contiguous, the computed-address frees would refuse, and the CURSOR
@@ -618,15 +629,15 @@ long.
     FK_REJECT_SERIAL=$'*** #DF ENTERED ON THE FAULTING STACK -- NO IST SWITCH ***\nFortran Kernel: the deliberate fault did NOT trap.\nFortran Kernel: 8259 PIC mask readback FAILED.' \
     FK_CHECK_HW=1 tools/qemu-boot-test.sh         # 3.2.5
 
-    ./tools/run.sh build/run-pmm                  # roadmap 3.4, 390 host checks
+    ./tools/run.sh build/run-pmm                  # roadmap 3.4, 746 host checks
     FK_MEM=4G tools/qemu-boot-test.sh             # the map tracks -m: see above
     FK_EXPECT_SERIAL=$'*** PMM OUT OF MEMORY ***\nEXCEPTION 0x03 ERR 0x0000000000000000 -- #BP Breakpoint' \
       tools/qemu-boot-test.sh                     # after sedding FK_FAULT_MODE to -1
 
-    tools/qmp-sentinel.py selftest                # 30 assertion checks, no VM
+    tools/qmp-sentinel.py selftest                # 103 assertion checks, no VM
     FK_CHECK_HW=1 tools/qemu-boot-test.sh         # 3.2b: the shipped no-fault build
 
-    tools/mutate-phase3.sh                        # the whole table, 40 boots
+    tools/mutate-phase3.sh                        # the whole table, 46 boots
     tools/mutate-phase3.sh M10 M13                # or just these
     tools/mutate-phase3.sh baseline_guard         # roadmap 3.5's two #PF builds
     tools/mutate-phase3.sh baseline_idmap
@@ -653,7 +664,7 @@ Three channels again, and this milestone adds a fourth kind of evidence that the
 earlier ones could not produce: **the kernel reads its own page tables back and
 prints what it finds, before it loads any of them into CR3.**
 
-### 1. The static gate (`tools/linkscript-test.sh`, 145 checks)
+### 1. The static gate (`tools/linkscript-test.sh`, 145 checks at this milestone — 176 today)
 
 Two things moved here.
 
@@ -848,6 +859,14 @@ be delivered. The self-test carries both directions -- a master left fully
 masked is rejected, and so is a slave with a line open, because nothing in this
 machine drives one.
 
+ROADMAP 3.3 INVERTS IT BACK, and with it the master direction of that self-test.
+The IOAPIC carries IRQ0 now, `pic_disable` masks both chips before the route
+lands, and `tools/qmp-sentinel.py` demands `0xFF` on both again -- so a fully
+masked master is the ACCEPTED state today, and a master left at `0xFE` is
+REJECTED: a line live on the 8259 and on the IOAPIC at once is delivered twice,
+and only the chip the handler was told about is acknowledged. The slave case
+stands as written.
+
 ### 4. The one the kernel cannot say about itself
 
 Everything above is a line the kernel printed, and every one of them stays true
@@ -920,7 +939,7 @@ in a register dump.
 | M28 | the IRQ tail ends in `jmp fk_cpu_halt` instead of IRETQ — i.e. the tree exactly as it was before this milestone | **caught** — COM1 stops dead after the `RFLAGS.IF is set` line. The first timer interrupt is the last thing the CPU does |
 | M29 | `addq $16, %rsp` dropped before IRETQ | **caught** — `EXCEPTION 0x0D ERR 0x0000000000000000 -- #GP`. IRETQ read the line number the stub pushed as the return RIP |
 | M30 | the EOI deleted | **caught, and it is the case `FK_TICK_TARGET = 3` exists for** — `IRQ0 never reached the tick target`, a line the gate forbids. One interrupt was delivered and the chip then went quiet |
-| M31 | IRQ0 never unmasked | **caught three ways** — `8259 master IMR is 0xFF (want 0xFE)` from the device model, 0 ticks from guest memory, and the kernel's own `IRQ0 is STILL MASKED after the unmask.` |
+| M31 | IRQ0 never unmasked | **caught three ways** — `8259 master IMR is 0xFF (want 0xFE)` from the device model, 0 ticks from guest memory, and the kernel's own `IRQ0 is STILL MASKED after the unmask.` Superseded at 3.3: `MASTER_IMR` is 0xFF again so the device-model leg now passes a fully masked master, and `ioapic_bringup` routes IRQ0 whatever the 8259 unmask did so the ticks keep coming. Today M31 is caught on the serial channel alone. |
 | M32 | vectors 32-47 left not-present | **caught** — `EXCEPTION 0x0D ERR 0x0000000000000103 -- #GP`. Error code `0x103` is `(32 << 3) | 0b011`: the CPU naming vector 32, in the IDT, from an external interrupt. It is 3.2's "an unhandled vector must fault rather than jump to a zeroed offset" arriving from the other side |
 | M33 | the three OUTs in `pit_init` deleted | **ESCAPE** — see below |
 

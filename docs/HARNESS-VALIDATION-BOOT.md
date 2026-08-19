@@ -54,7 +54,7 @@ and in those five images the header is valid. It is the reason
 sufficient** condition, and why the QEMU gate exists.
 
 The assertion logic itself is self-tested without any VM: `tools/qemu-boot-test.sh
---selftest` proves the sentinel contract accepts a correct record and rejects eight wrong
+--selftest` proves the sentinel contract accepts a correct record and rejects seven wrong
 ones — including the interesting case where every static word is right but word 3 was
 derived from the *wrong* magic, which is exactly what a kernel storing constants would
 produce. `--smoke` proves the QMP/pmemsave plumbing works against a kernel-less guest and
@@ -91,13 +91,25 @@ exited **0**.
 
 ## What is still NOT proven
 
-* **UEFI.** The harness boots the BIOS/GRUB path. `-bios OVMF.fd` (roadmap 0.3) is not
-  wired up, and the EFI stage-1 described in `linker.ld` does not exist. Nothing here is
-  evidence about the Minisforum's actual firmware path.
+* **UEFI.** SUPERSEDED BY 0.3: the harness boots BOTH paths, `FK_FIRMWARE=uefi` running
+  the same assertions against OVMF -- as two pflash drives, not `-bios OVMF.fd` -- that the
+  default runs against SeaBIOS. What is still true is that the EFI stage-1 described in
+  `linker.ld` does not exist: GRUB is the EFI application and this image is its Multiboot2
+  payload. Nothing here is evidence about the Minisforum's actual firmware path.
 * **Real hardware.** KVM on one host CPU model.
 * **The framebuffer.** No framebuffer is requested (roadmap 2.2), so the renderer has
-  still never put a pixel on a screen.
+  still never put a pixel on a screen. SUPERSEDED BY 2.2 AND 2.4: header tag 5 asks for a
+  mode, `qmp-sentinel.py fb` reads the pixels back out of the running guest on every gated
+  boot and matches the status bar against the kernel's own font table glyph for glyph --
+  on the BIOS path, and under OVMF since `insmod all_video` landed in the ISO's grub.cfg.
 * **`-smp 6` is a resource allocation, not a claim.** Only CPU 0 is ever brought up;
-  the other five are parked by firmware. SMP bring-up is roadmap 4.1.
+  the other five are parked by firmware. 4.1 has landed and only COUNTS them, out of the
+  MADT; no roadmap box brings them up.
 * **The identity map is still live** after the higher-half jump, because GDTR holds a
   physical base. Unmapping `PML4[0]` is roadmap 3.5 work and must reload GDTR first.
+  SUPERSEDED BY 3.5, AND THE PREMISE WAS WRONG: `vmm_drop_identity` zeroes `PML4[0]` and
+  reloads CR3 on every boot, and the gate requires the line `PML4[0] unmapped; the
+  identity window is dead.` GDTR had held a higher-half base since 3.1 -- `gdt_init`
+  builds it from `c_loc(gdt)` -- so it was never the obstacle; `vmm_activate` reloads it
+  anyway, for the far return in `gdt_flush` that discards the boot stub's hidden segment
+  state.

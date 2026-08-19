@@ -97,8 +97,11 @@ gates before it was caught by a third*:
 That check is **white-box and is labelled as such in the script**: it asserts a
 spelling, not a semantics. `movzbl %al,%eax` after the `IN` would satisfy it and be
 correct; an instruction that wrote `EAX` and then clobbered it would satisfy it and
-not be. It is a tripwire on a property no behavioural test in this tree can reach,
-and it is worth having for exactly that reason — but it should not be read as proof.
+not be. At 2.1 it was a tripwire on a property no behavioural test in this tree could
+reach, and it was worth having for exactly that reason — but it should not be read as
+proof. SUPERSEDED AT 3.2b: `pic_imr` ors two full-width `fk_inb` results and the kernel
+prints all eight nibbles of the answer, which the boot gate matches as the fixed string
+`0x0000FFFE`. The property is behavioural now, on a line the gate already asserts.
 
 **Result: 16 mutations, 16 caught, 0 escapes** — with the honest qualification that
 M15 is caught by an instruction-pattern check rather than by observing wrong
@@ -122,10 +125,15 @@ Recorded rather than quietly omitted, in the manner of
    this: the *constants* are the kernel's own, whatever the mock does with them.
 4. **Receive.** `fk_inb` is exercised only for line-status polling and the loopback
    probe. There is no receive path in roadmap 2.1, so nothing tests one.
-5. **Concurrency.** The driver has no locking and the boot path is single-threaded
-   by construction (`-smp 6` is configured, but only one CPU is started). Two CPUs
-   printing at once would interleave mid-character. That is roadmap 3.3's problem
-   and nothing here would notice it today.
+5. **Concurrency.** The driver has no locking and the boot path was single-threaded
+   by construction when this was written (`-smp 6` is configured, but only one CPU is
+   started). Two CPUs printing at once would interleave mid-character. That is roadmap
+   3.3's problem and nothing here would notice it today.
+
+   SUPERSEDED BY 3.7: the interleave no longer needs a second CPU. One CPU now runs
+   three preemptible tasks, and the spawned threads write to the CONSOLE rather than
+   COM1 for exactly that reason -- `console_write` runs with IF clear and the serial
+   driver has no such bracket. Still unlocked, and still nothing here would notice.
 
 ## Reproducing
 

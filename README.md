@@ -9,9 +9,9 @@ oracles. Assembly is used only for the handful of things Fortran cannot express:
 the long-mode boot stub, port I/O, `cli`/`hlt`, the interrupt stubs, and the
 descriptor/control-register instructions.
 
-**On the name:** the kernel boots today through **Multiboot2 / GRUB** (the BIOS
-path). UEFI is the eventual target, not a current feature — nothing here has
-ever booted via UEFI yet.
+**On the name:** the kernel boots today through **Multiboot2 / GRUB**, and the
+same hybrid ISO comes up on both firmwares — SeaBIOS, and OVMF since roadmap
+0.3. GRUB is the EFI application; there is no `BOOTX64.EFI` of our own.
 
 ## What works today
 
@@ -21,18 +21,28 @@ ever booted via UEFI yet.
   that prints a full register dump
 - 8259 PIC remapped and masked; 8254 PIT at 100 Hz; interrupts that return
 - Physical memory manager — bitmap allocator over the Multiboot2 memory map
+  (tag 6), or the UEFI GetMemoryMap array (tag 17) on the UEFI path
 - Virtual memory manager — 4-level paging, per-section W^X + NX, a linear map
   of physical RAM, and a guard page under the boot stack
 - Kernel heap — implicit free list with boundary tags, coalescing both ways
 - Preemptive round-robin scheduler running two kernel threads off the timer
-- GOP framebuffer, 8x16 bitmap font, software renderer, and a scrolling console
+- GOP framebuffer, 8x16 bitmap font, software renderer, and a scrolling console,
+  on both firmware paths
+- Local APIC and I/O APIC — IRQ0 routed through the IOAPIC to GSI 2 with both
+  8259s masked, and EOI at the LAPIC
+- ACPI: RSDP, RSDT/XSDT, the MADT, and the MCFG that gives PCIe its ECAM window
+- PCIe enumeration through ECAM, configuration reads and writes, the capability
+  walk, and MSI-X discovery
+- An xHCI controller brought up from reset: command and event rings in
+  physically contiguous memory, a NO-OP command executed, and its MSI-X
+  interrupt delivered
 - `memset` / `memcpy` / `memmove` / `memcmp` and 7 integer-math routines,
   all translated from Linux and byte-compared against it
 
 ## Not done yet
 
-UEFI boot, Local APIC, ACPI/MADT, PCIe enumeration, xHCI/USB, NVMe, a VFS,
-syscalls, an ELF loader, and ring 3. See `roadmap.md` for the full plan.
+A USB keyboard driver, NVMe, a VFS, syscalls, an ELF loader, and ring 3.
+See `roadmap.md` for the full plan.
 
 ## Building
 
@@ -54,8 +64,15 @@ Then use the wrapper, which runs `make` inside that container:
 To actually boot it, from the host (needs QEMU):
 
 ```sh
-tools/qemu-boot-test.sh   # boots the ISO headless and asserts guest state over QMP
+tools/qemu-boot-test.sh                    # SeaBIOS, q35, headless
+FK_FIRMWARE=uefi tools/qemu-boot-test.sh   # the same ISO through OVMF
+FK_MACHINE=pc tools/qemu-boot-test.sh      # the board with no ECAM window
 ```
+
+It boots the ISO headless and asserts guest state over QMP: the framebuffer's
+pixels against the kernel's own font table, the PCIe bus against QEMU's `info
+pci`, the DMA run at its physical base, the xHCI's rings where the controller
+wrote them, and the timer still ticking between two reads.
 
 ## Testing
 

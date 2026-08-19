@@ -339,6 +339,8 @@ check.
 
 **4. `Makefile`** — pin `-fwrapv` with a comment marking it correctness-critical, and add a CI
 job running the differential suite under the full `KFLAGS` so A-5 stops being an assumption.
+Landed as the `kflags-test` target rather than a CI job — this repository has no CI — and
+`make audit` runs it.
 
 ---
 
@@ -354,3 +356,8 @@ $ bash tools/compliance.sh   →  8/8 comply
 ```
 
 Phase 2 remains blocked pending review of this report.
+
+> **Superseded.** It was reviewed and the gate patches merged. Phase 2 shipped — 2.1
+> through 2.4 all ticked, the framebuffer and the renderer live on both firmware paths —
+> and Phases 3 and 4 and roadmap 5.1 have landed since. This line is the state on
+> 2026-08-12, not current status.
