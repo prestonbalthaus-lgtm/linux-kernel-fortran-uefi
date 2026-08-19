@@ -3291,6 +3291,112 @@ def do_selftest():
                       "-ENOTDIR is rejected",
                words=vf_words(w10=(1 << 64) - 2))
 
+    # ---- roadmap 6.3 ------------------------------------------------------
+    # THE ENTRY ADDRESS IS A PARAMETER OF THE CHECK, so the fixture supplies
+    # both sides and can make them disagree.  Against the real guest one side
+    # comes from the register and the other from kernel.elf's symbol table.
+    SC_ENTRY = 0xFFFFFFFF80101234
+
+    def sc_words(**kw):
+        w = [0] * SYSCALL_WORDS
+        w[0] = SYSCALL_MAGIC
+        w[1] = 0
+        w[2] = KERNEL_CS << 32
+        w[3] = SC_ENTRY
+        w[4] = SYSCALL_FMASK
+        w[5] = 0xD01
+        w[6] = 3
+        w[7] = SYS_NR_EXIT
+        w[8] = 0
+        w[9] = 2
+        w[10] = 0
+        w[11] = 0
+        for k, v in kw.items():
+            w[int(k[1:])] = v
+        return w
+
+    def expect_syscall(ok_wanted, what, words=None, entry=SC_ENTRY):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_syscall(
+            sc_words() if words is None else words, entry))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} "
+                  f"(wanted {ok_wanted}, got {got})")
+            fail_n += 1
+
+    expect_syscall(True, "a complete, correct syscall bring-up is accepted")
+    expect_syscall(False, "a state block with no magic is rejected",
+                   words=sc_words(w0=0))
+    expect_syscall(False, "a non-zero bring-up status is rejected",
+                   words=sc_words(w11=(1 << 64) - 100))
+    expect_syscall(False, "a non-zero syscall_init status is rejected",
+                   words=sc_words(w1=(1 << 64) - 3))
+
+    # THE GDT CONTRACT.  CS comes from STAR[47:32] and SS from that PLUS
+    # EIGHT, so a STAR naming the DATA selector gives the CPU a data
+    # descriptor for CS and whatever follows it for SS.
+    expect_syscall(False, "a STAR naming the kernel DATA selector is rejected",
+                   words=sc_words(w2=KERNEL_DS << 32))
+    expect_syscall(False, "a STAR with a null selector is rejected",
+                   words=sc_words(w2=0))
+    expect_syscall(False, "a STAR whose selector carries an RPL is rejected",
+                   words=sc_words(w2=(KERNEL_CS | 3) << 32))
+    expect_syscall(False, "a non-zero 32-bit legacy target is rejected",
+                   words=sc_words(w2=(KERNEL_CS << 32) | 0x1000))
+    # THE ONE THAT MATTERS MOST, because it is the mistake a reader of the
+    # Linux source would make: copying __USER32_CS into the sysret half while
+    # the GDT still has no Ring 3 descriptors for it to name.
+    expect_syscall(False, "a plausible-looking sysret half is rejected -- "
+                          "there are no Ring 3 descriptors for it to name",
+                   words=sc_words(w2=(0x23 << 48) | (KERNEL_CS << 32)))
+
+    expect_syscall(False, "an LSTAR that is not the ELF's fk_syscall_entry is "
+                          "rejected", words=sc_words(w3=SC_ENTRY + 0x10))
+    expect_syscall(False, "a low-half LSTAR is rejected", entry=0x101234,
+                   words=sc_words(w3=0x101234))
+    expect_syscall(False, "a zero LSTAR is rejected", entry=0,
+                   words=sc_words(w3=0))
+
+    expect_syscall(False, "an FMASK missing IF is rejected",
+                   words=sc_words(w4=SYSCALL_FMASK & ~EFLAGS_IF))
+    expect_syscall(False, "an FMASK missing DF is rejected",
+                   words=sc_words(w4=SYSCALL_FMASK & ~EFLAGS_DF))
+    expect_syscall(False, "an FMASK missing NT is rejected",
+                   words=sc_words(w4=SYSCALL_FMASK & ~EFLAGS_NT))
+    # A BLANKET MASK WOULD PASS EVERY "is this flag in it" ROW, which is why
+    # the check also refuses bits that must NOT be masked.
+    expect_syscall(False, "a blanket 0x3FFFFF mask is rejected",
+                   words=sc_words(w4=0x3FFFFF))
+    expect_syscall(False, "a zero FMASK is rejected", words=sc_words(w4=0))
+
+    expect_syscall(False, "EFER without SCE is rejected -- SYSCALL would be "
+                          "#UD", words=sc_words(w5=0xD00))
+
+    expect_syscall(False, "zero calls is rejected -- the MSRs can be perfect "
+                          "and the instruction still not arrive",
+                   words=sc_words(w6=0))
+    expect_syscall(False, "one call is rejected -- a stub that corrupts its "
+                          "own stack survives the first and not the second",
+                   words=sc_words(w6=1))
+    expect_syscall(False, "a last number that is not exit is rejected",
+                   words=sc_words(w7=SYS_NR_WRITE))
+
+    # THE FMASK ASSERTION ITSELF, which is the row the whole flag list is for.
+    expect_syscall(False, "a surviving IF is rejected",
+                   words=sc_words(w9=0x202, w10=EFLAGS_IF))
+    expect_syscall(False, "a surviving DF is rejected",
+                   words=sc_words(w9=0x402, w10=EFLAGS_DF))
+    # AN ALL-ZERO RFLAGS IS NOT EVIDENCE.  Bit 1 is architecturally always
+    # set, so a zero here means the register was never read rather than that
+    # every flag was cleared -- which would make the row above pass for the
+    # wrong reason.
+    expect_syscall(False, "an all-zero entry RFLAGS is rejected -- bit 1 is "
+                          "architecturally always set",
+                   words=sc_words(w9=0))
+
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
 
