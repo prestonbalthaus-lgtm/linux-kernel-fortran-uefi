@@ -48,6 +48,7 @@ module fk_kmain_m
                          xhci_usbsts, xhci_crcr, xhci_erdp, xhci_dcbaap, &
                          xhci_halted, &
                          xhci_page_size
+  use fk_usb_kbd_m, only: usbkbd_bringup, fk_usbkbd_state
   use fk_pcie_types_m, only: FK_PCI_CMD_MEMORY_BIT, FK_PCI_CMD_MASTER_BIT, &
                              FK_PCI_CMD_INTX_DISABLE_BIT, &
                              FK_PCI_MSIX_CTRL_ENABLE_BIT, &
@@ -446,6 +447,35 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_XHCI_NOEVENT = &
        "Fortran Kernel: the xHCI never completed the NO-OP; no event arrived." // &
        FK_CRLF // c_null_char
+  ! roadmap 5.2
+  character(kind=c_char, len=*), parameter :: FK_KBD_START = &
+       "Fortran Kernel: USB looking for a HID keyboard (roadmap 5.2)." // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_KBD_NOMEM = &
+       "Fortran Kernel: the PMM refused a contiguous run for the keyboard." // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_KBD_PORT = &
+       "Fortran Kernel: USB port/portsc/speed 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_KBD_SLOT = &
+       "Fortran Kernel: USB slot/address/state 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_KBD_DEV = &
+       "Fortran Kernel: USB mps0/config/interface 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_KBD_EP = &
+       "Fortran Kernel: USB EP1 addr/maxpkt/interval 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_KBD_CTX = &
+       "Fortran Kernel: USB device/input ctx/report buffer 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_KBD_OK = &
+       "Fortran Kernel: the USB keyboard is addressed, configured and polling (roadmap 5.2)." // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_KBD_BAD = &
+       "Fortran Kernel: the USB keyboard bring-up FAILED, status 0x" // &
+       c_null_char
+
+  ! Six pages, one run: device context, input context, EP0's transfer ring,
+  ! EP1's, the descriptor buffer and the report buffer.  One physical base is
+  ! one thing for the host to check, which is 5.1's argument unchanged.
+  integer(c_int64_t), parameter :: FK_KBD_PAGES = 6_c_int64_t
+
   character(kind=c_char, len=*), parameter :: FK_XHCI_IRQ = &
        "Fortran Kernel: the xHCI's MSI-X interrupt ARRIVED, count 0x" // &
        c_null_char
@@ -2395,7 +2425,85 @@ contains
     else
        call serial_print_string(FK_XHCI_NOIRQ)
     end if
+
+    ! roadmap 5.2.  The DCBAA is 5.1's, at the base of its run; everything
+    ! else the keyboard needs is a run of its own.
+    call usbkbd_start(run_virt)
   end subroutine xhci_start
+
+  ! THE KEYBOARD (roadmap 5.2).  5.1 left a running controller and a NO-OP that
+  ! completed; this is a slot, a device context, an address, four control
+  ! transfers and an interrupt endpoint whose reports reach the screen.
+  subroutine usbkbd_start(dcbaa_virt)
+    implicit none
+    integer(c_int64_t), intent(in) :: dcbaa_virt
+    integer(c_int64_t) :: run
+    integer(c_int32_t) :: st
+
+    call serial_print_string(FK_KBD_START)
+    call serial_print_string(FK_NL)
+
+    run = pmm_alloc_contiguous(FK_KBD_PAGES)
+    if (run == 0_c_int64_t) then
+       call serial_print_string(FK_KBD_NOMEM)
+       return
+    end if
+
+    st = usbkbd_bringup(run, vmm_phys_to_virt(run), dcbaa_virt, &
+                        FK_PMM_PAGE_SIZE)
+
+    call serial_print_string(FK_KBD_PORT)
+    call serial_print_hex(fk_usbkbd_state(1), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_usbkbd_state(2), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_usbkbd_state(3), 2_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_KBD_CTX)
+    call serial_print_hex(fk_usbkbd_state(5), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_usbkbd_state(6), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_usbkbd_state(10), 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    if (st /= FK_XHCI_OK) then
+       call serial_print_string(FK_KBD_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+
+    call serial_print_string(FK_KBD_SLOT)
+    call serial_print_hex(fk_usbkbd_state(4), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_usbkbd_state(12), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_usbkbd_state(13), 2_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_KBD_DEV)
+    call serial_print_hex(fk_usbkbd_state(14), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(iand(fk_usbkbd_state(15), &
+                               int(z'FFFFFFFF', c_int64_t)), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(shiftr(fk_usbkbd_state(15), 32), 2_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_KBD_EP)
+    call serial_print_hex(fk_usbkbd_state(16), 2_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(shiftr(fk_usbkbd_state(17), 32), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(iand(fk_usbkbd_state(17), &
+                               int(z'FFFFFFFF', c_int64_t)), 2_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_KBD_OK)
+    call serial_print_string(FK_NL)
+  end subroutine usbkbd_start
 
   subroutine seq_failed(st)
     implicit none

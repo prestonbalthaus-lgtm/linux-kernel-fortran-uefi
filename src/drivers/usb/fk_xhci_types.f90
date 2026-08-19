@@ -200,6 +200,44 @@ module fk_xhci_types_m
             FK_XHCI_XECP_PROTO_PORT_CNT_POS, FK_XHCI_XECP_PROTO_PORT_CNT_LEN, &
             FK_XHCI_XECP_PROTO_PSIC_POS, FK_XHCI_XECP_PROTO_PSIC_LEN
 
+  ! roadmap 5.2: device contexts, endpoint contexts and the input context.
+  public :: FK_XHCI_CTX_ENTRY_BYTES, FK_XHCI_CTX_ENTRIES, FK_XHCI_ICTX_ENTRIES, &
+            FK_XHCI_DCI_MAX, FK_XHCI_ICTX_CTRL_IDX, FK_XHCI_ICTX_SLOT_IDX
+  public :: FK_XHCI_SLOT_ROUTE_POS, FK_XHCI_SLOT_ROUTE_LEN, &
+            FK_XHCI_SLOT_SPEED_POS, FK_XHCI_SLOT_SPEED_LEN, &
+            FK_XHCI_SLOT_MTT_BIT, FK_XHCI_SLOT_HUB_BIT, &
+            FK_XHCI_SLOT_CTXENT_POS, FK_XHCI_SLOT_CTXENT_LEN, &
+            FK_XHCI_SLOT_MAXEXIT_POS, FK_XHCI_SLOT_MAXEXIT_LEN, &
+            FK_XHCI_SLOT_RHPORT_POS, FK_XHCI_SLOT_RHPORT_LEN, &
+            FK_XHCI_SLOT_NPORTS_POS, FK_XHCI_SLOT_NPORTS_LEN, &
+            FK_XHCI_SLOT_INTR_POS, FK_XHCI_SLOT_INTR_LEN, &
+            FK_XHCI_SLOT_ADDR_POS, FK_XHCI_SLOT_ADDR_LEN, &
+            FK_XHCI_SLOT_STATE_POS, FK_XHCI_SLOT_STATE_LEN
+  public :: FK_XHCI_SLOT_STATE_DISABLED, FK_XHCI_SLOT_STATE_DEFAULT, &
+            FK_XHCI_SLOT_STATE_ADDRESSED, FK_XHCI_SLOT_STATE_CONFIGURED
+  public :: FK_XHCI_EP_STATE_POS, FK_XHCI_EP_STATE_LEN, &
+            FK_XHCI_EP_MULT_POS, FK_XHCI_EP_MULT_LEN, &
+            FK_XHCI_EP_MAXPSTR_POS, FK_XHCI_EP_MAXPSTR_LEN, &
+            FK_XHCI_EP_LSA_BIT, FK_XHCI_EP_INTERVAL_POS, &
+            FK_XHCI_EP_INTERVAL_LEN, FK_XHCI_EP_ESIT_HI_POS, &
+            FK_XHCI_EP_ESIT_HI_LEN, FK_XHCI_EP_CERR_POS, FK_XHCI_EP_CERR_LEN, &
+            FK_XHCI_EP_TYPE_POS, FK_XHCI_EP_TYPE_LEN, FK_XHCI_EP_HID_BIT, &
+            FK_XHCI_EP_MAXBURST_POS, FK_XHCI_EP_MAXBURST_LEN, &
+            FK_XHCI_EP_MAXPKT_POS, FK_XHCI_EP_MAXPKT_LEN, &
+            FK_XHCI_EP_DCS_BIT, FK_XHCI_EP_AVGTRB_POS, FK_XHCI_EP_AVGTRB_LEN, &
+            FK_XHCI_EP_ESIT_LO_POS, FK_XHCI_EP_ESIT_LO_LEN
+  public :: FK_XHCI_EP_TYPE_NOT_VALID, FK_XHCI_EP_TYPE_ISOCH_OUT, &
+            FK_XHCI_EP_TYPE_BULK_OUT, FK_XHCI_EP_TYPE_INT_OUT, &
+            FK_XHCI_EP_TYPE_CONTROL, FK_XHCI_EP_TYPE_ISOCH_IN, &
+            FK_XHCI_EP_TYPE_BULK_IN, FK_XHCI_EP_TYPE_INT_IN
+  public :: FK_XHCI_ICTX_DROP_OFF, FK_XHCI_ICTX_ADD_OFF, FK_XHCI_ICTX_CFG_OFF, &
+            FK_XHCI_ICTX_CFG_VALUE_POS, FK_XHCI_ICTX_CFG_VALUE_LEN, &
+            FK_XHCI_ICTX_CFG_IFACE_POS, FK_XHCI_ICTX_CFG_IFACE_LEN, &
+            FK_XHCI_ICTX_CFG_ALT_POS, FK_XHCI_ICTX_CFG_ALT_LEN
+  public :: FK_XHCI_TRB_SLOT_ID_POS, FK_XHCI_TRB_SLOT_ID_LEN, &
+            FK_XHCI_TRB_EP_ID_POS, FK_XHCI_TRB_EP_ID_LEN
+  public :: FK_XHCI_PORTSC_PRESERVE, FK_XHCI_PORTSC_CHANGE
+
   ! ---- block geometry, in bytes ----------------------------------------------
   ! The operational block base is CAPLENGTH, the doorbell array base DBOFF and
   ! the runtime block base RTSOFF, all read at run time (xHCI 1.2 5.3.1/5.3.7/
@@ -813,5 +851,140 @@ module fk_xhci_types_m
   integer(c_int32_t), parameter :: FK_XHCI_XECP_PROTO_PORT_CNT_LEN = 8_c_int32_t
   integer(c_int32_t), parameter :: FK_XHCI_XECP_PROTO_PSIC_POS = 28_c_int32_t
   integer(c_int32_t), parameter :: FK_XHCI_XECP_PROTO_PSIC_LEN = 4_c_int32_t
+
+  ! ---- device, endpoint and input contexts (roadmap 5.2) ---------------------
+  ! xHCI 1.2 sections 6.2.2, 6.2.3 and 6.2.5, cross-checked against
+  ! xhci.h:343-350 (slot), :425-433 (endpoint) and :510-513 (input control).
+  !
+  ! AN ENTRY IS 32 << HCCPARAMS1.CSZ BYTES, never 32.  Every offset below is a
+  ! DWORD INDEX WITHIN one entry, which is the same for both sizes -- a 64-byte
+  ! context is the 32-byte one with 32 reserved bytes appended for the
+  ! controller's own use.  The stride is the caller's to supply.
+  integer(c_int32_t), parameter :: FK_XHCI_CTX_ENTRY_BYTES = 32_c_int32_t
+  ! A Device Context is the slot context plus DCI 1..31.
+  integer(c_int32_t), parameter :: FK_XHCI_CTX_ENTRIES = 32_c_int32_t
+  ! An Input Context is all of that with the Input Control Context in front.
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_ENTRIES = 33_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_DCI_MAX = 31_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_CTRL_IDX = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_SLOT_IDX = 1_c_int32_t
+
+  ! Slot Context dword 0 (xhci.h:354-366).
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_ROUTE_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_ROUTE_LEN = 20_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_SPEED_POS = 20_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_SPEED_LEN = 4_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_MTT_BIT = 25_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_HUB_BIT = 26_c_int32_t
+  ! Context Entries is the index of the LAST valid endpoint context, so an
+  ! endpoint at DCI 3 needs 3 here and not 1.  A slot left at 1 with EP1 IN
+  ! added is a Configure Endpoint the controller answers with a parameter error.
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_CTXENT_POS = 27_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_CTXENT_LEN = 5_c_int32_t
+  ! Slot Context dword 1 (xhci.h:372-375).
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_MAXEXIT_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_MAXEXIT_LEN = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_RHPORT_POS = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_RHPORT_LEN = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_NPORTS_POS = 24_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_NPORTS_LEN = 8_c_int32_t
+  ! Slot Context dword 2: interrupter target in 31:22.
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_INTR_POS = 22_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_INTR_LEN = 10_c_int32_t
+  ! Slot Context dword 3.  BOTH FIELDS ARE THE CONTROLLER'S: it writes the
+  ! address it assigned and the state it moved the slot to, so they are the one
+  ! part of this structure a kernel cannot fake by writing it.
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_ADDR_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_ADDR_LEN = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_STATE_POS = 27_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_STATE_LEN = 5_c_int32_t
+
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_STATE_DISABLED = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_STATE_DEFAULT = 1_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_STATE_ADDRESSED = 2_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_SLOT_STATE_CONFIGURED = 3_c_int32_t
+
+  ! Endpoint Context dword 0 (xhci.h:446-466).
+  integer(c_int32_t), parameter :: FK_XHCI_EP_STATE_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_STATE_LEN = 3_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_MULT_POS = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_MULT_LEN = 2_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_MAXPSTR_POS = 10_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_MAXPSTR_LEN = 5_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_LSA_BIT = 15_c_int32_t
+  ! Interval is an EXPONENT of 125us microframes, not a count: the period is
+  ! 2**interval microframes.  A high-speed interrupt endpoint's descriptor
+  ! already carries an exponent in bInterval, one-based, so the field is
+  ! bInterval - 1.  Full and low speed carry a frame COUNT there instead and
+  ! need a different conversion, which is why the speed decode is an allowlist.
+  integer(c_int32_t), parameter :: FK_XHCI_EP_INTERVAL_POS = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_INTERVAL_LEN = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_ESIT_HI_POS = 24_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_ESIT_HI_LEN = 8_c_int32_t
+  ! Endpoint Context dword 1 (xhci.h:477-493).
+  integer(c_int32_t), parameter :: FK_XHCI_EP_CERR_POS = 1_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_CERR_LEN = 2_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_POS = 3_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_LEN = 3_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_HID_BIT = 7_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_MAXBURST_POS = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_MAXBURST_LEN = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_MAXPKT_POS = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_MAXPKT_LEN = 16_c_int32_t
+  ! Endpoint Context dwords 2 and 3 are the TR Dequeue Pointer.  Bit 0 of the
+  ! low half is the Dequeue Cycle State, not an address bit: it tells the
+  ! controller which cycle polarity the ring's producer is currently writing.
+  integer(c_int32_t), parameter :: FK_XHCI_EP_DCS_BIT = 0_c_int32_t
+  ! Endpoint Context dword 4 (xhci.h:496-499).
+  integer(c_int32_t), parameter :: FK_XHCI_EP_AVGTRB_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_AVGTRB_LEN = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_ESIT_LO_POS = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_ESIT_LO_LEN = 16_c_int32_t
+
+  ! Endpoint types, xHCI 1.2 table 6-9 (xhci.h:480-488).  The IN/OUT halves are
+  ! four apart, which is why the field is three bits for eight values.
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_NOT_VALID = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_ISOCH_OUT = 1_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_BULK_OUT = 2_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_INT_OUT = 3_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_CONTROL = 4_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_ISOCH_IN = 5_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_BULK_IN = 6_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_EP_TYPE_INT_IN = 7_c_int32_t
+
+  ! Input Control Context (xhci.h:510-513).  Dword offsets within the entry.
+  ! Bit n of either flag word names DCI n, so bit 0 is the slot context and bit
+  ! 1 is EP0.  Drop flags 0 and 1 are reserved and must be zero.
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_DROP_OFF = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_ADD_OFF = 1_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_CFG_OFF = 7_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_CFG_VALUE_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_CFG_VALUE_LEN = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_CFG_IFACE_POS = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_CFG_IFACE_LEN = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_CFG_ALT_POS = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_ICTX_CFG_ALT_LEN = 8_c_int32_t
+
+  ! Slot and endpoint id in a command TRB's control dword, and in the transfer
+  ! event that answers it (xhci.h:818-824).
+  integer(c_int32_t), parameter :: FK_XHCI_TRB_SLOT_ID_POS = 24_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_TRB_SLOT_ID_LEN = 8_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_TRB_EP_ID_POS = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_XHCI_TRB_EP_ID_LEN = 5_c_int32_t
+
+  ! PORTSC IS NOT READ-MODIFY-WRITEABLE and this is the mask that says so.
+  ! CHANGE is every write-1-to-clear bit (xhci-port.h:71-99); PRESERVE is the
+  ! ordinary read/write state worth carrying forward.  PED is in NEITHER, on
+  ! purpose: it is write-1-to-DISABLE, so a read-modify-write of an enabled
+  ! port disables it, and an acknowledged change bit is a change nobody looked
+  ! at.  Every write is composed as iand(read, PRESERVE) plus the one bit being
+  ! asked for.
+  integer(c_int32_t), parameter :: FK_XHCI_PORTSC_CHANGE = &
+       int(z'00FE0000', c_int32_t)
+  ! PP (9), the two port-indicator bits (14:15) and the three wake-enable bits
+  ! (25:27).  The speed field 13:10 is read-only and LWS 16 is a write strobe,
+  ! so neither belongs in a value being written back.
+  integer(c_int32_t), parameter :: FK_XHCI_PORTSC_PRESERVE = &
+       int(z'0E00C200', c_int32_t)
 
 end module fk_xhci_types_m

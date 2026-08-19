@@ -544,6 +544,46 @@ F90
 )
 expect_reject "call to an external nothing in the tree defines" tools/linktest.sh "$d"
 
+# roadmap 5.2.  A module of nothing but PARAMETERs compiles to an object with
+# no symbols at all -- every constant is folded at the use site -- so linktest
+# exempts it from needing an entry point.  BOTH HALVES OF THAT EXEMPTION ARE
+# TESTED HERE, because an exemption nothing has watched refuse is a hole:
+# constants-only is accepted, and no-text-but-undefined is still rejected.
+d=$(mkcase l_constants <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_int32_t
+  implicit none
+  private
+  public :: FK_CASE_ONE
+  integer(c_int32_t), parameter :: FK_CASE_ONE = 1_c_int32_t
+end module fk_case_m
+F90
+)
+if bash "$REPO/tools/linktest.sh" "$d" >/dev/null 2>&1; then
+  ok "linktest.sh accepts a module that is nothing but parameters"
+else
+  bad "linktest.sh rejects a parameters-only module (nothing to link is not a failure)"
+fi
+
+d=$(mkcase l_no_text_undef <<'F90'
+! SPDX-License-Identifier: GPL-2.0
+module fk_case_m
+  use, intrinsic :: iso_c_binding, only: c_int32_t
+  implicit none
+  private
+  public :: fk_case_ptr
+  interface
+    subroutine fk_no_such_primitive() bind(c, name="fk_no_such_primitive")
+      implicit none
+    end subroutine fk_no_such_primitive
+  end interface
+  procedure(fk_no_such_primitive), pointer :: fk_case_ptr => fk_no_such_primitive
+end module fk_case_m
+F90
+)
+expect_reject "an object with no text but an undefined symbol -- the exemption does NOT cover it" tools/linktest.sh "$d"
+
 echo
 echo "=== FP/vector detector fires on an object that really contains SSE ==="
 cat > "$WORK/fp.f90" <<'F90'

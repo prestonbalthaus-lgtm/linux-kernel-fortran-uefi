@@ -257,6 +257,13 @@ module fk_idt_m
     ! FSRC_KERNEL, and reordering that chain to satisfy a use statement would
     ! move every module below it.  This is the idiom fk_heap_m already uses to
     ! reach pmm_alloc_contiguous.
+    ! roadmap 5.2.  Declared rather than USEd, for the reason console_write
+    ! is: fk_usb_kbd_m is built long after this module and a .mod dependency
+    ! would force the whole video and USB stack in front of the IDT.
+    subroutine usbkbd_isr() bind(c, name="usbkbd_isr")
+      implicit none
+    end subroutine usbkbd_isr
+
     subroutine lapic_eoi(base) bind(c, name="lapic_eoi")
       import :: c_int64_t
       implicit none
@@ -598,6 +605,12 @@ contains
     ! skipping it wedges every later interrupt at that priority.
     if (line == FK_MSI_LINE) then
        fk_msi_count = fk_msi_count + 1_c_int64_t
+       ! THE DEVICE IS ACKNOWLEDGED BEFORE THE CPU IS.  usbkbd_isr clears the
+       ! interrupter's IP -- write-1-to-clear, and the controller sends no
+       ! further message while it is set -- and drains the event ring.  Leaving
+       ! that out gives exactly one interrupt for the life of the machine, and
+       ! one keystroke looks identical to a working keyboard.
+       call usbkbd_isr()
        if (eoi_lapic /= 0_c_int64_t) call lapic_eoi(eoi_lapic)
        return
     end if
