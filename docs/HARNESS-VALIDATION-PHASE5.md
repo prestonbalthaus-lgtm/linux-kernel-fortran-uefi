@@ -1,4 +1,4 @@
-# Does the USB stack's test actually catch bugs?
+# Does Phase 5's test actually catch bugs?
 
 Roadmap 5.1 brought a USB host controller out of reset, gave it a command ring
 and an event ring, ran it, executed a NO-OP, and took the first interrupt in this
@@ -248,6 +248,153 @@ already caught this project out with once.
 be refutable because QEMU's keyboard may report the same eight bytes in both
 protocols, and that if so it would be labelled QEMU-specific rather than
 counted as coverage. It was not refutable. It is labelled.
+
+## Roadmap 5.3: the NVMe controller, and sector 0
+
+5.1's device was a controller, 5.2's was a keyboard on the end of one. 5.3's is
+a **disk**, and that gives this milestone something the other two never had: an
+answer that exists outside the machine before the machine is switched on.
+
+### The disk is the oracle
+
+Every other assertion in this project compares the guest against QEMU's device
+model, against the guest's own earlier reading, or against a reference model
+written from a specification. The sector read is different: **the bytes are on
+the host, in a file, before the kernel boots.**
+
+    tools/qemu-boot-test.sh generates build/boot/nvme-disk.img
+      sector 0   00 01 02 ... 0f, then zeros, then 55 AA
+      sector 1   "FORTRAN-KERNEL!!"
+
+The checker `pmemsave`s the guest's DMA landing zone at its physical base and
+compares it against that file, **read at check time**. There is no second copy
+of the expected bytes anywhere, so a changed fixture cannot drift away from its
+own assertion — which is the failure mode a hardcoded `00 01 02 ...` in the
+checker would have had.
+
+The image is **generated, not committed**. A binary fixture in git is one
+nobody can read a diff of.
+
+### Sector 1 exists to catch an off-by-one, and it did
+
+`Read`'s NLB field is **zero-based**: 0 means one block. Two of the ten
+mutations are off-by-one in exactly that arithmetic, and the second sector's
+ASCII signature is what makes them visible rather than plausible:
+
+    M83 (SLBA 1 instead of 0)   the 512 bytes at 0x35D000 are ...
+                                (first 16: 464f525452414e2d4b45524e454c2121)
+
+`464f...` is `FORTRAN-KERNEL!!`. A disk of zeros would have made that mutation
+a comparison of zeros against zeros.
+
+### The guard region, and the mutation that forced it
+
+**M82 escaped the first time it was run.** Writing the block *count* into NLB
+instead of count-1 reads TWO blocks — and the first of them is still sector 0,
+so a checker that compares the 512 bytes it asked for sees nothing wrong.
+
+This is `HARNESS-VALIDATION-PHASE2.md`'s mutation 4 in a new costume: a
+comparison bounded by the region of interest cannot see a write **past** it.
+The fix is the same one the framebuffer needed. The kernel now zeroes the whole
+page before the read, the checker reads 1024 bytes, and the second 512 are a
+guard region that a one-block read has no business touching:
+
+    the 512 bytes ABOVE the sector are still zero, so the read was one block
+    and not two (first 16: 464f525452414e2d4b45524e454c2121)
+
+### Two-entry queues, because a phase tag that never wraps is not tested
+
+A completion queue entry belongs to the controller until its phase bit differs
+from the consumer's expectation, and the consumer flips its expectation every
+time it wraps. **With a 64-entry queue and four admin commands the wrap never
+runs**, so a driver with inverted flip logic would pass every gate that could
+be built on it — the M33 shape exactly.
+
+The admin queues are therefore **two entries**, the specification's minimum, so
+the ordinary bring-up wraps them twice with no artificial padding command. The
+gate reads the head and phase back:
+
+    the admin completion queue's phase is 1 after wrapping, head at 0
+
+Phase 1 with head 0 after four commands is two full laps. M80 removes the flip
+and the bring-up spins out.
+
+### The interrupt claim is narrow, because the vector is shared
+
+There is one MSI vector and the xHCI already owns it; `irq_handler` calls both
+drains and each answers nothing for an interrupt that was not its. So "an
+interrupt arrived" says nothing about NVMe.
+
+What the gate asserts instead is a counter incremented **only inside
+`nvme_isr`, and only when a completion was actually consumed there**. M85 makes
+the read complete by polling instead, and that counter stays at zero.
+
+### Mutations
+
+| # | Injected defect | Detected? | How it surfaced |
+|---|---|---|---|
+| M76 | CC.EN never set | **yes** | bring-up returns −3; `CSTS 0x00000000: the controller is READY` fails |
+| M77 | CC.IOSQES and IOCQES left zero | **yes** | bring-up returns **−6** — the controller rejected Create I/O SQ two commands after the bad enable, and the gate names the cause: `CC.IOSQES is 0` |
+| M78 | AQA written with the entry count, not count−1 | **yes** | `AQA 0x00020002: both admin queues are 2 entries, written zero-based` |
+| M79 | ASQ and ACQ swapped | **yes** | bring-up returns −5; the controller fetches commands from the completion queue and nothing ever completes |
+| M80 | the phase tag never flipped on wrap | **yes** | bring-up returns −5 after the first lap; zero completions in interrupt context |
+| M81 | the CQ head doorbell never rung | **yes** | bring-up returns −5 once the queue is full |
+| M82 | NLB written as the block count | **yes**, after the guard region | escaped first; see above |
+| M83 | reads LBA 1 instead of LBA 0 | **yes** | sector 1's signature where sector 0's bytes belong |
+| M84 | PRP1's low half left zero | **yes** | bring-up returns −7; Identify writes nowhere useful and the LBA format decodes to nothing |
+| M85 | the completion polled rather than taken by interrupt | **yes** | `0 completion(s) were consumed IN INTERRUPT CONTEXT` |
+
+`NVME_BAD` reaches the gate's verdict expression and **M83 is the proof**: it
+fails on the sector comparison alone, and the run exits non-zero. That check was
+worth making explicitly -- 5.1 shipped a gate whose `XHCI_BAD` was computed and
+never reached the verdict, so the summary said FAIL and the gate exited 0.
+
+**Ten cases, ten refused** — the first phase in this project with no escapes,
+and the reason is worth naming: this milestone's assertions are mostly about
+**arithmetic the controller checks**, not about behaviour QEMU is free to be
+lenient over. A controller that is handed a bad AQA or a bad PRP does not
+quietly work anyway.
+
+### A defect mmiocheck caught in code that had already booted
+
+`fk_nvme.o` was refused on its first pass through the gate:
+
+    REFUSED  build/boot/fk_nvme.o -- sub-dword access to a device register
+      <__fk_nvme_m_MOD_submit.constprop.0>:  1b3: movzbl (%r15),%esi
+
+`submit`'s `opcode` dummy was by-reference, so it lived in memory, and its
+value feeds an 8-bit `mvbits` field — **gfortran narrowed the load to a byte.**
+That is 3.3's bug in a new place, and the memory in question happened to be a
+stack temporary rather than a device register, so it was harmless.
+
+It was still refused, and the refusal is correct: `mmiocheck` reads the object
+and cannot tell a stack temporary from a BAR. Every internal helper in the
+module now takes its scalars by `value`, so there is no load to narrow. **The
+kernel had already booted and read the disk correctly before this was found** —
+the gate caught something a working boot could not.
+
+### What 5.3 does NOT claim
+
+- **`fk_nvme.f90` has no host suite.** The other five drivers in this tree have
+  one; this does not. A host test would need a controller model of the kind
+  `tests/drivers/usb/test_xhci.c` implements — one that executes the submission
+  queue when a doorbell is written — and that is real work, not a stub. Until
+  it exists, the driver's logic is covered by the boot gate and ten mutations
+  and by nothing that runs in two seconds on the host.
+- **The disable path is unexercised.** CC.EN is already 0 on this model when
+  the kernel first sees it, so "clear EN, poll RDY to 0" returns immediately
+  and proves nothing. It is still done, because the machine where firmware HAS
+  driven the controller is the one where skipping it corrupts memory the PMM is
+  about to hand out.
+- **One PRP entry, no PRP list.** Every transfer here is one page-aligned
+  buffer, so PRP2 is always zero. A transfer crossing a page boundary needs a
+  PRP list and there is not one.
+- **One namespace, one I/O queue pair, no writes.** Nothing deletes a queue,
+  nothing shuts the controller down, and nothing has ever written a byte to the
+  disk.
+- **The 2048-block image is smaller than any real drive.** Nothing here has met
+  a namespace whose block count needs more than 32 bits, or an LBA format other
+  than 512 bytes.
 
 ## What is NOT claimed
 

@@ -79,6 +79,23 @@ module fk_nvme_types_m
             FK_NVME_ADMIN_IDENTIFY, FK_NVME_ADMIN_SET_FEATURES, &
             FK_NVME_IO_FLUSH, FK_NVME_IO_WRITE, FK_NVME_IO_READ
 
+  ! roadmap 5.3
+  public :: FK_NVME_REG_CAP_OFF, FK_NVME_REG_VS_OFF, FK_NVME_REG_INTMS_OFF, &
+            FK_NVME_REG_INTMC_OFF, FK_NVME_REG_CC_OFF, FK_NVME_REG_CSTS_OFF, &
+            FK_NVME_REG_AQA_OFF, FK_NVME_REG_ASQ_OFF, FK_NVME_REG_ACQ_OFF
+  public :: FK_NVME_SQE_BYTES, FK_NVME_CQE_BYTES, FK_NVME_QUEUE_ALIGN
+  public :: FK_NVME_ID_CNS_NS, FK_NVME_ID_CNS_CTRL
+  public :: FK_NVME_Q_PHYS_CONTIG_BIT, FK_NVME_CQ_IRQ_ENABLED_BIT
+  public :: FK_NVME_CQID_POS, FK_NVME_CQID_LEN, FK_NVME_QSIZE_POS, &
+            FK_NVME_QSIZE_LEN, FK_NVME_QFLAGS_POS, FK_NVME_QFLAGS_LEN, &
+            FK_NVME_IV_POS, FK_NVME_IV_LEN, FK_NVME_SQ_CQID_POS, &
+            FK_NVME_SQ_CQID_LEN
+  public :: FK_NVME_RW_NLB_POS, FK_NVME_RW_NLB_LEN
+  public :: FK_NVME_IDNS_NSZE_OFF, FK_NVME_IDNS_NLBAF_OFF, &
+            FK_NVME_IDNS_FLBAS_OFF, FK_NVME_IDNS_LBAF_OFF, &
+            FK_NVME_LBAF_BYTES, FK_NVME_LBAF_DS_OFF, &
+            FK_NVME_FLBAS_IDX_POS, FK_NVME_FLBAS_IDX_LEN
+
   ! Byte offsets from BAR0.  nvme.h:132-163.
   integer(c_int32_t), parameter :: FK_NVME_PMR_BASE = int(z'0E00', c_int32_t)
   integer(c_int32_t), parameter :: FK_NVME_DB_BASE = int(z'1000', c_int32_t)
@@ -291,4 +308,77 @@ module fk_nvme_types_m
   integer(c_int8_t), parameter :: FK_NVME_IO_FLUSH = int(z'00', c_int8_t)
   integer(c_int8_t), parameter :: FK_NVME_IO_WRITE = int(z'01', c_int8_t)
   integer(c_int8_t), parameter :: FK_NVME_IO_READ = int(z'02', c_int8_t)
+
+  ! ---- byte offsets of the registers the driver actually touches (5.3) ------
+  ! The type above describes the block; nothing may reach a device register
+  ! through a Fortran pointer, so the offsets have to exist as numbers too --
+  ! the same reason fk_xhci_types gives.
+  integer(c_int32_t), parameter :: FK_NVME_REG_CAP_OFF   = int(z'00', c_int32_t)
+  integer(c_int32_t), parameter :: FK_NVME_REG_VS_OFF    = int(z'08', c_int32_t)
+  integer(c_int32_t), parameter :: FK_NVME_REG_INTMS_OFF = int(z'0C', c_int32_t)
+  integer(c_int32_t), parameter :: FK_NVME_REG_INTMC_OFF = int(z'10', c_int32_t)
+  integer(c_int32_t), parameter :: FK_NVME_REG_CC_OFF    = int(z'14', c_int32_t)
+  ! 0x18 is reserved.  CSTS is at 0x1C and a driver that assumes the registers
+  ! are contiguous reads the reserved dword instead and never sees RDY.
+  integer(c_int32_t), parameter :: FK_NVME_REG_CSTS_OFF  = int(z'1C', c_int32_t)
+  integer(c_int32_t), parameter :: FK_NVME_REG_AQA_OFF   = int(z'24', c_int32_t)
+  integer(c_int32_t), parameter :: FK_NVME_REG_ASQ_OFF   = int(z'28', c_int32_t)
+  integer(c_int32_t), parameter :: FK_NVME_REG_ACQ_OFF   = int(z'30', c_int32_t)
+
+  ! CC.IOSQES and CC.IOCQES are the log2 of these, and the pair is what makes
+  ! the controller's stride agree with the driver's.
+  integer(c_int32_t), parameter :: FK_NVME_SQE_BYTES = 64_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_CQE_BYTES = 16_c_int32_t
+  ! A queue base is a PRP: page aligned, and its low twelve bits are reserved.
+  integer(c_int32_t), parameter :: FK_NVME_QUEUE_ALIGN = 4096_c_int32_t
+
+  ! Identify CNS, CDW10 bits 7:0.  nvme.h:561-562.
+  integer(c_int32_t), parameter :: FK_NVME_ID_CNS_NS = int(z'00', c_int32_t)
+  integer(c_int32_t), parameter :: FK_NVME_ID_CNS_CTRL = int(z'01', c_int32_t)
+
+  ! Create CQ / Create SQ queue flags, nvme.h:1369-1374.  PHYS_CONTIG is not
+  ! optional when CAP.CQR is set, which it is on every controller this has met.
+  integer(c_int32_t), parameter :: FK_NVME_Q_PHYS_CONTIG_BIT = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_CQ_IRQ_ENABLED_BIT = 1_c_int32_t
+
+  ! Create CQ: CDW10 is qsize:cqid, CDW11 is irq_vector:cq_flags.
+  ! Create SQ: CDW10 is qsize:sqid, CDW11 is cqid:sq_flags.
+  ! Upstream spells both as four __le16 in struct nvme_create_cq/sq
+  ! (nvme.h:1306-1335); here they are fields of the generic cdw array, so the
+  ! positions are written out.  QSIZE IS ZERO-BASED -- a queue of n entries
+  ! puts n-1 here, and putting n asks for one more entry than the memory holds.
+  integer(c_int32_t), parameter :: FK_NVME_CQID_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_CQID_LEN = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_QSIZE_POS = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_QSIZE_LEN = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_QFLAGS_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_QFLAGS_LEN = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_IV_POS = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_IV_LEN = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_SQ_CQID_POS = 16_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_SQ_CQID_LEN = 16_c_int32_t
+
+  ! Read/Write: SLBA is the 64 bits at CDW10/11 and NLB is CDW12 15:0.
+  ! NLB IS ZERO-BASED: 0 is one block.  Writing the block count there reads one
+  ! block too many, which on a disk whose next sector differs is visible and on
+  ! one whose next sector is zeros is not.
+  integer(c_int32_t), parameter :: FK_NVME_RW_NLB_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_RW_NLB_LEN = 16_c_int32_t
+
+  ! Identify Namespace, byte offsets into the 4096-byte result.  nvme.h's
+  ! struct nvme_id_ns: nsze at 0, nlbaf at 25, flbas at 26, lbaf[] at 128.
+  ! Each LBA format is four bytes (ms, ds, rp) and DS IS AN EXPONENT: the block
+  ! size is 2**ds bytes.
+  integer(c_int32_t), parameter :: FK_NVME_IDNS_NSZE_OFF = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_IDNS_NLBAF_OFF = 25_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_IDNS_FLBAS_OFF = 26_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_IDNS_LBAF_OFF = 128_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_LBAF_BYTES = 4_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_LBAF_DS_OFF = 2_c_int32_t
+  ! FLBAS bits 3:0 index lbaf[].  Bits 6:4 extend it above 16 formats, which
+  ! nothing this driver has met uses; the low nibble is taken and the guard is
+  ! that nlbaf bounds it.
+  integer(c_int32_t), parameter :: FK_NVME_FLBAS_IDX_POS = 0_c_int32_t
+  integer(c_int32_t), parameter :: FK_NVME_FLBAS_IDX_LEN = 4_c_int32_t
+
 end module fk_nvme_types_m

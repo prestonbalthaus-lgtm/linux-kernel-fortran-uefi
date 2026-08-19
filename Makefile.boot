@@ -116,6 +116,8 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/drivers/usb/fk_usb_types.f90 \
                src/drivers/usb/fk_usb_hid.f90 \
                src/drivers/usb/fk_usb_kbd.f90 \
+               src/drivers/storage/fk_nvme_types.f90 \
+               src/drivers/storage/fk_nvme.f90 \
                src/cpu/fk_sched.f90 \
                src/boot/fk_kmain.f90
 
@@ -358,11 +360,11 @@ selftest-boot: $(KERNEL)
 # the tree to WRITE a device register, and the scanner's pattern covers movb
 # and movw stores as well as narrowed loads.
 mmiocheck-boot: $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o $(BUILD)/fk_pcie.o \
-                $(BUILD)/fk_xhci.o $(BUILD)/fk_usb_kbd.o
+                $(BUILD)/fk_xhci.o $(BUILD)/fk_usb_kbd.o $(BUILD)/fk_nvme.o
 	@bash tools/mmiocheck.sh --selftest
 	@bash tools/mmiocheck.sh $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o \
 	                         $(BUILD)/fk_pcie.o $(BUILD)/fk_xhci.o \
-	                         $(BUILD)/fk_usb_kbd.o
+	                         $(BUILD)/fk_usb_kbd.o $(BUILD)/fk_nvme.o
 
 # Everything the boot path must survive inside the container. The remaining
 # gate -- does it actually boot -- needs a VM and therefore runs on the host:

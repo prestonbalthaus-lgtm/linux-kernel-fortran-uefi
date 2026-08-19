@@ -264,6 +264,16 @@ module fk_idt_m
       implicit none
     end subroutine usbkbd_isr
 
+    ! roadmap 5.3.  THE VECTOR IS SHARED with the xHCI: MSI-X has no
+    ! per-device line to interrogate, so both drains run and each answers
+    ! nothing for an interrupt that was not its.  An empty completion queue is
+    ! indistinguishable from "not mine" and needs no other test.
+    function nvme_isr() result(n) bind(c, name="nvme_isr")
+      import :: c_int32_t
+      implicit none
+      integer(c_int32_t) :: n
+    end function nvme_isr
+
     subroutine lapic_eoi(base) bind(c, name="lapic_eoi")
       import :: c_int64_t
       implicit none
@@ -579,7 +589,7 @@ contains
     implicit none
     type(fk_regs_t), intent(in), target :: regs
     integer(c_int64_t) :: resume
-    integer(c_int32_t) :: line
+    integer(c_int32_t) :: line, msi_drained
 
     ! The frame's own address: what irq_common pushed and what it will pop
     ! unless the scheduler names another one.
@@ -611,6 +621,7 @@ contains
        ! that out gives exactly one interrupt for the life of the machine, and
        ! one keystroke looks identical to a working keyboard.
        call usbkbd_isr()
+       msi_drained = nvme_isr()
        if (eoi_lapic /= 0_c_int64_t) call lapic_eoi(eoi_lapic)
        return
     end if

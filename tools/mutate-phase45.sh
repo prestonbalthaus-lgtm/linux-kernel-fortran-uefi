@@ -26,6 +26,7 @@ FILES="src/acpi/fk_acpi.f90 src/acpi/fk_madt.f90 src/acpi/fk_mcfg.f90 \
        src/drivers/usb/fk_xhci.f90 src/drivers/usb/fk_xhci_types.f90 \
        src/drivers/usb/fk_usb_kbd.f90 src/drivers/usb/fk_usb_hid.f90 \
        src/drivers/usb/fk_usb_types.f90 src/cpu/fk_idt.f90 \
+       src/drivers/storage/fk_nvme.f90 src/drivers/storage/fk_nvme_types.f90 \
        src/mm/fk_vmm.f90 src/boot/fk_kmain.f90"
 
 restore() { git checkout -- $FILES 2>/dev/null; }
@@ -302,9 +303,68 @@ case_M75() {
   run_case M75-isr-drains-before-it-owns-the-ring
 }
 
+
+# --- roadmap 5.3: the NVMe controller ----------------------------------------
+case_M76() {
+  subst src/drivers/storage/fk_nvme.f90 \
+    $'    v = ibset(v, FK_NVME_CC_EN_BIT)\n' ''
+  run_case M76-cc-en-never-set
+}
+case_M77() {
+  subst src/drivers/storage/fk_nvme.f90 \
+    $'    call mvbits(FK_NVME_CC_IOSQES_NVM, 0_c_int32_t, FK_NVME_CC_IOSQES_LEN, v, &\n                FK_NVME_CC_IOSQES_POS)\n    call mvbits(FK_NVME_CC_IOCQES_NVM, 0_c_int32_t, FK_NVME_CC_IOCQES_LEN, v, &\n                FK_NVME_CC_IOCQES_POS)\n' ''
+  run_case M77-iosqes-iocqes-left-zero
+}
+case_M78() {
+  subst src/drivers/storage/fk_nvme.f90 \
+    $'    call mvbits(FK_NVME_ADMIN_ENTRIES - 1_c_int32_t, 0_c_int32_t, &\n                FK_NVME_AQA_ASQS_LEN, v, FK_NVME_AQA_ASQS_POS)\n    call mvbits(FK_NVME_ADMIN_ENTRIES - 1_c_int32_t, 0_c_int32_t, &\n                FK_NVME_AQA_ACQS_LEN, v, FK_NVME_AQA_ACQS_POS)' \
+    $'    call mvbits(FK_NVME_ADMIN_ENTRIES, 0_c_int32_t, &\n                FK_NVME_AQA_ASQS_LEN, v, FK_NVME_AQA_ASQS_POS)\n    call mvbits(FK_NVME_ADMIN_ENTRIES, 0_c_int32_t, &\n                FK_NVME_AQA_ACQS_LEN, v, FK_NVME_AQA_ACQS_POS)'
+  run_case M78-aqa-not-zero-based
+}
+case_M79() {
+  subst src/drivers/storage/fk_nvme.f90 \
+    $'    call wr64(FK_NVME_REG_ASQ_OFF, sq_p)\n    call wr64(FK_NVME_REG_ACQ_OFF, cq_p)' \
+    $'    call wr64(FK_NVME_REG_ASQ_OFF, cq_p)\n    call wr64(FK_NVME_REG_ACQ_OFF, sq_p)'
+  run_case M79-asq-and-acq-swapped
+}
+case_M80() {
+  subst src/drivers/storage/fk_nvme.f90 \
+    $'       cq_phase(q) = 1_c_int32_t - cq_phase(q)\n' ''
+  run_case M80-phase-never-flipped-on-wrap
+}
+case_M81() {
+  subst src/drivers/storage/fk_nvme.f90 \
+    $'    call fk_writel(db_addr(qid_of(q), FK_NVME_DB_CQ), cq_head(q))\n' ''
+  run_case M81-cq-head-doorbell-never-rung
+}
+case_M82() {
+  subst src/drivers/storage/fk_nvme.f90 \
+    $'    call mvbits(blocks - 1_c_int32_t, 0_c_int32_t, FK_NVME_RW_NLB_LEN, cdw12, &' \
+    $'    call mvbits(blocks, 0_c_int32_t, FK_NVME_RW_NLB_LEN, cdw12, &'
+  run_case M82-nlb-not-zero-based
+}
+case_M83() {
+  subst src/boot/fk_kmain.f90 \
+    $'    if (st == FK_NVME_OK) st = nvme_read(1_c_int32_t, 0_c_int64_t, &' \
+    $'    if (st == FK_NVME_OK) st = nvme_read(1_c_int32_t, 1_c_int64_t, &'
+  run_case M83-reads-lba-1-not-lba-0
+}
+case_M84() {
+  subst src/drivers/storage/fk_nvme.f90 \
+    $'    call fk_writel(e + int(z\'18\', c_int64_t), &\n                   int(iand(prp1, int(z\'FFFFFFFF\', c_int64_t)), c_int32_t))' \
+    $'    call fk_writel(e + int(z\'18\', c_int64_t), 0_c_int32_t)'
+  run_case M84-prp1-low-half-zero
+}
+case_M85() {
+  subst src/drivers/storage/fk_nvme.f90 \
+    $'    if (isr_owns) then\n       status = FK_NVME_OK\n       return\n    end if\n' ''
+  run_case M85-completion-polled-not-taken-by-interrupt
+}
+
 CASES="baseline M40 M41 M42 M43 M44 M45 M46 M47 M48 M49 M50 M51 \
        M52 M53 M54 M55 M56 M57 M58 M59 M60 M61 M62 M63 M64 \
-       M65 M66 M67 M68 M69 M70 M71 M72 M73 M74 M75"
+       M65 M66 M67 M68 M69 M70 M71 M72 M73 M74 M75 \
+       M76 M77 M78 M79 M80 M81 M82 M83 M84 M85"
 
 trap 'restore' EXIT INT TERM
 for c in $CASES; do

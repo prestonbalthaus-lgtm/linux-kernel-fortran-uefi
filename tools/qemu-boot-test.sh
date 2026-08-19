@@ -263,6 +263,26 @@ if [[ "${FK_MACHINE:-q35}" == pc ]]; then
   FK_KBD_PASS_LINES=''
 fi
 
+FK_NVME_PASS_LINES=$'Fortran Kernel: NVMe looking for a storage controller (roadmap 5.3).
+Fortran Kernel: NVMe BAR0 mapped strong-UC, virt/phys 0x
+Fortran Kernel: NVMe cap/version/mqes/dstrd 0x
+Fortran Kernel: NVMe cc/csts/aqa 0x
+Fortran Kernel: NVMe asq/acq 0x
+Fortran Kernel: NVMe nsid 1 blocks/lba-bytes 0x
+Fortran Kernel: NVMe sector 0 [0..15] 0x
+Fortran Kernel: the NVMe controller read sector 0 into memory (roadmap 5.3).'
+FK_NVME_FAIL_LINES=$'Fortran Kernel: no NVMe controller on this bus.
+Fortran Kernel: the NVMe register block could not be mapped, status 0x
+Fortran Kernel: the PMM refused a contiguous run for the NVMe queues.
+Fortran Kernel: the NVMe bring-up FAILED, status 0x'
+# The i440FX board has no ECAM window, so no NVMe function is ever found and
+# nvme_bringup never runs.  Its lines are REJECT lines there; their absence is
+# the assertion, exactly as 5.1's and 5.2's are.
+if [[ "${FK_MACHINE:-q35}" == pc ]]; then
+  FK_NVME_FAIL_LINES="$FK_NVME_PASS_LINES"
+  FK_NVME_PASS_LINES=''
+fi
+
 FK_PCIE_FAIL_LINES=$'Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map.
 Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
 Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route.
@@ -378,7 +398,8 @@ $FK_ACPI_PASS_LINES
 $FK_IRQ_PASS_LINES
 $FK_IOA_PASS_LINES
 $FK_PCIE_PASS_LINES
-$FK_KBD_PASS_LINES}"
+$FK_KBD_PASS_LINES
+$FK_NVME_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
 $FK_VMM_FAIL_LINES
@@ -392,7 +413,8 @@ $FK_ACPI_FAIL_LINES
 $FK_IRQ_FAIL_LINES
 $FK_IOA_FAIL_LINES
 $FK_PCIE_FAIL_LINES
-$FK_KBD_FAIL_LINES}"
+$FK_KBD_FAIL_LINES
+$FK_NVME_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a
@@ -470,6 +492,9 @@ CHECK_DMA="${FK_CHECK_DMA:-1}"
 CHECK_XHCI="${FK_CHECK_XHCI:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_XHCI=0
 [[ "$CHECK_XHCI" != 0 ]] && say "xhci check : the command and event rings, read where the controller wrote them"
+CHECK_NVME="${FK_CHECK_NVME:-1}"
+[[ "$MACHINE" == pc ]] && CHECK_NVME=0
+[[ "$CHECK_NVME" != 0 ]] && say "nvme check : sector 0, read at its physical base and diffed against the image"
 CHECK_KBD="${FK_CHECK_KBD:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_KBD=0
 [[ "$CHECK_KBD" != 0 ]] && say "kbd check  : key presses injected over QMP, decoded and rendered by the guest"
@@ -682,6 +707,12 @@ assertion_summary() {
       else                           say "  xHCI controller  : FAIL  see the ring dumps above"
       fi
     fi
+    if [[ "$CHECK_NVME" != 0 ]]; then
+      if   (( NVME_OK == 1 )); then  say "  NVMe sector 0    : PASS  the DMA read matches the disk image byte for byte"
+      elif (( NVME_RAN == 0 )); then say "  NVMe sector 0    : FAIL  the guest died before it could be asked"
+      else                           say "  NVMe sector 0    : FAIL  see the NVMe assertions above"
+      fi
+    fi
     if [[ "$CHECK_KBD" != 0 ]]; then
       if   (( KBD_OK == 1 )); then  say "  USB keyboard     : PASS  keys were pressed, decoded and rendered"
       elif (( KBD_RAN == 0 )); then say "  USB keyboard     : FAIL  the guest died before it could be asked"
@@ -735,6 +766,28 @@ QEMU_ARGS=(
 # the 5.1 tree with the device attached and watching every assertion hold.
 [[ "$MACHINE" == pc ]] || QEMU_ARGS+=( -device qemu-xhci,id=xhci \
                                        -device usb-kbd,bus=xhci.0,id=kbd )
+
+# roadmap 5.3. The disk is GENERATED, not committed: a binary fixture in git is
+# a fixture nobody can read a diff of, and its contents are the assertion --
+# sector 0 carries a known 16-byte prologue and a signature the guest has no
+# way to guess. Rebuilt whenever it is missing, so the gate is self-contained.
+NVME_IMG="${FK_NVME_IMG:-build/boot/nvme-disk.img}"
+if [[ "$MACHINE" != pc ]]; then
+  if [[ ! -f "$NVME_IMG" ]]; then
+    mkdir -p "$(dirname "$NVME_IMG")"
+    python3 - "$NVME_IMG" <<'PYIMG'
+import sys
+SECTORS, SZ = 2048, 512
+d = bytearray(SECTORS * SZ)
+d[0:16] = bytes(range(16))          # the prologue the guest prints
+d[510:512] = b"\x55\xaa"            # a boot signature, so sector 0 looks real
+d[512:528] = b"FORTRAN-KERNEL!!"    # sector 1, to catch an off-by-one LBA
+open(sys.argv[1], "wb").write(bytes(d))
+PYIMG
+  fi
+  QEMU_ARGS+=( -drive "file=$NVME_IMG,format=raw,if=none,id=nvm"
+               -device nvme,drive=nvm,serial=fk1234 )
+fi
 [[ "$MODE" == gate ]] && QEMU_ARGS+=( -cdrom "$ISO" )
 
 # FK_FIRMWARE=uefi boots the SAME ISO through OVMF instead of SeaBIOS (roadmap
@@ -900,6 +953,19 @@ if [[ "$CHECK_XHCI" != 0 && "$MODE" == gate ]]; then
   fi
 fi
 
+NVME_RAN=0; NVME_OK=0
+if [[ "$CHECK_NVME" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    NVME_RAN=1
+    rule
+    say "--- the NVMe read, at its physical base and against the disk ---"
+    if python3 "$SENTINEL" nvme --qmp "$SOCK" --elf "$KERNEL" \
+               --image "$NVME_IMG" --timeout 15; then
+      NVME_OK=1
+    fi
+  fi
+fi
+
 KBD_RAN=0; KBD_OK=0
 if [[ "$CHECK_KBD" != 0 && "$MODE" == gate ]]; then
   if qemu_alive; then
@@ -1032,13 +1098,15 @@ XHCI_BAD=0
 if [[ "$CHECK_XHCI" != 0 && "$MODE" == gate ]] && (( XHCI_OK == 0 )); then XHCI_BAD=1; fi
 KBD_BAD=0
 if [[ "$CHECK_KBD" != 0 && "$MODE" == gate ]] && (( KBD_OK == 0 )); then KBD_BAD=1; fi
+NVME_BAD=0
+if [[ "$CHECK_NVME" != 0 && "$MODE" == gate ]] && (( NVME_OK == 0 )); then NVME_BAD=1; fi
 PCI_BAD=0
 if [[ "$CHECK_PCI" != 0 && "$MODE" == gate ]] && (( PCI_OK == 0 )); then PCI_BAD=1; fi
 
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
    && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )) \
    && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )) && (( DMA_BAD == 0 )) \
-   && (( PCI_BAD == 0 )) && (( XHCI_BAD == 0 )) && (( KBD_BAD == 0 )); then
+   && (( PCI_BAD == 0 )) && (( XHCI_BAD == 0 )) && (( KBD_BAD == 0 )) && (( NVME_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule

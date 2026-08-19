@@ -49,6 +49,18 @@ module fk_kmain_m
                          xhci_halted, &
                          xhci_page_size
   use fk_usb_kbd_m, only: usbkbd_bringup, fk_usbkbd_state
+  use fk_nvme_m,    only: FK_NVME_OK, nvme_attach, nvme_disable, &
+                          nvme_admin_queues, nvme_enable, nvme_identify, &
+                          nvme_ns_decode, nvme_create_cq, nvme_create_sq, &
+                          nvme_read, nvme_owner_isr, nvme_irq_completions, &
+                          nvme_cap, nvme_version, nvme_cc, nvme_csts, &
+                          nvme_aqa, nvme_asq, nvme_acq, nvme_mqes, &
+                          nvme_dstrd, nvme_ns_size, nvme_lba_bytes, &
+                          nvme_last_status, nvme_admin_head, nvme_admin_phase, &
+                          nvme_sector_word, nvme_set_sector_buf, &
+                          fk_nvme_irq_completions => irq_completions, &
+                          FK_NVME_E_CMD, FK_NVME_E_NOBASE, FK_NVME_E_QUEUE
+  use fk_nvme_types_m, only: FK_NVME_ID_CNS_CTRL, FK_NVME_ID_CNS_NS
   use fk_pcie_types_m, only: FK_PCI_CMD_MEMORY_BIT, FK_PCI_CMD_MASTER_BIT, &
                              FK_PCI_CMD_INTX_DISABLE_BIT, &
                              FK_PCI_MSIX_CTRL_ENABLE_BIT, &
@@ -113,7 +125,7 @@ module fk_kmain_m
                          vmm_physmap_top, FK_VMM_PHYSMAP, &
                          vmm_reserve_mmio, vmm_map_mmio, vmm_pat_arm, &
                          vmm_read_pat, vmm_punch_physmap, FK_VMM_E_IS_RAM, &
-                         FK_VMM_IOAPIC, FK_VMM_ECAM, FK_VMM_XHCI
+                         FK_VMM_IOAPIC, FK_VMM_ECAM, FK_VMM_XHCI, FK_VMM_NVME
   use fk_sched_m,  only: FK_SCHED_MAX, fk_task_runs, fk_sched_switches, &
                          sched_init, sched_spawn, sched_start, sched_current, &
                          sched_tasks
@@ -447,6 +459,50 @@ module fk_kmain_m
   character(kind=c_char, len=*), parameter :: FK_XHCI_NOEVENT = &
        "Fortran Kernel: the xHCI never completed the NO-OP; no event arrived." // &
        FK_CRLF // c_null_char
+  ! roadmap 5.3
+  character(kind=c_char, len=*), parameter :: FK_NVME_START = &
+       "Fortran Kernel: NVMe looking for a storage controller (roadmap 5.3)." // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_NONE = &
+       "Fortran Kernel: no NVMe controller on this bus." // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_MAP_BAD = &
+       "Fortran Kernel: the NVMe register block could not be mapped, status 0x" // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_NOMEM = &
+       "Fortran Kernel: the PMM refused a contiguous run for the NVMe queues." // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_CAPS = &
+       "Fortran Kernel: NVMe cap/version/mqes/dstrd 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_WINDOW = &
+       "Fortran Kernel: NVMe BAR0 mapped strong-UC, virt/phys 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_READY = &
+       "Fortran Kernel: NVMe cc/csts/aqa 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_QUEUES = &
+       "Fortran Kernel: NVMe asq/acq 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_NS = &
+       "Fortran Kernel: NVMe nsid 1 blocks/lba-bytes 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_SECTOR = &
+       "Fortran Kernel: NVMe sector 0 [0..15] 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_DONE = &
+       "Fortran Kernel: the NVMe controller read sector 0 into memory (roadmap 5.3)." // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_NVME_BAD = &
+       "Fortran Kernel: the NVMe bring-up FAILED, status 0x" // c_null_char
+
+  ! Six pages, one run: admin SQ and CQ, I/O SQ and CQ, the identify buffer
+  ! and the sector buffer.  One physical base for the host to check, 5.1's
+  ! argument unchanged.
+  integer(c_int64_t), parameter :: FK_NVME_PAGES = 6_c_int64_t
+  ! [0] magic [1] BAR0 [2] run [3] cap [4] version [5] cc [6] csts [7] aqa
+  ! [8] asq [9] acq [10] identify buf phys [11] sector buf phys [12] ns blocks
+  ! [13] lba bytes [14] last status [15] completions taken IN INTERRUPT CONTEXT
+  ! [16] the first eight bytes of sector 0 [17] the next eight
+  ! [18] admin cq head [19] admin cq phase [20] sequence status
+  integer(c_int64_t), parameter :: FK_NVMES_MAGIC = &
+       int(z'4E564D450503', c_int64_t)
+  integer(c_int64_t), volatile, save, bind(c, name="fk_nvme_state") :: &
+       fk_nvme_state(0:20)
+
   ! roadmap 5.2
   character(kind=c_char, len=*), parameter :: FK_KBD_START = &
        "Fortran Kernel: USB looking for a HID keyboard (roadmap 5.2)." // &
@@ -2096,6 +2152,7 @@ contains
     end do
 
     call xhci_bringup()
+    call nvme_bringup()
 
     if (n > 0_c_int32_t) call serial_print_string(FK_PCIE_WALKED)
   end subroutine pcie_bringup
@@ -2506,6 +2563,239 @@ contains
     call serial_print_string(FK_KBD_OK)
     call serial_print_string(FK_NL)
   end subroutine usbkbd_start
+
+  ! THE DRIVE (roadmap 5.3).  Everything 5.1 did for the xHCI -- enable the
+  ! function, map the BAR strong-UC, route MSI-X -- and then the controller's
+  ! own sequence: disable, admin queues, enable, identify, an I/O queue pair,
+  ! and one 512-byte read of LBA 0 that lands in DRAM by DMA.
+  subroutine nvme_bringup()
+    implicit none
+    integer(c_int64_t) :: bar, run, run_virt, asq, acq, iosq, iocq, idbuf, sec
+    integer(c_int64_t) :: pte
+    integer(c_int32_t) :: i, st, fw, down, cmd, cap, cnt, bir, off
+
+    fk_nvme_state = 0_c_int64_t
+    fk_nvme_state(0) = FK_NVMES_MAGIC
+
+    i = pcie_find_nvme()
+    if (i == FK_PCIE_NOT_FOUND) then
+       call serial_print_string(FK_NVME_NONE)
+       return
+    end if
+    call serial_print_string(FK_NVME_START)
+
+    fw   = pcie_command(i)
+    down = pcie_cmd_disable(i)
+    cmd  = pcie_cmd_enable(i)
+    if (btest(down, FK_PCI_CMD_MEMORY_BIT) .or. &
+        .not. btest(cmd, FK_PCI_CMD_MEMORY_BIT) .or. &
+        .not. btest(cmd, FK_PCI_CMD_MASTER_BIT)) then
+       call nvme_failed(FK_NVME_E_NOBASE)
+       return
+    end if
+
+    bar = pcie_bar64(i, 0_c_int32_t)
+    fk_nvme_state(1) = bar
+    if (bar == 0_c_int64_t) then
+       call nvme_failed(FK_NVME_E_NOBASE)
+       return
+    end if
+
+    ! The BAR sits ABOVE top-of-RAM on this machine, so the punch finds nothing
+    ! in the linear map and correctly does nothing.  It is still called: a
+    ! controller whose BAR firmware placed below top-of-RAM would need it, and
+    ! which side of that line a machine falls on is not this code's to assume.
+    st = vmm_punch_physmap(bar, FK_XHCI_WINDOW_BYTES)
+    if (st == FK_VMM_OK) &
+         st = vmm_map_mmio(FK_VMM_NVME, bar, FK_XHCI_WINDOW_BYTES, FK_VMM_UC)
+    if (st /= FK_VMM_OK) then
+       call serial_print_string(FK_NVME_MAP_BAD)
+       call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+       call serial_print_string(FK_NL)
+       return
+    end if
+    call serial_print_string(FK_NVME_WINDOW)
+    call serial_print_hex(FK_VMM_NVME, 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(bar, 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! The route, exactly as 5.1 builds the xHCI's, and onto the SAME vector.
+    ! MSI-X has no line to share, so two devices on one vector is two drains in
+    ! the handler and no arbitration anywhere.
+    cap = pcie_msix_at(i)
+    if (cap /= FK_PCIE_NOT_FOUND) then
+       cnt = pcie_msix_count(i)
+       bir = pcie_msix_bir(i)
+       off = pcie_msix_offset(i)
+       if (cnt > 0_c_int32_t .and. bir == 0_c_int32_t) then
+          st = pcie_msix_entry_set(FK_VMM_NVME + int(off, c_int64_t), &
+                                   0_c_int32_t, &
+                                   lapic_msi_addr(lapic_id(FK_VMM_LAPIC)), &
+                                   0_c_int32_t, lapic_msi_data(FK_VECTOR_MSI))
+          if (st == FK_PCIE_OK) then
+             st = pcie_msix_enable(i)
+             st = pcie_intx_disable(i)
+          end if
+       end if
+    end if
+
+    st = nvme_attach(FK_VMM_NVME)
+    if (st /= FK_NVME_OK) then
+       call nvme_failed(st)
+       return
+    end if
+
+    fk_nvme_state(3) = nvme_cap()
+    fk_nvme_state(4) = int(nvme_version(), c_int64_t)
+    call serial_print_string(FK_NVME_CAPS)
+    call serial_print_hex(nvme_cap(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(nvme_version(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(nvme_mqes(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(nvme_dstrd(), c_int64_t), 2_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    run = pmm_alloc_contiguous(FK_NVME_PAGES)
+    if (run == 0_c_int64_t) then
+       call serial_print_string(FK_NVME_NOMEM)
+       return
+    end if
+    run_virt = vmm_phys_to_virt(run)
+    fk_nvme_state(2) = run
+    asq   = run
+    acq   = run + FK_PMM_PAGE_SIZE
+    iosq  = run + 2_c_int64_t * FK_PMM_PAGE_SIZE
+    iocq  = run + 3_c_int64_t * FK_PMM_PAGE_SIZE
+    idbuf = run + 4_c_int64_t * FK_PMM_PAGE_SIZE
+    sec   = run + 5_c_int64_t * FK_PMM_PAGE_SIZE
+    fk_nvme_state(10) = idbuf
+    fk_nvme_state(11) = sec
+    call nvme_set_sector_buf(run_virt + 5_c_int64_t * FK_PMM_PAGE_SIZE, &
+                             int(FK_PMM_PAGE_SIZE, c_int32_t))
+
+    st = nvme_disable()
+    if (st == FK_NVME_OK) &
+         st = nvme_admin_queues(run_virt, asq, &
+                                run_virt + FK_PMM_PAGE_SIZE, acq)
+    if (st == FK_NVME_OK) st = nvme_enable()
+    if (st /= FK_NVME_OK) then
+       call nvme_failed(st)
+       return
+    end if
+
+    fk_nvme_state(5) = int(nvme_cc(), c_int64_t)
+    fk_nvme_state(6) = int(nvme_csts(), c_int64_t)
+    fk_nvme_state(7) = int(nvme_aqa(), c_int64_t)
+    fk_nvme_state(8) = nvme_asq()
+    fk_nvme_state(9) = nvme_acq()
+    call serial_print_string(FK_NVME_READY)
+    call serial_print_hex(int(nvme_cc(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(nvme_csts(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(nvme_aqa(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+    call serial_print_string(FK_NVME_QUEUES)
+    call serial_print_hex(nvme_asq(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(nvme_acq(), 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    st = nvme_identify(FK_NVME_ID_CNS_CTRL, 0_c_int32_t, idbuf)
+    if (st == FK_NVME_OK) &
+         st = nvme_identify(FK_NVME_ID_CNS_NS, 1_c_int32_t, idbuf)
+    if (st == FK_NVME_OK) &
+         st = nvme_ns_decode(run_virt + 4_c_int64_t * FK_PMM_PAGE_SIZE)
+    if (st /= FK_NVME_OK) then
+       call nvme_failed(st)
+       return
+    end if
+    fk_nvme_state(12) = nvme_ns_size()
+    fk_nvme_state(13) = int(nvme_lba_bytes(), c_int64_t)
+    call serial_print_string(FK_NVME_NS)
+    call serial_print_hex(nvme_ns_size(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(nvme_lba_bytes(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! THE COMPLETION QUEUE BEFORE THE SUBMISSION QUEUE.  Create I/O SQ names
+    ! the CQ it completes into, so a controller asked for the pair in the other
+    ! order rejects the SQ for referring to a queue that does not exist.
+    st = nvme_create_cq(run_virt + 3_c_int64_t * FK_PMM_PAGE_SIZE, iocq, &
+                        1_c_int32_t, 2_c_int32_t, 0_c_int32_t)
+    if (st == FK_NVME_OK) &
+         st = nvme_create_sq(run_virt + 2_c_int64_t * FK_PMM_PAGE_SIZE, iosq, &
+                             run_virt + 3_c_int64_t * FK_PMM_PAGE_SIZE, iocq, &
+                             1_c_int32_t, 2_c_int32_t)
+    if (st /= FK_NVME_OK) then
+       call nvme_failed(st)
+       return
+    end if
+    fk_nvme_state(18) = int(nvme_admin_head(), c_int64_t)
+    fk_nvme_state(19) = int(nvme_admin_phase(), c_int64_t)
+
+    ! THE HANDOVER, and its order is 5.2's lesson repeated: the flag goes up
+    ! inside nvme_owner_isr BEFORE the controller's interrupts are unmasked, so
+    ! there is no instant where a completion is taken by a handler that does
+    ! not own the queue.
+    st = nvme_owner_isr()
+    if (st == FK_NVME_OK) st = nvme_read(1_c_int32_t, 0_c_int64_t, &
+                                         1_c_int32_t, sec)
+    if (st /= FK_NVME_OK) then
+       call nvme_failed(st)
+       return
+    end if
+
+    ! The read completes by INTERRUPT now, so this waits on the counter the
+    ! handler moves rather than on the queue it no longer owns.
+    ! THE VOLATILE VARIABLE, not the accessor over it.  An accessor is
+    ! side-effect-free to gfortran, so this loop would load once and spin on a
+    ! value that can never change -- which is exactly what it did.
+    do i = 1_c_int32_t, 2000000_c_int32_t
+       if (fk_nvme_irq_completions > 0_c_int64_t) exit
+    end do
+    fk_nvme_state(15) = fk_nvme_irq_completions
+    fk_nvme_state(14) = int(nvme_last_status(), c_int64_t)
+    if (fk_nvme_irq_completions == 0_c_int64_t) then
+       call nvme_failed(FK_NVME_E_CMD)
+       return
+    end if
+
+    fk_nvme_state(16) = nvme_sector_word(0_c_int32_t)
+    fk_nvme_state(17) = nvme_sector_word(1_c_int32_t)
+    call serial_print_string(FK_NVME_SECTOR)
+    call serial_print_hex(fk_nvme_state(16), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(fk_nvme_state(17), 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    pte = vmm_translate(FK_VMM_NVME)
+    if (iand(pte, FK_PTE_PWT) == 0_c_int64_t .or. &
+        iand(pte, FK_PTE_PCD) == 0_c_int64_t) then
+       call nvme_failed(FK_NVME_E_QUEUE)
+       return
+    end if
+
+    fk_nvme_state(20) = 0_c_int64_t
+    call serial_print_string(FK_NVME_DONE)
+    call serial_print_string(FK_NL)
+    call console_write(FK_NVME_SECTOR, 64_c_int32_t)
+    call console_print_hex(fk_nvme_state(16), 16_c_int32_t)
+    call console_newline()
+  end subroutine nvme_bringup
+
+  subroutine nvme_failed(st)
+    implicit none
+    integer(c_int32_t), intent(in) :: st
+
+    call serial_print_string(FK_NVME_BAD)
+    call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+    fk_nvme_state(20) = int(st, c_int64_t)
+  end subroutine nvme_failed
 
   subroutine seq_failed(st)
     implicit none
