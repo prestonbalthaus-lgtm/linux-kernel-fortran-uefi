@@ -2227,9 +2227,63 @@ Preparing the kernel to host external C applications.
 
         Validation: Kernel can read the directory structure of the NVMe drive and locate a specific file.
 
-   * [ ] 6.3 Syscall ABI Trap
+   * [x] 6.3 Syscall ABI Trap
 
         Validation: Assembly syscall instruction routes to a Fortran handler (sys_write, sys_read, sys_exit).
+
+        DONE 2026-08-19. `src/cpu/fk_syscall.f90` programs EFER.SCE, STAR, LSTAR and FMASK
+        and reads all four back; `boot/interrupts.S` gains the entry stub; the router
+        dispatches to `sys_read`, `sys_write` and `sys_exit`, which are SCAFFOLDS that record
+        what they were asked. It does not implement a system call and it does not drop to
+        Ring 3 -- 7.1 owns that. What it establishes is the PATH.
+
+        IRETQ AND NOT SYSRETQ, and it is the one deliberate deviation. SYSRET derives CS from
+        `STAR[63:48] + 16` and SS from `+ 8`, both with RPL hardwired to 3
+        (`segment.h:177-186`), so no encoding of it returns to CPL 0 and it cannot return the
+        only caller 6.3 has. In 64-bit mode IRETQ ALWAYS pops SS:RSP, privilege change or
+        not, so ONE frame shape serves ring 0 now and ring 3 at 7.1 -- only the two selectors
+        in it change. Linux answers the same problem the same way: every kernel-to-kernel
+        return in `entry_64.S` is IRETQ.
+
+        `STAR[63:48]` IS ZERO AND A GATE ASSERTS IT IS. A plausible-looking value there --
+        `__USER32_CS` copied from `common.c:2306`, say -- would name Ring 3 descriptors this
+        GDT does not contain: a register that reads as configured and faults on first use.
+        That is only sound while nothing executes SYSRET, so `sysretcheck-boot` objdumps the
+        image and refuses one. 7.1 adds the three descriptors, fills in the sysret half, and
+        DELETES that gate.
+
+        THE STACK SWITCH IS SOFTWARE'S AND THAT IS WHY IF IS IN FMASK. `entry_64.S:65-66`:
+        SYSCALL does not change RSP. Between arriving and having a kernel stack there is a
+        window in which RSP is still the caller's, and an interrupt there would push its
+        frame onto a pointer the caller chose. No swapgs: nothing in this tree uses a GS
+        base, so the stack comes from an ordinary global -- and that is the first thing 7.1
+        revisits if per-CPU state ever arrives.
+
+        THE ROUTER READS THE FRAME, which dissolves the R10 problem rather than shuffling
+        around it: the Linux syscall ABI puts argument 4 in R10 because SYSCALL destroys RCX
+        with the return address, and a frame-reading router makes R10 the field called `r10`.
+        `fk_regs_t` is now PUBLISHED by `fk_idt_m` rather than copied, so one type describes
+        the exception, interrupt and syscall paths.
+
+        THE CONSTANTS ARE ALL THE KERNEL'S. `asm/msr-index.h` and
+        `uapi/asm/processor-flags.h` both compile standalone out of the vendor tree, so every
+        MSR number, `EFER_SCE` and all fourteen FMASK flags are spelled with Linux's own
+        names and `FK_SYSCALL_FMASK` is diffed against the OR of that list. And MSR_LSTAR has
+        an INDEPENDENT channel: the sentinel reads `fk_syscall_entry` out of `kernel.elf`'s
+        symbol table and diffs it against what the guest read back out of the register.
+
+        The host suite supplies a MODEL MSR FILE rather than executing WRMSR, which it must
+        not -- a test that programmed the real MSR_LSTAR would point the HOST's system calls
+        at a Fortran routine in a test binary. The model is worth more anyway: it can be made
+        to DROP a write, which is the only way to check the read-back at all.
+
+        63 host checks and 24 new sentinel self-test assertions, every one shown to REFUSE.
+        `docs/HARNESS-VALIDATION-PHASE6.md` carries the mutation table: 20 cases, 20 refused,
+        three of which need a boot. S131 is the one worth the sentence -- FMASK without IF is
+        INVISIBLE to the kernel's own `syscall_masked_flags()`, which ANDs the entry flags
+        with the same constant that was written, so removing a bit removes it from both sides
+        of the comparison. Only the sentinel's independent list can refuse it. A checker that
+        derives its expectation from the thing it is checking is not a checker.
 
    * [ ] 6.4 ELF Binary Loader
 

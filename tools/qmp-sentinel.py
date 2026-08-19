@@ -192,6 +192,155 @@ XHCI_SYMBOL = "fk_xhci_state"
 XHCI_WORDS = 19
 MSI_SYMBOL = "fk_msi_count"
 XHCI_MAGIC = 0x584843490501
+# Roadmap 6.3.
+SYSCALL_SYMBOL = "fk_syscall_state"
+SYSCALL_WORDS = 12
+SYSCALL_MAGIC = 0x535943410603
+# The entry point the guest must have programmed into MSR_LSTAR, read out of
+# the ELF by NAME.  This is the independent channel: the guest publishes the
+# value it wrote and this tool derives the value it should have written from a
+# different source entirely, exactly as roadmap 4.1 walked the ACPI tables in
+# Python before believing the Fortran.
+SYSCALL_ENTRY_SYMBOL = "fk_syscall_entry"
+# common.c:2291-2300's fourteen flags.  Named individually because the point of
+# checking them is that a driver cannot pass by masking EVERYTHING: bit 1 is
+# architecturally always set and VM/VIF/VIP have no meaning in 64-bit mode, so
+# a blanket mask is refused below.
+EFLAGS_CF, EFLAGS_PF, EFLAGS_AF, EFLAGS_ZF = 0x1, 0x4, 0x10, 0x40
+EFLAGS_SF, EFLAGS_TF, EFLAGS_IF, EFLAGS_DF = 0x80, 0x100, 0x200, 0x400
+EFLAGS_OF, EFLAGS_IOPL, EFLAGS_NT = 0x800, 0x3000, 0x4000
+EFLAGS_RF, EFLAGS_VM, EFLAGS_AC, EFLAGS_ID = 0x10000, 0x20000, 0x40000, 0x200000
+SYSCALL_FMASK = (EFLAGS_CF | EFLAGS_PF | EFLAGS_AF | EFLAGS_ZF | EFLAGS_SF |
+                 EFLAGS_TF | EFLAGS_IF | EFLAGS_DF | EFLAGS_OF | EFLAGS_IOPL |
+                 EFLAGS_NT | EFLAGS_RF | EFLAGS_AC | EFLAGS_ID)
+KERNEL_CS = 0x08
+KERNEL_DS = 0x10
+EFER_SCE = 0x1
+SYS_NR_WRITE = 1
+SYS_NR_EXIT = 60
+
+
+def check_syscall(words, entry_virt):
+    """Roadmap 6.3, and MSR_LSTAR is diffed against the ELF rather than itself.
+
+    `entry_virt` is the virtual address of fk_syscall_entry taken out of
+    build/boot/kernel.elf's symbol table.  The guest never sees that number;
+    it publishes what it read back out of the register.
+    """
+    out = []
+    out.append((words[0] == SYSCALL_MAGIC,
+                f"fk_syscall_state magic is 0x{words[0]:012X} "
+                f"(want 0x{SYSCALL_MAGIC:012X}: the bring-up ran)"))
+    if words[0] != SYSCALL_MAGIC:
+        return out
+
+    out.append((_signed(words[11]) == 0,
+                f"the syscall bring-up returned {_signed(words[11])}"))
+    out.append((_signed(words[1]) == 0,
+                f"syscall_init returned {_signed(words[1])}"))
+    if _signed(words[11]) != 0:
+        return out
+
+    star, lstar, fmask, efer = words[2], words[3], words[4], words[5]
+
+    # THE SYSCALL HALF.  The CPU loads CS from STAR[47:32] and SS from that
+    # value PLUS EIGHT -- the +8 is the instruction's and is not in the MSR --
+    # so the two descriptors must be adjacent, code first (segment.h:173-189).
+    out.append(((star >> 32) & 0xFFFF == KERNEL_CS,
+                f"STAR[47:32] is 0x{(star >> 32) & 0xFFFF:04X}, the kernel "
+                f"code selector (want 0x{KERNEL_CS:04X})"))
+    out.append((((star >> 32) & 0xFFFC) + 8 == KERNEL_DS,
+                f"so the SS the CPU derives is 0x{((star >> 32) & 0xFFFC) + 8:04X}, "
+                f"the kernel data selector (want 0x{KERNEL_DS:04X})"))
+    out.append((star & 0xFFFFFFFF == 0,
+                f"STAR[31:0] is 0x{star & 0xFFFFFFFF:08X} -- the 32-bit legacy "
+                f"target, which long mode never reads (want 0)"))
+    # AND THE SYSRET HALF IS ZERO, which is an assertion about what has NOT
+    # been built.  SYSRET derives CS from STAR[63:48]+16 and SS from +8, both
+    # at RPL 3; a plausible-looking value here would name Ring 3 descriptors
+    # this GDT does not contain -- configured-looking and fatal on first use.
+    # Roadmap 7.1 adds them, and this line is what has to change when it does.
+    out.append(((star >> 48) & 0xFFFF == 0,
+                f"STAR[63:48] is 0x{(star >> 48) & 0xFFFF:04X} -- zero, because "
+                f"there are no Ring 3 descriptors to name yet (roadmap 7.1)"))
+
+    # THE INDEPENDENT ONE.  The guest read this back out of the register; this
+    # number came out of the ELF's symbol table.
+    out.append((lstar == entry_virt,
+                f"MSR_LSTAR is 0x{lstar:016X}, which is fk_syscall_entry in "
+                f"build/boot/kernel.elf (0x{entry_virt:016X})"))
+    out.append((lstar >> 63 == 1,
+                f"and it is a higher-half address, so the value RIP is loaded "
+                f"with is canonical"))
+
+    out.append((fmask == SYSCALL_FMASK,
+                f"MSR_FMASK is 0x{fmask:08X} (want 0x{SYSCALL_FMASK:08X}: "
+                f"common.c:2291-2300's fourteen flags)"))
+    out.append((fmask & EFLAGS_IF != 0,
+                "and IF is among them -- SYSCALL does not switch the stack, so "
+                "the software switch in boot/interrupts.S must not be "
+                "interruptible"))
+    out.append((fmask & EFLAGS_DF != 0, "as is DF"))
+    out.append((fmask & EFLAGS_NT != 0,
+                "as is NT -- with it set an IRET attempts a task switch"))
+    out.append((fmask & (EFLAGS_VM | 2) == 0,
+                "and it is not a blanket mask: bit 1 is architecturally always "
+                "set and VM has no meaning in 64-bit mode"))
+
+    out.append((efer & EFER_SCE != 0,
+                f"EFER is 0x{efer:08X} and SCE is set, so SYSCALL is not #UD"))
+
+    # THE INSTRUCTION ACTUALLY EXECUTED.  Three calls: a write, an unknown
+    # number, and an exit.  More than one matters on its own -- a stub that
+    # corrupted its own stack or left fk_syscall_rsp0 wrong survives the first
+    # and not the second.
+    out.append((words[6] >= 3,
+                f"{words[6]} SYSCALL instruction(s) reached the Fortran "
+                f"handler and returned (want >= 3)"))
+    out.append((words[7] == SYS_NR_EXIT,
+                f"the last number seen was {words[7]} (want {SYS_NR_EXIT}, "
+                f"exit -- which at 6.3 returns, because the caller is the "
+                f"kernel's own boot thread)"))
+
+    # FMASK DID ITS JOB, and this is the row the whole flag list exists for.
+    # The kernel was interruptible before the instruction and the handler was
+    # entered with IF clear.
+    out.append((words[10] == 0,
+                f"not one masked flag survived into the handler "
+                f"(0x{words[10]:X} of them did)"))
+    out.append((words[9] & EFLAGS_IF == 0,
+                f"specifically IF was clear on entry, RFLAGS 0x{words[9]:X}"))
+    out.append((words[9] & 2 != 0,
+                f"and bit 1 is still set, which is the architectural value and "
+                f"proves the register was read rather than left at zero"))
+    return out
+
+
+def do_syscall(sock_path, elf, timeout, quiet):
+    _v, paddr = symbol_phys_addr(elf, SYSCALL_SYMBOL)
+    entry_virt, _p = symbol_phys_addr(elf, SYSCALL_ENTRY_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-syscall.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    try:
+        client.handshake()
+        client.pmemsave(paddr, SYSCALL_WORDS * 8, tmp.name)
+        words = list(struct.unpack(f"<{SYSCALL_WORDS}Q",
+                                   open(tmp.name, "rb").read()))
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+
+    results = check_syscall(words, entry_virt)
+    if not report_hwstate(results, quiet):
+        print(f"        {SYSCALL_SYMBOL} at 0x{paddr:X}, "
+              f"{SYSCALL_ENTRY_SYMBOL} at 0x{entry_virt:X}")
+        return 1
+    return 0
+
+
 VFS_SYMBOL = "fk_vfs_state"
 VFS_WORDS = 12
 VFS_MAGIC = 0x5646530601
@@ -3142,6 +3291,112 @@ def do_selftest():
                       "-ENOTDIR is rejected",
                words=vf_words(w10=(1 << 64) - 2))
 
+    # ---- roadmap 6.3 ------------------------------------------------------
+    # THE ENTRY ADDRESS IS A PARAMETER OF THE CHECK, so the fixture supplies
+    # both sides and can make them disagree.  Against the real guest one side
+    # comes from the register and the other from kernel.elf's symbol table.
+    SC_ENTRY = 0xFFFFFFFF80101234
+
+    def sc_words(**kw):
+        w = [0] * SYSCALL_WORDS
+        w[0] = SYSCALL_MAGIC
+        w[1] = 0
+        w[2] = KERNEL_CS << 32
+        w[3] = SC_ENTRY
+        w[4] = SYSCALL_FMASK
+        w[5] = 0xD01
+        w[6] = 3
+        w[7] = SYS_NR_EXIT
+        w[8] = 0
+        w[9] = 2
+        w[10] = 0
+        w[11] = 0
+        for k, v in kw.items():
+            w[int(k[1:])] = v
+        return w
+
+    def expect_syscall(ok_wanted, what, words=None, entry=SC_ENTRY):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_syscall(
+            sc_words() if words is None else words, entry))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} "
+                  f"(wanted {ok_wanted}, got {got})")
+            fail_n += 1
+
+    expect_syscall(True, "a complete, correct syscall bring-up is accepted")
+    expect_syscall(False, "a state block with no magic is rejected",
+                   words=sc_words(w0=0))
+    expect_syscall(False, "a non-zero bring-up status is rejected",
+                   words=sc_words(w11=(1 << 64) - 100))
+    expect_syscall(False, "a non-zero syscall_init status is rejected",
+                   words=sc_words(w1=(1 << 64) - 3))
+
+    # THE GDT CONTRACT.  CS comes from STAR[47:32] and SS from that PLUS
+    # EIGHT, so a STAR naming the DATA selector gives the CPU a data
+    # descriptor for CS and whatever follows it for SS.
+    expect_syscall(False, "a STAR naming the kernel DATA selector is rejected",
+                   words=sc_words(w2=KERNEL_DS << 32))
+    expect_syscall(False, "a STAR with a null selector is rejected",
+                   words=sc_words(w2=0))
+    expect_syscall(False, "a STAR whose selector carries an RPL is rejected",
+                   words=sc_words(w2=(KERNEL_CS | 3) << 32))
+    expect_syscall(False, "a non-zero 32-bit legacy target is rejected",
+                   words=sc_words(w2=(KERNEL_CS << 32) | 0x1000))
+    # THE ONE THAT MATTERS MOST, because it is the mistake a reader of the
+    # Linux source would make: copying __USER32_CS into the sysret half while
+    # the GDT still has no Ring 3 descriptors for it to name.
+    expect_syscall(False, "a plausible-looking sysret half is rejected -- "
+                          "there are no Ring 3 descriptors for it to name",
+                   words=sc_words(w2=(0x23 << 48) | (KERNEL_CS << 32)))
+
+    expect_syscall(False, "an LSTAR that is not the ELF's fk_syscall_entry is "
+                          "rejected", words=sc_words(w3=SC_ENTRY + 0x10))
+    expect_syscall(False, "a low-half LSTAR is rejected", entry=0x101234,
+                   words=sc_words(w3=0x101234))
+    expect_syscall(False, "a zero LSTAR is rejected", entry=0,
+                   words=sc_words(w3=0))
+
+    expect_syscall(False, "an FMASK missing IF is rejected",
+                   words=sc_words(w4=SYSCALL_FMASK & ~EFLAGS_IF))
+    expect_syscall(False, "an FMASK missing DF is rejected",
+                   words=sc_words(w4=SYSCALL_FMASK & ~EFLAGS_DF))
+    expect_syscall(False, "an FMASK missing NT is rejected",
+                   words=sc_words(w4=SYSCALL_FMASK & ~EFLAGS_NT))
+    # A BLANKET MASK WOULD PASS EVERY "is this flag in it" ROW, which is why
+    # the check also refuses bits that must NOT be masked.
+    expect_syscall(False, "a blanket 0x3FFFFF mask is rejected",
+                   words=sc_words(w4=0x3FFFFF))
+    expect_syscall(False, "a zero FMASK is rejected", words=sc_words(w4=0))
+
+    expect_syscall(False, "EFER without SCE is rejected -- SYSCALL would be "
+                          "#UD", words=sc_words(w5=0xD00))
+
+    expect_syscall(False, "zero calls is rejected -- the MSRs can be perfect "
+                          "and the instruction still not arrive",
+                   words=sc_words(w6=0))
+    expect_syscall(False, "one call is rejected -- a stub that corrupts its "
+                          "own stack survives the first and not the second",
+                   words=sc_words(w6=1))
+    expect_syscall(False, "a last number that is not exit is rejected",
+                   words=sc_words(w7=SYS_NR_WRITE))
+
+    # THE FMASK ASSERTION ITSELF, which is the row the whole flag list is for.
+    expect_syscall(False, "a surviving IF is rejected",
+                   words=sc_words(w9=0x202, w10=EFLAGS_IF))
+    expect_syscall(False, "a surviving DF is rejected",
+                   words=sc_words(w9=0x402, w10=EFLAGS_DF))
+    # AN ALL-ZERO RFLAGS IS NOT EVIDENCE.  Bit 1 is architecturally always
+    # set, so a zero here means the register was never read rather than that
+    # every flag was cleared -- which would make the row above pass for the
+    # wrong reason.
+    expect_syscall(False, "an all-zero entry RFLAGS is rejected -- bit 1 is "
+                          "architecturally always set",
+                   words=sc_words(w9=0))
+
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
 
@@ -3211,6 +3466,12 @@ def main(argv=None):
     vf.add_argument("--timeout", type=float, default=15.0)
     vf.add_argument("--quiet", action="store_true")
 
+    sc = sub.add_parser("syscall", help="assert the syscall trap and its MSRs")
+    sc.add_argument("--qmp", required=True)
+    sc.add_argument("--elf", required=True)
+    sc.add_argument("--timeout", type=float, default=15.0)
+    sc.add_argument("--quiet", action="store_true")
+
     nv = sub.add_parser("nvme", help="assert the NVMe read against the disk")
     nv.add_argument("--qmp", required=True)
     nv.add_argument("--elf", required=True)
@@ -3279,6 +3540,8 @@ def main(argv=None):
             return do_xhci(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "vfs":
             return do_vfs(args.qmp, args.elf, args.timeout, args.quiet)
+        if args.cmd == "syscall":
+            return do_syscall(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "nvme":
             return do_nvme(args.qmp, args.elf, args.timeout, args.quiet,
                            image=args.image)

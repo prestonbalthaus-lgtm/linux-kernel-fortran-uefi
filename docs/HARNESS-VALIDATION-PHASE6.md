@@ -191,3 +191,104 @@ Kill by PID.
 - **Concurrency is not addressed at all.** The pools take no lock, exactly as
   `fk_heap_m` does not, and the bring-up runs before `sched_start` for the same
   reason.
+
+---
+
+# Roadmap 6.3: does the syscall trap's test actually catch bugs?
+
+The constraint that shapes everything: **this suite must not execute WRMSR.** A
+host test that programmed the real `MSR_LSTAR` would point THIS machine's system
+calls at a Fortran routine inside a test binary.
+
+So `fk_rdmsr` and `fk_wrmsr` are supplied as a MODEL MSR FILE, and that turns
+out to be worth more than the instruction would be: **a model can be made to
+REFUSE a write**, which is the only way to check that `syscall_init` notices.
+That is S114-S116.
+
+## What each gate can establish
+
+| claim | where | why not the other place |
+|---|---|---|
+| STAR's composition, FMASK's bit set | host | pure values over the GDT selectors |
+| the router's dispatch, including R10 | host | ordinary code over a frame C can build |
+| the read-back notices a dropped write | host | only a model can drop one |
+| the four registers took the values | boot | needs a real WRMSR |
+| a SYSCALL instruction arrives | boot | the host cannot execute one |
+| FMASK cleared what it names | boot | needs a real caller and a real instruction |
+
+**The constants are all the kernel's.** `asm/msr-index.h` and
+`uapi/asm/processor-flags.h` both compile standalone out of the vendor tree, so
+`FK_SYSCALL_FMASK` is diffed against the OR of Linux's own fourteen flag names
+rather than against `0x257FD5` written a second time. The include order matters
+and is stated in `mk/syscall.mk`: the uapi `processor-flags.h` is the standalone
+one, the internal copy pulls in `linux/mem_encrypt.h`.
+
+**And MSR_LSTAR has an independent channel.** The sentinel reads
+`fk_syscall_entry` out of `kernel.elf`'s symbol table and diffs it against what
+the guest read back out of the register. The guest never sees that number.
+
+## Mutations
+
+`tools/mutate-syscall.sh`. 20 cases, 17 on the host and 3 that need a boot.
+
+| # | Injected defect | Detected? | How it surfaced |
+|---|---|---|---|
+| S110 | STAR names the kernel DATA selector | yes | the CPU would get a data descriptor for CS |
+| S111 | a plausible sysret half nothing can name | yes | `STAR[63:48] is zero` |
+| S112 | FMASK without IF | yes | the vendor-OR comparison |
+| S113 | FMASK is a blanket `0x3FFFFF` | yes | bit 1 and VM must NOT be masked |
+| S114 | STAR is never read back | yes | the model drops the write |
+| S115 | FMASK is never read back | yes | the model drops the write |
+| S116 | EFER.SCE is never read back | yes | the model drops the write |
+| S117 | SCE armed before LSTAR holds an address | yes | the write-order trace |
+| S118 | a low-half entry point is accepted | yes | LSTAR is loaded into RIP |
+| S119 | the syscall stack is not 16-byte aligned | yes | the ABI wants alignment AT a call |
+| S120 | read and write dispatched to each other | yes | the router's own rows |
+| S121 | the result is never written into the frame's rax | yes | `POP_GPRS` is what returns it |
+| S122 | an unknown number answers success | yes | `-ENOSYS`, not a halt and not zero |
+| S123 | a successful write is not counted | yes | the byte total |
+| S124 | a refused write still moves the byte total | yes | the byte total |
+| S125 | exit does not record its code | yes | the exit rows |
+| S134 | a `sysretq` in the image | yes | `the image contains SYSRET, but STAR[63:48] is zero`, naming the instruction |
+| S131 | **boot:** FMASK without IF | yes | **the sentinel's own flag list only** |
+| S132 | **boot:** a data descriptor for CS | yes | a fault inside a fault -- it arrives as a hang |
+| S133 | **boot:** the tail does not skip int_no/err_code | yes | IRETQ reads -1 as the return RIP |
+
+### S134 refused a build-system error before it refused a SYSRET
+
+The gate asserts a NEGATIVE -- that the image contains no SYSRET -- and a check
+of that shape passes trivially when it is broken, which is why it needed a case
+at all. The first attempt reported a catch that was not the gate's:
+`sysretcheck-boot` was reachable only through `Makefile.boot`, so
+`./tools/run.sh` answered `No rule to make target` and the non-zero exit was
+counted as a refusal. **A build-system error read as a passing gate is the same
+false green the gate itself exists to prevent, arriving one layer out.** The
+target is forwarded from the top-level `Makefile` now, and the refusal names
+the instruction: `ffffffff8010133f: 48 0f 07 sysretq`.
+
+Its second assertion, `grep -q iretq boot/interrupts.S`, is NOT covered and
+cannot usefully be: `irq_common` has carried an IRETQ since roadmap 3.2b, so
+that grep succeeds whatever the syscall stub's tail becomes. It is decoration.
+The objdump half is the gate, and S133 is what covers the tail.
+
+### S131 is the one that justifies spelling the flags out twice
+
+The kernel's own `syscall_masked_flags()` CANNOT see it. It ANDs the entry
+RFLAGS with the same constant that was written, so removing a bit removes it
+from both sides of the comparison and the answer stays zero. Only
+`qmp-sentinel.py`'s independent list refuses it -- which is why that check
+enumerates the fourteen flags rather than reading FMASK out of the guest and
+checking it against itself.
+
+That is the general lesson and it is not new here: a checker that derives its
+expectation from the thing it is checking is not a checker.
+
+## What the live FMASK assertion does not reach
+
+The boot check sets IF and the arithmetic flags before the instruction and
+requires none of them to survive. It does NOT set TF, DF, IOPL, NT or RF: TF
+would single-step the instruction before the syscall, RF cannot be set by POPFQ
+at all, and a kernel running with DF set even briefly would break every string
+operation between there and the instruction. Those five are covered by the value
+check on FMASK and by the sentinel's independent list, and are named here as
+what the LIVE assertion does not prove.
