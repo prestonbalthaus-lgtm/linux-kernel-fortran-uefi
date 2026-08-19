@@ -32,24 +32,25 @@ That grep now answers differently, which is the whole of the milestone:
 IRQ0 is overridden to GSI 2. No IOAPIC redirection entry for the timer can be
 written without it, and 3.3 is where it gets used.
 
-**2026-08-19 (later): 6.2 IS IN.** 1.1 and 6.1 landed earlier the same day -- the
-string half, then the VFS -- and 6.2 is what they were for: a `vfs_lookup` MISS
-now means "read the directory off the NVMe drive", which is the promise 6.1's
-header made in as many words.
+**2026-08-19 (later): 6.2 AND 6.3 ARE BOTH IN.** 1.1 and 6.1 landed earlier the
+same day -- the string half, then the VFS -- and this pair is what they were for.
+6.2 makes a `vfs_lookup` MISS mean "read the directory off the NVMe drive", which
+is the promise 6.1's header made in as many words; 6.3 makes a `SYSCALL`
+instruction land in a Fortran handler and come back.
 
-**6.3 IS DONE AND IS NOT ON MASTER RIGHT NOW**, which is why its box below is
-still open. It landed as PR #35 and was then REVERTED by PR #36, so master's
-tree went back to exactly `ff80fe0`'s. It comes back as a revert OF that revert,
-because `phase6/syscall-trap`'s commits are already ancestors of master and
-re-merging the branch would bring nothing -- git considers them merged and says
-`Already up to date`.
+**THEY DID NOT LAND IN A STRAIGHT LINE, and the detour is worth recording.** 6.3
+merged first as PR #35, was reverted by PR #36, then 6.2 landed as PR #34, and
+6.3 came back as a REVERT OF THAT REVERT. Nothing was wrong with the original
+order -- the two were built off the same master deliberately, share no code, and
+either could have gone first.
 
-That is worth writing down rather than discovering twice: **reverting a merge
-does not un-merge the branch.** The branch is still in the history, so the only
-way to bring the work back is to revert the revert. The two milestones were
-built off the same master deliberately -- they share no code -- and this one was
-rebased onto the post-revert master and re-verified on the rebased tip rather
-than inheriting a green earned on a base that no longer exists.
+What the detour taught is one sentence: **reverting a merge does not un-merge the
+branch.** `phase6/syscall-trap`'s commits stayed ancestors of master, so
+re-merging it reported `Already up to date` and brought nothing back; the only
+way to restore the work was to revert the revert. And 6.2 was REBASED onto the
+post-revert master and re-verified on the rebased tip -- audit, all four boot
+variants, both mutation tables -- rather than inheriting a green earned on a base
+that no longer existed.
 
 **The number 6.2 exists for**, printed by the running kernel off a real
 controller, and matched by `debugfs` reading the same image:
@@ -59,13 +60,23 @@ controller, and matched by `debugfs` reading the same image:
 Inode 13, 28 bytes, LBA 102. `debugfs` says inode 13, 28 bytes, block 51, which
 at a 1 KiB block is LBA 102.
 
+**And the number 6.3 exists for**, which is two lines and the second is the
+interesting one:
+
+    Fortran Kernel: syscall calls/nr/ret 0x00000001/0x00000001/0x00000005
+    Fortran Kernel: RFLAGS on entry/masked survivors 0x00000002/0x00000000
+
+The caller was provably interruptible (`RFLAGS = 0x282`) and the handler was
+entered at `0x02` -- bit 1 alone, which is architecturally always set. Not one
+of FMASK's fourteen flags survived, and IF is the one that makes the software
+stack switch in `boot/interrupts.S` safe at all.
+
 **Next, in order, with what each is really waiting on:**
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 6.3 | the syscall ABI trap | DONE. Landed as #35, reverted by #36, and returns as a revert of that revert | nothing but the button |
 | 6.4 | the ELF loader | BOTH prerequisites are now paid: 1.1 gave it strings and 6.2 gives it something to load a binary out of | nothing. It is also where the SINGLY-INDIRECT BLOCK gets written -- 6.2 implements twelve direct blocks, 12 KiB, which will not hold a BusyBox and refuses `-EFBIG` rather than truncating |
-| 7.1 | the Ring 3 drop | 6.3 built the path and stopped one step short of it on purpose | 6.3 landing |
+| 7.1 | the Ring 3 drop | 6.3 built the path and stopped one step short of it on purpose | nothing. It is FIVE edits and one box: add the three user descriptors at selectors 0x28/0x30/0x38 (GDT slots 5-7, the first free after the TSS pair), fill in `STAR[63:48]`, change the two selectors the syscall stub pushes into its frame, make `sys_exit` stop returning, and DELETE `sysretcheck-boot` -- which exists only to keep a zero sysret half honest |
 | 7.2 | boot /bin/init (BusyBox) | 6.2 can find it and 6.4 will load it | 6.4, and 6.4's indirect block |
 
 **WHAT 5.1 NEEDED BEFORE IT COULD TOUCH THE CONTROLLER, AND IT IS PAID.** 4.2
@@ -2309,9 +2320,63 @@ Preparing the kernel to host external C applications.
         through, of which four were one mistake, an assertion too coarse to tell two
         mechanisms apart, and two were bugs in the runner.
 
-   * [ ] 6.3 Syscall ABI Trap
+   * [x] 6.3 Syscall ABI Trap
 
         Validation: Assembly syscall instruction routes to a Fortran handler (sys_write, sys_read, sys_exit).
+
+        DONE 2026-08-19. `src/cpu/fk_syscall.f90` programs EFER.SCE, STAR, LSTAR and FMASK
+        and reads all four back; `boot/interrupts.S` gains the entry stub; the router
+        dispatches to `sys_read`, `sys_write` and `sys_exit`, which are SCAFFOLDS that record
+        what they were asked. It does not implement a system call and it does not drop to
+        Ring 3 -- 7.1 owns that. What it establishes is the PATH.
+
+        IRETQ AND NOT SYSRETQ, and it is the one deliberate deviation. SYSRET derives CS from
+        `STAR[63:48] + 16` and SS from `+ 8`, both with RPL hardwired to 3
+        (`segment.h:177-186`), so no encoding of it returns to CPL 0 and it cannot return the
+        only caller 6.3 has. In 64-bit mode IRETQ ALWAYS pops SS:RSP, privilege change or
+        not, so ONE frame shape serves ring 0 now and ring 3 at 7.1 -- only the two selectors
+        in it change. Linux answers the same problem the same way: every kernel-to-kernel
+        return in `entry_64.S` is IRETQ.
+
+        `STAR[63:48]` IS ZERO AND A GATE ASSERTS IT IS. A plausible-looking value there --
+        `__USER32_CS` copied from `common.c:2306`, say -- would name Ring 3 descriptors this
+        GDT does not contain: a register that reads as configured and faults on first use.
+        That is only sound while nothing executes SYSRET, so `sysretcheck-boot` objdumps the
+        image and refuses one. 7.1 adds the three descriptors, fills in the sysret half, and
+        DELETES that gate.
+
+        THE STACK SWITCH IS SOFTWARE'S AND THAT IS WHY IF IS IN FMASK. `entry_64.S:65-66`:
+        SYSCALL does not change RSP. Between arriving and having a kernel stack there is a
+        window in which RSP is still the caller's, and an interrupt there would push its
+        frame onto a pointer the caller chose. No swapgs: nothing in this tree uses a GS
+        base, so the stack comes from an ordinary global -- and that is the first thing 7.1
+        revisits if per-CPU state ever arrives.
+
+        THE ROUTER READS THE FRAME, which dissolves the R10 problem rather than shuffling
+        around it: the Linux syscall ABI puts argument 4 in R10 because SYSCALL destroys RCX
+        with the return address, and a frame-reading router makes R10 the field called `r10`.
+        `fk_regs_t` is now PUBLISHED by `fk_idt_m` rather than copied, so one type describes
+        the exception, interrupt and syscall paths.
+
+        THE CONSTANTS ARE ALL THE KERNEL'S. `asm/msr-index.h` and
+        `uapi/asm/processor-flags.h` both compile standalone out of the vendor tree, so every
+        MSR number, `EFER_SCE` and all fourteen FMASK flags are spelled with Linux's own
+        names and `FK_SYSCALL_FMASK` is diffed against the OR of that list. And MSR_LSTAR has
+        an INDEPENDENT channel: the sentinel reads `fk_syscall_entry` out of `kernel.elf`'s
+        symbol table and diffs it against what the guest read back out of the register.
+
+        The host suite supplies a MODEL MSR FILE rather than executing WRMSR, which it must
+        not -- a test that programmed the real MSR_LSTAR would point the HOST's system calls
+        at a Fortran routine in a test binary. The model is worth more anyway: it can be made
+        to DROP a write, which is the only way to check the read-back at all.
+
+        63 host checks and 24 new sentinel self-test assertions, every one shown to REFUSE.
+        `docs/HARNESS-VALIDATION-PHASE6.md` carries the mutation table: 20 cases, 20 refused,
+        three of which need a boot. S131 is the one worth the sentence -- FMASK without IF is
+        INVISIBLE to the kernel's own `syscall_masked_flags()`, which ANDs the entry flags
+        with the same constant that was written, so removing a bit removes it from both sides
+        of the comparison. Only the sentinel's independent list can refuse it. A checker that
+        derives its expectation from the thing it is checking is not a checker.
 
    * [ ] 6.4 ELF Binary Loader
 
