@@ -37,6 +37,7 @@ module fk_vmm_m
             FK_VMM_PHYSMAP, FK_VMM_SCRATCH, &
             FK_PTE_P, FK_PTE_RW, FK_PTE_PS, FK_PTE_NX, FK_PTE_ADDR, &
             FK_PTE_PWT, FK_PTE_PCD, FK_VMM_MMIO, FK_VMM_HEAP, FK_VMM_WC, &
+            FK_VMM_NVME, &
             vmm_reserve_mmio, vmm_reserved_holes, vmm_map_mmio, &
             vmm_punch_physmap, FK_VMM_E_IS_RAM, FK_VMM_IOAPIC, &
             FK_VMM_ECAM, FK_VMM_XHCI, &
@@ -107,6 +108,11 @@ module fk_vmm_m
   ! alias of it would let a store sit in a cache line while the device waits.
   integer(c_int64_t), parameter :: FK_VMM_XHCI = &
        FK_VMM_MMIO + int(z'22000000', c_int64_t)
+  ! roadmap 5.3.  Same 64 KiB treatment as the xHCI's and for the same reason:
+  ! the doorbells start at BAR0+0x1000 and the MSI-X table at +0x2000, so a
+  ! window that stopped at the register block would map neither.
+  integer(c_int64_t), parameter :: FK_VMM_NVME = &
+       FK_VMM_MMIO + int(z'23000000', c_int64_t)
   ! 1 GiB into the MMIO window, clear of the two single pages above and with
   ! room for the 256 MiB an MCFG allocation covering all 256 buses declares.
   ! Derived from FK_VMM_MMIO like the others: three constants that must stay

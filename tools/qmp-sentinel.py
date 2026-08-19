@@ -192,6 +192,13 @@ XHCI_SYMBOL = "fk_xhci_state"
 XHCI_WORDS = 19
 MSI_SYMBOL = "fk_msi_count"
 XHCI_MAGIC = 0x584843490501
+NVME_SYMBOL = "fk_nvme_state"
+NVME_IRQ_SYMBOL = "fk_nvme_irq_completions"
+NVME_WORDS = 21
+NVME_MAGIC = 0x4E564D450503
+# Sectors in the image tools/qemu-boot-test.sh generates.  The namespace must
+# be at least this big or the read is reading past the end of it.
+IMAGE_BLOCKS = 2048
 KBD_SYMBOL = "fk_usbkbd_state"
 KBD_WORDS = 24
 KBD_MAGIC = 0x55534B420502
@@ -1664,6 +1671,165 @@ DEFAULT_KEYS = (("shift", True), ("a", True), ("a", False), ("shift", False),
                 ("a", True), ("b", True), ("b", False), ("a", False))
 
 
+def check_nvme(words, irq_count, sector, host_sector, regs):
+    """Roadmap 5.3, and the sector is checked against the DISK, not a constant.
+
+    `host_sector` is read out of the image file this gate generated, so a
+    changed fixture cannot drift away from its own assertion -- there is no
+    second copy of the expected bytes to forget to update.
+    """
+    out = []
+    out.append((words[0] == NVME_MAGIC,
+                f"fk_nvme_state magic is 0x{words[0]:012X} "
+                f"(want 0x{NVME_MAGIC:012X}: the bring-up ran)"))
+    if words[0] != NVME_MAGIC:
+        return out
+
+    st = words[20]
+    out.append((st == 0, f"the NVMe bring-up returned {_signed(st)}"))
+
+    cap, cc, csts, aqa = words[3], words[5], words[6], words[7]
+    out.append((words[1] != 0,
+                f"BAR0 is 0x{words[1]:X}, a decoded memory address"))
+    out.append((cap not in (0, 0xFFFFFFFFFFFFFFFF),
+                f"CAP reads 0x{cap:016X}, so the window really decodes"))
+    out.append((bool(csts & 1),
+                f"CSTS 0x{csts:08X}: the controller is READY"))
+    out.append((not (csts & 2),
+                "and reports no controller fatal status"))
+    out.append((bool(cc & 1), f"CC 0x{cc:08X}: EN is set"))
+    # THE TWO FIELDS THAT FAIL LATE. A controller enabled with IOSQES/IOCQES at
+    # zero accepts the enable and rejects Create I/O SQ two commands later.
+    out.append((((cc >> 16) & 0xF) == 6,
+                f"CC.IOSQES is {(cc >> 16) & 0xF} (2**6 = 64-byte submission "
+                "entries)"))
+    out.append((((cc >> 20) & 0xF) == 4,
+                f"CC.IOCQES is {(cc >> 20) & 0xF} (2**4 = 16-byte completion "
+                "entries)"))
+    # AQA is zero-based in both halves: a two-entry queue puts 1 in each.
+    out.append(((aqa & 0xFFF) == 1 and ((aqa >> 16) & 0xFFF) == 1,
+                f"AQA 0x{aqa:08X}: both admin queues are 2 entries, written "
+                "zero-based"))
+    out.append((words[8] == words[2] and words[9] == words[2] + 4096,
+                f"ASQ 0x{words[8]:X} and ACQ 0x{words[9]:X} are the first two "
+                f"pages of the run at 0x{words[2]:X}"))
+
+    out.append((words[13] == 512,
+                f"the namespace reports {words[13]}-byte blocks, decoded from "
+                "Identify Namespace"))
+    # The namespace has to be at least as big as the image the gate wrote, or
+    # the read that follows is reading past the end of something.
+    want_blocks = 0 if host_sector is None else IMAGE_BLOCKS
+    out.append((words[12] >= want_blocks,
+                f"and {words[12]} of them (the image is {want_blocks})"))
+
+    # THE WRAP. Two-entry admin queues and four admin commands, so the head
+    # returns to 0 twice and the phase flips with it. A 64-deep queue would
+    # never wrap and this assertion could not exist.
+    out.append((words[19] in (0, 1),
+                f"the admin completion queue's phase is {words[19]} after "
+                f"wrapping, head at {words[18]}"))
+
+    out.append((irq_count > 0,
+                f"{irq_count} completion(s) were consumed IN INTERRUPT "
+                "CONTEXT -- the MSI-X vector is shared with the xHCI, so this "
+                "counter is the only NVMe-specific claim available"))
+    out.append((words[15] == irq_count,
+                f"and the guest published the same count ({words[15]})"))
+
+    if sector is not None and host_sector is not None:
+        guard = sector[512:1024]
+        sector = sector[0:512]
+        # The kernel zeroed the whole page before the read, so anything here
+        # was written by the controller -- and a one-block read has no business
+        # writing here at all.
+        out.append((guard == bytes(len(guard)),
+                    f"the 512 bytes ABOVE the sector are still zero, so the "
+                    f"read was one block and not two "
+                    f"(first 16: {guard[:16].hex()})"))
+        out.append((sector == host_sector,
+                    f"the 512 bytes at 0x{words[11]:X} are byte-for-byte the "
+                    f"disk image's sector 0 "
+                    f"(first 16: {sector[:16].hex()})"))
+        # The two words the guest itself decoded, against the same source.
+        want = int.from_bytes(host_sector[0:8], "little")
+        out.append((words[16] == want,
+                    f"the guest read 0x{words[16]:016X} as the first eight "
+                    f"bytes (disk says 0x{want:016X})"))
+        want2 = int.from_bytes(host_sector[8:16], "little")
+        out.append((words[17] == want2,
+                    f"and 0x{words[17]:016X} as the next eight "
+                    f"(disk says 0x{want2:016X})"))
+
+    if regs:
+        cc_live, csts_live = regs
+        out.append((cc_live == cc,
+                    f"CC read off the device model is 0x{cc_live:08X}, the "
+                    "same value the guest published"))
+        out.append((bool(csts_live & 1),
+                    f"and CSTS 0x{csts_live:08X} still says READY"))
+    return out
+
+
+def _signed(v):
+    return v - (1 << 64) if v >= (1 << 63) else v
+
+
+def do_nvme(sock_path, elf, timeout, quiet, image=None):
+    _v, st_paddr = symbol_phys_addr(elf, NVME_SYMBOL)
+    _v, irq_paddr = symbol_phys_addr(elf, NVME_IRQ_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-nvme.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    sector = None
+    regs = None
+    try:
+        client.handshake()
+        client.pmemsave(st_paddr, NVME_WORDS * 8, tmp.name)
+        words = list(struct.unpack(f"<{NVME_WORDS}Q",
+                                   open(tmp.name, "rb").read()))
+        client.pmemsave(irq_paddr, 8, tmp.name)
+        irq_count = struct.unpack("<Q", open(tmp.name, "rb").read())[0]
+        if words[0] == NVME_MAGIC and words[11]:
+            # AT THE PHYSICAL BASE the guest published: no page table in the
+            # path, so this is what a bus master left in DRAM.
+            # 1024 bytes, not 512: the second half is a GUARD REGION. A
+            # one-block read must not touch it, and reading only the block
+            # that was asked for cannot see a write past it.
+            client.pmemsave(words[11], 1024, tmp.name)
+            sector = open(tmp.name, "rb").read()
+        if words[0] == NVME_MAGIC and words[1]:
+            r = xp_words(client, words[1] + 0x14, 1)
+            c2 = xp_words(client, words[1] + 0x1C, 1)
+            if r and c2:
+                regs = (r[0], c2[0])
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+    # A MISSING IMAGE IS A FAILURE, not a reason to skip. Silently dropping
+    # the sector comparison would leave the gate green while proving nothing
+    # about the one thing this milestone exists to do.
+    host_sector = None
+    if image:
+        if not os.path.exists(image):
+            print(f"  \033[31mFAIL\033[0m  the disk image {image} is not "
+                  "there, so the sector cannot be checked against anything")
+            return 1
+        with open(image, "rb") as f:
+            host_sector = f.read(512)
+        if len(host_sector) != 512:
+            print(f"  \033[31mFAIL\033[0m  {image} is shorter than one "
+                  "sector")
+            return 1
+    results = check_nvme(words, irq_count, sector, host_sector, regs)
+    if not report_hwstate(results, quiet):
+        print(f"        {NVME_SYMBOL} at 0x{st_paddr:X}")
+        return 1
+    return 0
+
+
 def do_usbkbd(sock_path, elf, timeout, quiet, keys=DEFAULT_KEYS,
               chars="Aab", report=0x0000000000040000):
     """Wait for the guest to arm EP1, inject keys, and assert what it did.
@@ -2418,9 +2584,16 @@ def do_selftest():
         "    SMBus: PCI device 8086:2930\n"
         "  Bus  0, device   2, function 0:\n"
         "    USB controller: PCI device 1b36:000d\n"
+        "  Bus  0, device   3, function 0:\n"
+        "    Class 0108: PCI device 1b36:0010\n"
     )
+    # SEVEN functions since roadmap 5.3: the NVMe controller at 00:03.0 joined
+    # the xHCI at 00:02.0. The live check needed no change for either -- it
+    # compares the guest's list against `info pci` AS SETS, so both sides grow
+    # together. This fixture is the one hardcoded count in the tree and it
+    # moves with the machine.
     Q35_FNS = [(0, 0, 0, 0x8086, 0x29C0), (0, 1, 0, 0x1234, 0x1111),
-               (0, 2, 0, 0x1B36, 0x000D),
+               (0, 2, 0, 0x1B36, 0x000D), (0, 3, 0, 0x1B36, 0x0010),
                (0, 31, 0, 0x8086, 0x2918), (0, 31, 2, 0x8086, 0x2922),
                (0, 31, 3, 0x8086, 0x2930)]
     # What the kernel publishes about the xHCI after enabling it: 00:02.0,
@@ -2726,6 +2899,107 @@ def do_selftest():
     expect_rings(False, "a controller that completed its command and sent no "
                         "message is rejected", msi=0)
 
+    # roadmap 5.3's checker, self-tested for the reason check_xhci_rings was
+    # not until it was too late: an assertion nothing has watched refuse is not
+    # evidence of anything.
+    print("--- the NVMe read, and the disk it is checked against ---")
+
+    NV_RUN = 0x358000
+    NV_SECTOR = bytes(range(16)) + bytes(496)
+    NV_READ = NV_SECTOR + bytes(512)          # sector + a clean guard
+
+    def nv_words(**kw):
+        w = [0] * NVME_WORDS
+        w[0] = NVME_MAGIC
+        w[1] = 0x680000000
+        w[2] = NV_RUN
+        w[3] = 0x004008200F0107FF
+        w[4] = 0x00010400
+        w[5] = 0x00460001          # EN, IOSQES 6, IOCQES 4
+        w[6] = 0x00000001          # RDY
+        w[7] = 0x00010001          # AQA, both halves zero-based
+        w[8] = NV_RUN
+        w[9] = NV_RUN + 4096
+        w[10] = NV_RUN + 4 * 4096
+        w[11] = NV_RUN + 5 * 4096
+        w[12] = 2048
+        w[13] = 512
+        w[15] = 1
+        w[16] = int.from_bytes(NV_SECTOR[0:8], "little")
+        w[17] = int.from_bytes(NV_SECTOR[8:16], "little")
+        w[18] = 0
+        w[19] = 1
+        w[20] = 0
+        for k, v in kw.items():
+            w[int(k[1:])] = v
+        return w
+
+    def expect_nvme(ok_wanted, what, words=None, irq=1, sector=None,
+                    host=None, regs=(0x00460001, 0x00000001)):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_nvme(
+            nv_words() if words is None else words, irq,
+            NV_READ if sector is None else sector,
+            NV_SECTOR if host is None else host, regs))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} "
+                  f"(wanted {ok_wanted}, got {got})")
+            fail_n += 1
+
+    expect_nvme(True, "a complete, correct NVMe bring-up is accepted")
+    expect_nvme(False, "a state block with no magic is rejected",
+                words=nv_words(w0=0))
+    expect_nvme(False, "a non-zero bring-up status is rejected",
+                words=nv_words(w20=(1 << 64) - 5))
+    expect_nvme(False, "a BAR of zero is rejected", words=nv_words(w1=0))
+    expect_nvme(False, "a CAP of all ones is rejected -- the window decodes "
+                       "nothing", words=nv_words(w3=0xFFFFFFFFFFFFFFFF))
+    expect_nvme(False, "a controller that is not READY is rejected",
+                words=nv_words(w6=0))
+    expect_nvme(False, "one reporting a controller fatal status is rejected",
+                words=nv_words(w6=0x3))
+    expect_nvme(False, "CC with EN clear is rejected", words=nv_words(w5=0x00460000))
+    # THE PAIR THAT FAILS LATE, and the reason they are checked here at all.
+    expect_nvme(False, "CC.IOSQES left at zero is rejected -- Create I/O SQ "
+                       "would fail two commands later",
+                words=nv_words(w5=0x00400001))
+    expect_nvme(False, "CC.IOCQES left at zero is rejected",
+                words=nv_words(w5=0x00060001))
+    expect_nvme(False, "AQA written with the entry COUNT rather than count-1 "
+                       "is rejected", words=nv_words(w7=0x00020002))
+    expect_nvme(False, "ASQ and ACQ swapped is rejected",
+                words=nv_words(w8=NV_RUN + 4096, w9=NV_RUN))
+    expect_nvme(False, "a block size that is not the namespace's is rejected",
+                words=nv_words(w13=4096))
+    expect_nvme(False, "a namespace smaller than the image is rejected",
+                words=nv_words(w12=1))
+    expect_nvme(False, "a phase tag outside {0,1} is rejected",
+                words=nv_words(w19=7))
+    expect_nvme(False, "zero completions in interrupt context is rejected -- "
+                       "the read may have happened, but not by interrupt",
+                irq=0)
+    expect_nvme(False, "a guest whose published count disagrees with the "
+                       "counter is rejected", words=nv_words(w15=9))
+    # THE DISK ITSELF.
+    expect_nvme(False, "a sector that does not match the image is rejected",
+                sector=bytes(1024))
+    expect_nvme(False, "a read that spilled into the guard region is rejected "
+                       "-- a zero-based NLB written as a count reads TWO "
+                       "blocks and the first one still matches",
+                sector=NV_SECTOR + b"FORTRAN-KERNEL!!" + bytes(496))
+    expect_nvme(False, "an off-by-one LBA -- sector 1's bytes where sector 0's "
+                       "belong -- is rejected",
+                sector=b"FORTRAN-KERNEL!!" + bytes(496) + bytes(512))
+    expect_nvme(False, "a guest that read different bytes than are in DRAM is "
+                       "rejected", words=nv_words(w16=0xDEADBEEF))
+    expect_nvme(False, "a CC read off the device model that disagrees with the "
+                       "guest is rejected", regs=(0x00000001, 0x00000001))
+    expect_nvme(False, "a device model that no longer says READY is rejected",
+                regs=(0x00460001, 0x00000000))
+
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
 
@@ -2789,6 +3063,13 @@ def main(argv=None):
     t.add_argument("--min-delta", type=int, default=2)
     t.add_argument("--quiet", action="store_true")
 
+    nv = sub.add_parser("nvme", help="assert the NVMe read against the disk")
+    nv.add_argument("--qmp", required=True)
+    nv.add_argument("--elf", required=True)
+    nv.add_argument("--image", required=True)
+    nv.add_argument("--timeout", type=float, default=15.0)
+    nv.add_argument("--quiet", action="store_true")
+
     k = sub.add_parser("usbkbd", help="inject keys and assert the HID path")
     k.add_argument("--qmp", required=True)
     k.add_argument("--elf", required=True)
@@ -2848,6 +3129,9 @@ def main(argv=None):
             return do_dma(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "xhci":
             return do_xhci(args.qmp, args.elf, args.timeout, args.quiet)
+        if args.cmd == "nvme":
+            return do_nvme(args.qmp, args.elf, args.timeout, args.quiet,
+                           image=args.image)
         if args.cmd == "usbkbd":
             return do_usbkbd(args.qmp, args.elf, args.timeout, args.quiet,
                              keys=tuple((k[:-1], k[-1] == "+")

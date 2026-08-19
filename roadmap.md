@@ -36,7 +36,7 @@ written without it, and 3.3 is where it gets used.
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 5.3 | the NVMe controller | 4.2 finds it (`pcie_find_nvme`), 3.x gives it contiguous memory, and 5.2 has now walked the whole PCIe-to-device path once on the xHCI | submission and completion queues, and an admin queue before either |
+| 6.1 | the VFS | all three hardware pillars are up: 2.2 draws, 5.2 reads keys, 5.3 reads blocks | `strlen`/`strcpy`/`strcmp`, which 1.1 still owes and which nothing else is waiting on |
 | 1.1 | the string half of the core library | unchanged and still owed | nothing; 6.1 and 6.4 cannot start without it |
 
 **WHAT 5.1 NEEDED BEFORE IT COULD TOUCH THE CONTROLLER, AND IT IS PAID.** 4.2
@@ -2075,15 +2075,40 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
         command -- intermittently, which is the worst way to find out. Before
         this milestone there was no device and nothing else to arrive.
 
-   * [ ] 5.3 NVMe Storage Controller
+   * [x] 5.3 NVMe Storage Controller
 
         Validation: Kernel identifies the NVMe drive, establishes Submission/Completion Queues, and successfully reads Sector 0 into a Fortran array.
 
-        THE REGISTER BLOCKS ARE IN, THE DRIVE IS UNTOUCHED.
-        `src/drivers/storage/fk_nvme_types.f90` carries the controller register
-        block, the persistent-memory region block, the 64-byte submission queue
-        entry and the 16-byte completion queue entry. Measured, like the others.
-        Blocked on the same one thing 5.1 is: the interrupt route.
+        DONE, and the disk is the first ORACLE this project has had that exists
+        outside the machine before the machine is switched on:
+
+            NVMe cap/version/mqes/dstrd 0x004008200F0107FF/0x00010400/0x00000800/0x00
+            NVMe cc/csts/aqa 0x00460001/0x00000001/0x00010001
+            NVMe nsid 1 blocks/lba-bytes 0x0000000000000800/0x00000200
+            NVMe sector 0 [0..15] 0x0706050403020100/0x0F0E0D0C0B0A0908
+
+        The gate reads those 512 bytes at their PHYSICAL base and diffs them
+        against the image file on the host, read at check time -- so there is no
+        second copy of the expected bytes to drift.
+
+        MEASURED FIRST: the controller is at 00:03.0 with class 01/08/02, which
+        pcie_find_nvme already matched, and its BAR0 is at 0x680000000 -- ABOVE
+        top-of-RAM. vmm_punch_physmap only punches below map_top and refuses
+        anything overlapping RAM, so a high BAR needed no special case at all.
+        THE PCI FUNCTION SET GREW FROM SIX TO SEVEN AND THE LIVE GATE DID NOT
+        CHANGE: it compares the guest's list against `info pci` as SETS, so both
+        sides grew together. Only qmp-sentinel's hardcoded fixture moved.
+
+        THE ADMIN QUEUES ARE TWO ENTRIES ON PURPOSE. A completion queue's phase
+        tag flips when the consumer wraps, and with a 64-deep queue and four
+        admin commands the wrap NEVER RUNS -- a driver with inverted flip logic
+        would pass every gate built on it. Two is the minimum the specification
+        allows and it makes the ordinary bring-up wrap twice.
+
+        WHAT IS NOT DONE: no host suite for fk_nvme (it needs a controller model
+        of the kind tests/drivers/usb/test_xhci.c implements), no PRP list, no
+        writes, one namespace, one I/O queue pair, and the disable path is
+        unexercised because CC.EN is already 0 when the kernel first looks.
 
 ## 🌉 Phase 6: The User-Space Bridge (Distro Maker)
 
