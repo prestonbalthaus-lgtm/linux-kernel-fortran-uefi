@@ -110,8 +110,15 @@ module fk_kmain_m
                          vga_width, vga_height, vga_print_string
   use fk_vfs_m, only: vfs_reset, vfs_mount, vfs_root, vfs_add, vfs_resolve, &
                       vfs_dentry_inode, vfs_inode_ino, vfs_inode_size, &
-                      vfs_inode_mode, vfs_dentries_used, vfs_inodes_used
+                      vfs_inode_mode, vfs_dentries_used, vfs_inodes_used, &
+                      vfs_inode_priv, vfs_fills
   use fk_vfs_types_m, only: FK_S_IFDIR, FK_S_IFREG, FK_E_NOTDIR
+  use fk_blkdev_m, only: blk_attach, blk_reads, FK_BLK_SECTOR_BYTES
+  use fk_blkdev_nvme_m, only: blkdev_nvme_attach, blkdev_nvme_timeouts, &
+                              FK_BLKNVME_OK
+  use fk_ext2_m, only: ext2_reset, ext2_mount, ext2_block_size, &
+                       ext2_inode_size, ext2_blocks_count, ext2_inodes_count, &
+                       ext2_inode_table, ext2_first_lba
   use fk_console_m, only: FK_CON_OK, console_init, console_write, &
                          console_print_hex, console_cols, console_rows, &
                          console_ready, fk_console_scrolls
@@ -496,7 +503,39 @@ module fk_kmain_m
   ! Six pages, one run: admin SQ and CQ, I/O SQ and CQ, the identify buffer
   ! and the sector buffer.  One physical base for the host to check, 5.1's
   ! argument unchanged.
-  integer(c_int64_t), parameter :: FK_NVME_PAGES = 6_c_int64_t
+  ! SEVEN, AND THE SEVENTH IS ROADMAP 6.2's.  Six pages are 5.3's own -- two
+  ! admin queues, two I/O queues, an Identify buffer and a sector -- and the
+  ! block layer's buffer is the seventh.  It is taken from THIS run rather than
+  ! allocated separately, and that is a decision with two reasons.
+  !
+  ! The first is that it belongs here: the buffer is memory an NVMe controller
+  ! writes by DMA, page-aligned because fk_nvme.f90's submit() leaves PRP2 zero
+  ! and a transfer that crossed a page would need a PRP list.  A run that
+  ! already carries five such buffers is where the sixth goes.
+  !
+  ! The second is measured and is NOT a root cause.  6.2 first asked the PMM
+  ! for its own page, and that call was seen to return 0 -- refusal -- ONCE in
+  ! nine boots, with the PMM's published totals byte-identical to the passing
+  ! runs (0x5FFF7D total, 0x5FFD36 free) and the NVMe run at the same 0x35F000.
+  ! pmm_alloc_contiguous(1) is covered by tests/mm/test_pmm.c:561 and passes
+  ! there, and frame 0 is reserved by pmm_init precisely so that 0 cannot be a
+  ! successful address (fk_pmm.f90:640-641), so neither of the two obvious
+  ! explanations fits.  IT IS NOT EXPLAINED.  Folding the buffer into a run
+  ! that is allocated once, in one place, whose failure nvme_bringup already
+  ! reports, removes 6.2's dependence on that call; it does not remove the
+  ! question, which is recorded rather than closed.
+  integer(c_int64_t), parameter :: FK_NVME_PAGES = 7_c_int64_t
+
+  ! See nvme_bringup's completion wait for why this is not 2,000,000.
+  integer(c_int32_t), parameter :: FK_NVME_COMPLETION_SPINS = &
+       200000000_c_int32_t
+
+  ! Physical and virtual base of that seventh page, published by nvme_bringup
+  ! for ext2_bringup.  Zero until the controller has come up, which is what
+  ! makes "there is no drive on this machine" a readable state rather than an
+  ! address nobody set.
+  integer(c_int64_t), save :: fs_buf_phys = 0_c_int64_t
+  integer(c_int64_t), save :: fs_buf_virt = 0_c_int64_t
   ! [0] magic [1] BAR0 [2] run [3] cap [4] version [5] cc [6] csts [7] aqa
   ! [8] asq [9] acq [10] identify buf phys [11] sector buf phys [12] ns blocks
   ! [13] lba bytes [14] last status [15] completions taken IN INTERRUPT CONTEXT
@@ -544,6 +583,52 @@ module fk_kmain_m
        int(z'5646530601', c_int64_t)
   integer(c_int64_t), volatile, save, bind(c, name="fk_vfs_state") :: &
        fk_vfs_state(0:11)
+
+  ! roadmap 6.2
+  character(kind=c_char, len=*), parameter :: FK_E2_START = &
+       "Fortran Kernel: mounting ext2 off the NVMe drive (roadmap 6.2)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_E2_NONE = &
+       "Fortran Kernel: no NVMe drive, so no filesystem to mount (roadmap 6.2)." // &
+       FK_CRLF // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_E2_SUPER = &
+       "Fortran Kernel: ext2 bsize/isize/blocks/inodes 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_E2_TABLE = &
+       "Fortran Kernel: ext2 sb/root/itab 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_E2_FOUND = &
+       "Fortran Kernel: /bin/init ino/size/LBA 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_E2_IO = &
+       "Fortran Kernel: ext2 blocks read/dentries filled 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_E2_DONE = &
+       "Fortran Kernel: a cache miss reached the disk and /bin/init came back (roadmap 6.2)." // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_E2_BAD = &
+       "Fortran Kernel: the ext2 bring-up FAILED, status 0x" // c_null_char
+
+  ! [0] magic [1] the VFS superblock ext2 mounted [2] block size
+  ! [3] inode size [4] blocks count [5] inodes count [6] group-0 inode table
+  ! [7] /bin/init's dentry [8] its ext2 inode number [9] its size
+  ! [10] its mode [11] its starting LBA [12] blocks read off the device
+  ! [13] dentries filled through the miss path [14] what /bin/init/ answered
+  ! [15] sequence status
+  ! THIS ROUTINE'S OWN FAILURES, IN A RANGE THE DRIVER CANNOT PRODUCE, and
+  ! that separation is not cosmetic -- it cost a wrong diagnosis.  fk_ext2.f90's
+  ! statuses run -1..-14, and this routine used to report its own steps as
+  ! -1..-4.  A superblock that could not be READ therefore surfaced as
+  ! FK_EXT2_E_IO = -1, which is also what "there is no block buffer" said, and
+  ! an intermittent device timeout was investigated for an hour as an allocator
+  ! that refuses a page.  A diagnostic that names the wrong mechanism sends the
+  ! reader to the wrong place; the ranges are disjoint now so it cannot.
+  integer(c_int32_t), parameter :: FK_E2B_NODISK = -100_c_int32_t
+  integer(c_int32_t), parameter :: FK_E2B_NOBUF = -101_c_int32_t
+  integer(c_int32_t), parameter :: FK_E2B_NODEV = -102_c_int32_t
+  integer(c_int32_t), parameter :: FK_E2B_NOLBA = -103_c_int32_t
+  integer(c_int32_t), parameter :: FK_E2B_NOSLASH = -104_c_int32_t
+
+  integer(c_int64_t), parameter :: FK_E2S_MAGIC = &
+       int(z'455854320602', c_int64_t)
+  integer(c_int64_t), volatile, save, bind(c, name="fk_ext2_state") :: &
+       fk_ext2_state(0:15)
 
   ! roadmap 5.2
   character(kind=c_char, len=*), parameter :: FK_KBD_START = &
@@ -2713,6 +2798,8 @@ contains
     iocq  = run + 3_c_int64_t * FK_PMM_PAGE_SIZE
     idbuf = run + 4_c_int64_t * FK_PMM_PAGE_SIZE
     sec   = run + 5_c_int64_t * FK_PMM_PAGE_SIZE
+    fs_buf_phys = run + 6_c_int64_t * FK_PMM_PAGE_SIZE
+    fs_buf_virt = run_virt + 6_c_int64_t * FK_PMM_PAGE_SIZE
     fk_nvme_state(10) = idbuf
     fk_nvme_state(11) = sec
     call nvme_set_sector_buf(run_virt + 5_c_int64_t * FK_PMM_PAGE_SIZE, &
@@ -2796,7 +2883,19 @@ contains
     ! THE VOLATILE VARIABLE, not the accessor over it.  An accessor is
     ! side-effect-free to gfortran, so this loop would load once and spin on a
     ! value that can never change -- which is exactly what it did.
-    do i = 1_c_int32_t, 2000000_c_int32_t
+    ! THE BUDGET IS 100x WHAT IT WAS, AND THAT IS A ROADMAP 5.3 FIX MADE HERE
+    ! BECAUSE 6.2 IS WHAT FOUND IT.  At 2,000,000 this loop expired roughly one
+    ! boot in ten, and only on a host running back-to-back VMs -- the boot gate
+    ! had never been run a dozen times in a row before, so the defect was
+    ! latent rather than absent.  It surfaced as FK_NVME_E_CMD, the controller
+    ! blamed for a completion that had in fact simply not arrived yet.
+    !
+    ! An EMPTY SPIN MEASURES HOST CPU TIME, not device time: under KVM on a
+    ! contended host the vCPU is descheduled and the count runs out while the
+    ! device is still working.  It stays a bound rather than becoming a forever
+    ! loop, because a controller that has genuinely stopped must fail the
+    ! bring-up and let the console say so.
+    do i = 1_c_int32_t, FK_NVME_COMPLETION_SPINS
        if (fk_nvme_irq_completions > 0_c_int64_t) exit
     end do
     fk_nvme_state(15) = fk_nvme_irq_completions
@@ -3176,6 +3275,166 @@ contains
     fk_vfs_state(0) = FK_VFSS_MAGIC
     fk_vfs_state(11) = int(st, c_int64_t)
   end subroutine vfs_failed
+
+  ! roadmap 6.2.  Everything above this point built its tree by hand; this one
+  ! reads it off the drive.  The claim is narrow and it is the milestone's:
+  ! NOTHING is put in the dentry tree here, so every component of /bin/init is
+  ! a cache MISS, and the only way a handle comes back is that vfs_lookup asked
+  ! src/fs/fk_ext2.f90, which asked the NVMe controller for a block.
+  !
+  ! IT DOES NOT vfs_reset.  6.1's tree stays where it is under superblock 1 and
+  ! ext2 takes superblock 2, which is what four superblock slots are for -- and
+  ! it means the boot proves the two coexist rather than asserting it.
+  subroutine ext2_bringup()
+    implicit none
+    integer(c_int64_t) :: buf_phys, buf_virt, lba
+    integer(c_int32_t) :: sb, d, ino_h, probe, st
+    character(kind=c_char), target :: pbuf(FK_VFS_PBUF)
+
+    fk_ext2_state = 0_c_int64_t
+    fk_ext2_state(0) = FK_E2S_MAGIC
+
+    ! fk_nvme_state(20) is 5.3's own verdict and it is zero only when the
+    ! controller came all the way up.  On FK_MACHINE=pc there is no NVMe
+    ! function at all, so this is the machine-independent way to say "there is
+    ! no disk here" without this file knowing what a PCI bus is.
+    if (fk_nvme_state(0) /= FK_NVMES_MAGIC .or. &
+        fk_nvme_state(20) /= 0_c_int64_t) then
+       call serial_print_string(FK_E2_NONE)
+       fk_ext2_state(15) = int(FK_E2B_NODISK, c_int64_t)
+       return
+    end if
+    call serial_print_string(FK_E2_START)
+
+    ! THE SEVENTH PAGE OF 5.3's DMA RUN, not a fresh allocation.  See
+    ! FK_NVME_PAGES above for why, including the one thing that is measured and
+    ! unexplained.  It cannot be zero here: nvme_bringup sets it before it
+    ! publishes the success status this routine has already checked.
+    buf_phys = fs_buf_phys
+    buf_virt = fs_buf_virt
+    if (buf_phys == 0_c_int64_t .or. buf_virt == 0_c_int64_t) then
+       call ext2_failed(FK_E2B_NOBUF)
+       return
+    end if
+
+    st = blkdev_nvme_attach(1_c_int32_t, nvme_lba_bytes())
+    if (st /= FK_BLKNVME_OK) then
+       call ext2_failed(FK_E2B_NODEV)
+       return
+    end if
+    call blk_attach(buf_virt, buf_phys, int(FK_PMM_PAGE_SIZE, c_int32_t), &
+                    nvme_ns_size())
+    call ext2_reset()
+
+    sb = ext2_mount(1_c_int32_t)
+    if (sb <= 0_c_int32_t) then
+       call ext2_failed(sb)
+       return
+    end if
+    fk_ext2_state(1) = int(sb, c_int64_t)
+    fk_ext2_state(2) = int(ext2_block_size(), c_int64_t)
+    fk_ext2_state(3) = int(ext2_inode_size(), c_int64_t)
+    fk_ext2_state(4) = ext2_blocks_count()
+    fk_ext2_state(5) = ext2_inodes_count()
+    fk_ext2_state(6) = ext2_inode_table()
+
+    call serial_print_string(FK_E2_SUPER)
+    call serial_print_hex(int(ext2_block_size(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(ext2_inode_size(), c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(ext2_blocks_count(), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(ext2_inodes_count(), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_E2_TABLE)
+    call serial_print_hex(int(sb, c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(int(vfs_root(sb), c_int64_t), 4_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(ext2_inode_table(), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! THE MILESTONE, in one call.  Nothing named "bin" or "init" has been put
+    ! anywhere; both components miss, both misses read a directory block off
+    ! the drive, and vfs_add puts the answer in the tree on the way back.
+    call path_copy(FK_VFS_P_INIT, pbuf)
+    d = vfs_resolve(c_loc(pbuf(1)))
+    if (d <= 0_c_int32_t) then
+       call ext2_failed(d)
+       return
+    end if
+    ino_h = vfs_dentry_inode(d)
+    lba = ext2_first_lba(ino_h)
+    if (lba <= 0_c_int64_t) then
+       call ext2_failed(FK_E2B_NOLBA)
+       return
+    end if
+
+    ! And the same refusal 6.1 makes, now against a real filesystem: /bin/init
+    ! is a regular file on the disk, so a trailing slash is still -ENOTDIR.
+    call path_copy(FK_VFS_P_SLASH, pbuf)
+    probe = vfs_resolve(c_loc(pbuf(1)))
+    if (probe /= -FK_E_NOTDIR) then
+       call ext2_failed(FK_E2B_NOSLASH)
+       return
+    end if
+
+    fk_ext2_state(7) = int(d, c_int64_t)
+    fk_ext2_state(8) = vfs_inode_priv(ino_h)
+    fk_ext2_state(9) = vfs_inode_size(ino_h)
+    fk_ext2_state(10) = int(vfs_inode_mode(ino_h), c_int64_t)
+    fk_ext2_state(11) = lba
+    fk_ext2_state(12) = blk_reads()
+    fk_ext2_state(13) = vfs_fills()
+    fk_ext2_state(14) = int(probe, c_int64_t)
+
+    call serial_print_string(FK_E2_FOUND)
+    call serial_print_hex(vfs_inode_priv(ino_h), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(vfs_inode_size(ino_h), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(lba, 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! THE READ COUNT IS THE EVIDENCE, not decoration.  A driver that fabricated
+    ! the dentry returns a handle just as positive as this one; only a counter
+    ! the block layer moves separates "it answered" from "it read the disk".
+    call serial_print_string(FK_E2_IO)
+    call serial_print_hex(blk_reads(), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(vfs_fills(), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    fk_ext2_state(15) = 0_c_int64_t
+    call serial_print_string(FK_E2_DONE)
+    call serial_print_string(FK_NL)
+
+    ! Roadmap 6.2's validation sentence asks for this on the GOP console and
+    ! not only on the wire, because the console is the half a human watching
+    ! the machine can see.
+    call console_write(FK_E2_FOUND, 64_c_int32_t)
+    call console_print_hex(vfs_inode_size(ino_h), 8_c_int32_t)
+    call console_print_hex(lba, 8_c_int32_t)
+    call console_newline()
+  end subroutine ext2_bringup
+
+  subroutine ext2_failed(st)
+    implicit none
+    integer(c_int32_t), intent(in) :: st
+
+    call serial_print_string(FK_E2_BAD)
+    call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    ! HOW MANY READS THE DEVICE NEVER COMPLETED, printed next to every failure.
+    ! Without it a timeout and a parse error look identical from the console,
+    ! which is how the first one was misread.
+    call serial_print_hex(blkdev_nvme_timeouts(), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+    fk_ext2_state(0) = FK_E2S_MAGIC
+    fk_ext2_state(15) = int(st, c_int64_t)
+  end subroutine ext2_failed
 
   ! A parameter string copied into storage whose address can be taken.  c_loc
   ! needs a TARGET and a named constant is not one; a character SCALAR with a
@@ -3663,6 +3922,12 @@ contains
     call dma_bringup()
 
     call vfs_bringup()
+
+    ! roadmap 6.2, and it must follow both of the boxes it stands on: the VFS
+    ! (it mounts into those pools) and the NVMe controller (it reads through
+    ! it).  It skips itself cleanly on a machine with no drive, which is what
+    ! keeps FK_MACHINE=pc a passing configuration.
+    call ext2_bringup()
 
     ! roadmap 4.0's second half.  Last, because from here on this routine is
     ! one of three threads rather than the only one, and everything above

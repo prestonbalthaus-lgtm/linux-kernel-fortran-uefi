@@ -1680,7 +1680,216 @@ DEFAULT_KEYS = (("shift", True), ("a", True), ("a", False), ("shift", False),
                 ("a", True), ("b", True), ("b", False), ("a", False))
 
 
-def check_nvme(words, irq_count, sector, host_sector, regs):
+# ---------------------------------------------------------------------------
+# Roadmap 6.2.  AN INDEPENDENT ext2 WALKER, written in Python and sharing no
+# line with src/fs/fk_ext2.f90.  Roadmap 4.1 set this standard -- every value
+# the kernel printed was first read out of guest memory by a host-side walk of
+# the same tables, in a different language -- and it is the reason this file is
+# worth more than an assertion that the guest agrees with itself.
+#
+# So the disk image has THREE readers that must agree: mke2fs wrote it, this
+# walks it, and the Fortran parses it off a real controller by DMA.
+# ---------------------------------------------------------------------------
+E2_SUPER_OFF = 1024
+E2_MAGIC = 0xEF53
+E2_ROOT_INO = 2
+
+
+def _le(b, off, n):
+    return int.from_bytes(b[off:off + n], "little")
+
+
+class Ext2Image:
+    """Enough of ext2 to resolve a path to (ino, size, first_block)."""
+
+    def __init__(self, path):
+        self.d = open(path, "rb").read()
+        sb = self.d[E2_SUPER_OFF:E2_SUPER_OFF + 1024]
+        if _le(sb, 56, 2) != E2_MAGIC:
+            raise ValueError("not an ext2 filesystem")
+        self.block_size = 1024 << _le(sb, 24, 4)
+        self.first_data = _le(sb, 20, 4)
+        self.blocks_count = _le(sb, 4, 4)
+        self.inodes_count = _le(sb, 0, 4)
+        self.ipg = _le(sb, 40, 4)
+        self.bpg = _le(sb, 32, 4)
+        rev = _le(sb, 76, 4)
+        self.inode_size = _le(sb, 88, 2) if rev >= 1 else 128
+        self.first_ino = _le(sb, 84, 4) if rev >= 1 else 11
+        self.incompat = _le(sb, 96, 4) if rev >= 1 else 0
+        # descriptor_loc(), super.c:813: the block after the superblock's.
+        self.gd_table = E2_SUPER_OFF // self.block_size + 1
+        gd = self.block(self.gd_table)
+        self.inode_table = _le(gd, 8, 4)
+
+    def block(self, n):
+        off = n * self.block_size
+        return self.d[off:off + self.block_size]
+
+    def inode(self, ino):
+        group = (ino - 1) // self.ipg
+        index = (ino - 1) % self.ipg
+        gd = self.block(self.gd_table)[group * 32:group * 32 + 32]
+        table = _le(gd, 8, 4)
+        byte = index * self.inode_size
+        blk = self.block(table + byte // self.block_size)
+        off = byte % self.block_size
+        raw = blk[off:off + self.inode_size]
+        mode = _le(raw, 0, 2)
+        size = _le(raw, 4, 4)
+        if mode & 0o170000 == 0o100000:
+            size |= _le(raw, 108, 4) << 32
+        blocks = [_le(raw, 40 + 4 * k, 4) for k in range(12)]
+        return {"ino": ino, "mode": mode, "size": size,
+                "links": _le(raw, 26, 2), "blocks": blocks}
+
+    def lookup(self, dir_ino, name):
+        want = name.encode()
+        ino = self.inode(dir_ino)
+        want_blocks = (ino["size"] + self.block_size - 1) // self.block_size
+        for bi in range(min(12, want_blocks)):
+            if ino["blocks"][bi] == 0:
+                continue
+            blk = self.block(ino["blocks"][bi])
+            off = 0
+            while off <= self.block_size - 12:
+                child = _le(blk, off, 4)
+                rec = _le(blk, off + 4, 2)
+                nlen = blk[off + 6]
+                if rec < 12 or rec & 3 or off + rec > self.block_size:
+                    break
+                if child and blk[off + 8:off + 8 + nlen] == want:
+                    return child
+                off += rec
+        return 0
+
+    def resolve(self, path):
+        ino = E2_ROOT_INO
+        for comp in [c for c in path.split("/") if c]:
+            ino = self.lookup(ino, comp)
+            if ino == 0:
+                return None
+        return self.inode(ino)
+
+
+EXT2_SYMBOL = "fk_ext2_state"
+EXT2_WORDS = 16
+EXT2_MAGIC = 0x455854320602
+
+
+def check_ext2(words, img):
+    """Roadmap 6.2, and the guest is diffed against a SECOND implementation.
+
+    `img` is an Ext2Image built from the same file QEMU handed the guest as an
+    NVMe namespace, walked here in Python.  Nothing below compares the guest to
+    a constant; every expectation is what an independent reader found on the
+    same bytes.
+    """
+    out = []
+    out.append((words[0] == EXT2_MAGIC,
+                f"fk_ext2_state magic is 0x{words[0]:012X} "
+                f"(want 0x{EXT2_MAGIC:012X}: the bring-up ran)"))
+    if words[0] != EXT2_MAGIC:
+        return out
+
+    out.append((_signed(words[15]) == 0,
+                f"the ext2 bring-up returned {_signed(words[15])}"))
+    if _signed(words[15]) != 0:
+        return out
+
+    out.append((words[1] > 0, f"ext2 mounted as VFS superblock {words[1]}"))
+    out.append((words[2] == img.block_size,
+                f"block size {words[2]} (the image says {img.block_size})"))
+    out.append((words[3] == img.inode_size,
+                f"inode size {words[3]} (the image says {img.inode_size})"))
+    # THE FIXTURE IS NOT FORMATTED AT 128 ON PURPOSE.  A driver that hardcoded
+    # EXT2_GOOD_OLD_INODE_SIZE would read every inode after the first at the
+    # wrong offset, and only a filesystem whose inodes are not 128 bytes can
+    # tell the difference.
+    out.append((img.inode_size != 128,
+                f"and the image is deliberately not the original 128, so a "
+                f"hardcoded inode size could not have produced it"))
+    out.append((words[4] == img.blocks_count,
+                f"{words[4]} blocks (the image says {img.blocks_count})"))
+    out.append((words[5] == img.inodes_count,
+                f"{words[5]} inodes (the image says {img.inodes_count})"))
+    out.append((words[6] == img.inode_table,
+                f"group 0's inode table is block {words[6]} "
+                f"(the image says {img.inode_table})"))
+
+    init = img.resolve("/bin/init")
+    if init is None:
+        out.append((False, "the host walker cannot find /bin/init either -- "
+                           "the fixture is not what this check expects"))
+        return out
+
+    out.append((words[7] > 0, f"/bin/init resolved to dentry {words[7]}"))
+    out.append((words[8] == init["ino"],
+                f"its ext2 inode is {words[8]} "
+                f"(the host walker says {init['ino']})"))
+    out.append((words[9] == init["size"],
+                f"its size is {words[9]} bytes "
+                f"(the host walker says {init['size']})"))
+    out.append((words[10] & 0o170000 == 0o100000,
+                f"its mode 0o{words[10]:o} is a regular file"))
+    out.append((words[10] == init["mode"],
+                f"and matches the on-disk mode 0o{init['mode']:o} exactly"))
+
+    want_lba = init["blocks"][0] * (img.block_size // 512)
+    out.append((words[11] == want_lba,
+                f"its first block lands at LBA {words[11]} (the host walker "
+                f"says block {init['blocks'][0]}, which is LBA {want_lba})"))
+
+    # THE CLAIM THE MILESTONE IS ABOUT.  A tree built in memory would answer
+    # with the same dentry handle; only a counter the block layer moves can
+    # say the answer came off the drive.  Two components of /bin/init were
+    # missing, so the miss path fired at least twice and at least two blocks
+    # were read to satisfy them.
+    out.append((words[12] >= 2,
+                f"{words[12]} block(s) were read off the device to answer it"))
+    out.append((words[13] >= 2,
+                f"and {words[13]} dentries were filled through the miss path"))
+    out.append((_signed(words[14]) == -20,
+                f"/bin/init/ answered {_signed(words[14])} (want -20, "
+                f"-ENOTDIR: the trailing slash survived the walk)"))
+    return out
+
+
+def do_ext2(sock_path, elf, timeout, quiet, image=None):
+    _v, paddr = symbol_phys_addr(elf, EXT2_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-ext2.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    try:
+        client.handshake()
+        client.pmemsave(paddr, EXT2_WORDS * 8, tmp.name)
+        words = list(struct.unpack(f"<{EXT2_WORDS}Q",
+                                   open(tmp.name, "rb").read()))
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+
+    # A MISSING IMAGE IS A FAILURE, not a reason to skip -- do_nvme's rule, for
+    # do_nvme's reason. Dropping the comparison would leave the gate green
+    # while proving nothing about the one thing this milestone exists to do.
+    try:
+        img = Ext2Image(image)
+    except Exception as e:
+        print(f"  \033[31mFAIL\033[0m  the disk image {image} could not be "
+              f"walked here ({e}), so the guest has nothing to be checked "
+              f"against")
+        return 1
+
+    results = check_ext2(words, img)
+    if not report_hwstate(results, quiet):
+        print(f"        {EXT2_SYMBOL} at 0x{paddr:X}")
+        return 1
+    return 0
+
+
+def check_nvme(words, irq_count, sector, host_sector, regs, ext2_reads=0):
     """Roadmap 5.3, and the sector is checked against the DISK, not a constant.
 
     `host_sector` is read out of the image file this gate generated, so a
@@ -1743,8 +1952,18 @@ def check_nvme(words, irq_count, sector, host_sector, regs):
                 f"{irq_count} completion(s) were consumed IN INTERRUPT "
                 "CONTEXT -- the MSI-X vector is shared with the xHCI, so this "
                 "counter is the only NVMe-specific claim available"))
-    out.append((words[15] == irq_count,
-                f"and the guest published the same count ({words[15]})"))
+    # ACCOUNTING, NOT EQUALITY, AND ROADMAP 6.2 IS WHY THIS CHANGED.  5.3
+    # snapshots the completion counter the instant its one read lands, and this
+    # used to require the live counter to still hold that value -- true only
+    # while nothing else ever touched the controller.  6.2's block layer now
+    # reads the same drive afterwards, so equality is the wrong invariant and
+    # would go red on a kernel that is working perfectly.  Every completion is
+    # still accounted for, which is a STRONGER claim than the old one: it also
+    # catches a block layer that completed reads nobody asked for.
+    out.append((words[15] + ext2_reads == irq_count,
+                f"the guest published {words[15]} completion(s) at 5.3 and "
+                f"6.2's block layer has read {ext2_reads} block(s) since, "
+                f"which accounts for all {irq_count} of them"))
 
     if sector is not None and host_sector is not None:
         guard = sector[512:1024]
@@ -1867,6 +2086,7 @@ def do_nvme(sock_path, elf, timeout, quiet, image=None):
     client.connect()
     sector = None
     regs = None
+    ext2_reads = 0
     try:
         client.handshake()
         client.pmemsave(st_paddr, NVME_WORDS * 8, tmp.name)
@@ -1874,6 +2094,18 @@ def do_nvme(sock_path, elf, timeout, quiet, image=None):
                                    open(tmp.name, "rb").read()))
         client.pmemsave(irq_paddr, 8, tmp.name)
         irq_count = struct.unpack("<Q", open(tmp.name, "rb").read())[0]
+        # Roadmap 6.2 shares this controller, so its read count is part of the
+        # NVMe accounting rather than a separate concern. A tree with no
+        # filesystem mounted publishes no magic and contributes nothing.
+        try:
+            _v2, e2_paddr = symbol_phys_addr(elf, EXT2_SYMBOL)
+            client.pmemsave(e2_paddr, EXT2_WORDS * 8, tmp.name)
+            e2w = list(struct.unpack(f"<{EXT2_WORDS}Q",
+                                     open(tmp.name, "rb").read()))
+            if e2w[0] == EXT2_MAGIC:
+                ext2_reads = e2w[12]
+        except KeyError:
+            pass
         if words[0] == NVME_MAGIC and words[11]:
             # AT THE PHYSICAL BASE the guest published: no page table in the
             # path, so this is what a bus master left in DRAM.
@@ -1905,7 +2137,8 @@ def do_nvme(sock_path, elf, timeout, quiet, image=None):
             print(f"  \033[31mFAIL\033[0m  {image} is shorter than one "
                   "sector")
             return 1
-    results = check_nvme(words, irq_count, sector, host_sector, regs)
+    results = check_nvme(words, irq_count, sector, host_sector, regs,
+                         ext2_reads=ext2_reads)
     if not report_hwstate(results, quiet):
         print(f"        {NVME_SYMBOL} at 0x{st_paddr:X}")
         return 1
@@ -3211,6 +3444,13 @@ def main(argv=None):
     vf.add_argument("--timeout", type=float, default=15.0)
     vf.add_argument("--quiet", action="store_true")
 
+    e2 = sub.add_parser("ext2", help="assert the ext2 mount against the disk")
+    e2.add_argument("--qmp", required=True)
+    e2.add_argument("--elf", required=True)
+    e2.add_argument("--image", required=True)
+    e2.add_argument("--timeout", type=float, default=15.0)
+    e2.add_argument("--quiet", action="store_true")
+
     nv = sub.add_parser("nvme", help="assert the NVMe read against the disk")
     nv.add_argument("--qmp", required=True)
     nv.add_argument("--elf", required=True)
@@ -3281,6 +3521,9 @@ def main(argv=None):
             return do_vfs(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "nvme":
             return do_nvme(args.qmp, args.elf, args.timeout, args.quiet,
+                           image=args.image)
+        if args.cmd == "ext2":
+            return do_ext2(args.qmp, args.elf, args.timeout, args.quiet,
                            image=args.image)
         if args.cmd == "usbkbd":
             return do_usbkbd(args.qmp, args.elf, args.timeout, args.quiet,

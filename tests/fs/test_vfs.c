@@ -39,6 +39,32 @@
 #define VFS_FILES	16
 #define VFS_SUPERS	4
 
+/* THE MISS PATH (roadmap 6.2). vfs_lookup now asks a filesystem about a name
+ * the dentry tree does not have; src/fs/fk_ext2.f90 defines this symbol for the
+ * kernel and tests/fs/test_ext2.c defines it over a real ext2 image. Here it is
+ * a STUB THAT ALWAYS MISSES, which is what makes every 6.1 assertion below mean
+ * the same thing it meant before the seam existed -- a tree with no filesystem
+ * under it behaves exactly as it always did.
+ *
+ * It counts, and the count is not decoration: it is the only evidence that the
+ * seam is reached at all. A vfs_lookup that stopped calling it would leave
+ * every other check in this file green. */
+static long fill_calls;
+static int32_t fill_last_len;
+static char fill_last_name[NAME_MAX + 1];
+
+int32_t fk_vfs_fill(int32_t parent, const char *name, int32_t len)
+{
+	(void)parent;
+	fill_calls++;
+	fill_last_len = len;
+	if (len > 0 && len <= NAME_MAX) {
+		memcpy(fill_last_name, name, (size_t)len);
+		fill_last_name[len] = '\0';
+	}
+	return 0;
+}
+
 /* The mirrors. Field for field with src/fs/fk_vfs_types.f90. */
 struct fk_inode {
 	int32_t i_mode, i_nlink;
@@ -88,6 +114,7 @@ int32_t vfs_inode_nlink(int32_t i);
 int32_t vfs_file_inode(int32_t f);
 int64_t vfs_file_pos(int32_t f);
 int64_t vfs_super_magic(int32_t sb);
+int64_t vfs_fills(void);
 int32_t vfs_dentries_used(void);
 int32_t vfs_inodes_used(void);
 int32_t vfs_files_used(void);
@@ -491,6 +518,53 @@ static void test_open(void)
 	FK_EQ("and the slot comes back", 1, vfs_open(init_, O_RDONLY) > 0, "%d");
 }
 
+/* Roadmap 6.2 added a call out of vfs_lookup, and this is what proves it is
+ * reached, reached with the right arguments, and reached only when it should
+ * be. Nothing else in this file would notice if it stopped happening. */
+static void test_miss_path(void)
+{
+	int32_t sb, r, f, before;
+	int64_t fills_before;
+
+	vfs_reset();
+	fill_calls = 0;
+	sb = vfs_mount(0x5A, 4096, 1);
+	r = vfs_root(sb);
+
+	before = (int32_t)fill_calls;
+	fills_before = vfs_fills();
+	FK_EQ("a name in an empty root misses", 0, vfs_lookup(r, "bin", 3),
+	      "%d");
+	FK_EQ("and the filesystem was asked exactly once", before + 1,
+	      (int32_t)fill_calls, "%d");
+	FK_EQ("vfs_fills counts it too", fills_before + 1, vfs_fills(), "%lld");
+	FK_EQ("with the component's length", 3, fill_last_len, "%d");
+	FK_EQ("and its bytes, which are NOT NUL-terminated on the way in", 0,
+	      strcmp(fill_last_name, "bin"), "%d");
+
+	/* A name that IS in the tree must not reach the disk at all -- that is
+	 * the whole reason a dentry cache exists. */
+	FK_EQ("adding it works", 1, add(r, "bin", S_IFDIR | 0755, 0) > 0, "%d");
+	before = (int32_t)fill_calls;
+	FK_EQ("looking it up now hits", 1, vfs_lookup(r, "bin", 3) > 0, "%d");
+	FK_EQ("without asking the filesystem", before, (int32_t)fill_calls,
+	      "%d");
+
+	/* A NON-DIRECTORY IS NEVER FILLED FROM. Its i_priv is a file's inode
+	 * number and its contents are not directory records. */
+	f = add(r, "f", S_IFREG | 0644, 9);
+	before = (int32_t)fill_calls;
+	FK_EQ("a name inside a file misses", 0, vfs_lookup(f, "x", 1), "%d");
+	FK_EQ("and the filesystem is not asked", before, (int32_t)fill_calls,
+	      "%d");
+
+	/* vfs_reset must clear the counter, or a second mount inherits the
+	 * first one's tally. */
+	vfs_reset();
+	FK_EQ("reset clears the fill count", 0LL, (long long)vfs_fills(),
+	      "%lld");
+}
+
 int main(void)
 {
 	test_layout();
@@ -502,5 +576,6 @@ int main(void)
 	test_remove();
 	test_open();
 	test_lifecycle();
+	test_miss_path();
 	return fk_report("vfs");
 }

@@ -78,6 +78,7 @@ module fk_nvme_m
   public :: nvme_disable, nvme_admin_queues, nvme_enable
   public :: nvme_identify, nvme_create_cq, nvme_create_sq, nvme_read
   public :: nvme_isr, nvme_owner_isr, nvme_irq_completions, irq_completions
+  public :: nvme_isr_owns
   public :: nvme_last_status, nvme_last_cid, nvme_aqa, nvme_asq, nvme_acq
   public :: nvme_ns_size, nvme_lba_bytes, nvme_admin_head, nvme_admin_phase
   public :: nvme_ns_decode, nvme_sector_word, nvme_set_sector_buf
@@ -750,6 +751,20 @@ contains
        irq_completions = irq_completions + 1_c_int64_t
     end do
   end function nvme_isr
+
+  ! WHICH MECHANISM COMPLETED THE LAST COMMAND, and roadmap 6.2 is the caller
+  ! that has to know.  With the handler armed, nvme_read returns the instant it
+  ! rings the doorbell and the completion arrives on irq_completions; without
+  ! it, nvme_read has already reaped the completion itself and that counter
+  ! never moves.  A block layer that waits for the counter unconditionally
+  ! therefore hangs on exactly the path that needs no waiting.
+  function nvme_isr_owns() result(v) bind(c, name="nvme_isr_owns")
+    implicit none
+    integer(c_int32_t) :: v
+
+    v = 0_c_int32_t
+    if (isr_owns) v = 1_c_int32_t
+  end function nvme_isr_owns
 
   function nvme_irq_completions() result(v) &
        bind(c, name="nvme_irq_completions")

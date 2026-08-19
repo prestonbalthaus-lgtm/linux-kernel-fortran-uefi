@@ -120,6 +120,10 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/drivers/usb/fk_usb_kbd.f90 \
                src/drivers/storage/fk_nvme_types.f90 \
                src/drivers/storage/fk_nvme.f90 \
+               src/fs/fk_blkdev.f90 \
+               src/fs/fk_blkdev_nvme.f90 \
+               src/fs/fk_ext2_types.f90 \
+               src/fs/fk_ext2.f90 \
                src/cpu/fk_sched.f90 \
                src/boot/fk_kmain.f90
 
@@ -361,12 +365,23 @@ selftest-boot: $(KERNEL)
 # fk_pcie.o joined the list at roadmap 4.2's debt: it is the first module in
 # the tree to WRITE a device register, and the scanner's pattern covers movb
 # and movw stores as well as narrowed loads.
+# fk_blkdev.o joins this list at roadmap 6.2, and it is the first member that
+# reads DRAM rather than a device register.  The rule is the same either way:
+# the bytes it reads were written by a BUS MASTER, so the compiler must not be
+# allowed to narrow, hoist or cache the load -- which is why fk_blkdev.f90 goes
+# through fk_readl and declares no volatile pointer of its own.  Listing it
+# here is what keeps that true; the discriminator mmiocheck uses comes out of
+# the object rather than out of a name, so a module that reads its own .bss
+# narrowly still passes and a module that starts dereferencing a volatile
+# pointer does not.
 mmiocheck-boot: $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o $(BUILD)/fk_pcie.o \
-                $(BUILD)/fk_xhci.o $(BUILD)/fk_usb_kbd.o $(BUILD)/fk_nvme.o
+                $(BUILD)/fk_xhci.o $(BUILD)/fk_usb_kbd.o $(BUILD)/fk_nvme.o \
+                $(BUILD)/fk_blkdev.o
 	@bash tools/mmiocheck.sh --selftest
 	@bash tools/mmiocheck.sh $(BUILD)/fk_lapic.o $(BUILD)/fk_ioapic.o \
 	                         $(BUILD)/fk_pcie.o $(BUILD)/fk_xhci.o \
-	                         $(BUILD)/fk_usb_kbd.o $(BUILD)/fk_nvme.o
+	                         $(BUILD)/fk_usb_kbd.o $(BUILD)/fk_nvme.o \
+	                         $(BUILD)/fk_blkdev.o
 
 # Everything the boot path must survive inside the container. The remaining
 # gate -- does it actually boot -- needs a VM and therefore runs on the host:
