@@ -107,6 +107,15 @@ case_M110() {
   run_case M110-no-lower-bound-on-rec_len-so-the-walk-never-terminates
 }
 
+# M111 ESCAPES AND IT IS RIGHT TO, which is 1.1's M93 and 5.2's M71 again.
+# dir.c:124 refuses a rec_len that is not a multiple of four because no
+# EXT2_DIR_REC_LEN can produce one -- it is an integrity signal, not a bound.
+# With the other four refusals present, a rec_len of 13 is accepted by this
+# check's absence and then caught downstream: the walk lands mid-record, reads
+# a garbage header, and fails as corruption anyway. The OUTCOME is identical,
+# so no assertion this suite can make separates the two, and manufacturing a
+# fixture where it differs would be testing the fixture rather than the driver.
+# It is kept because the vendor keeps it and because it is one comparison.
 case_M111() {
   subst src/fs/fk_ext2.f90 \
     $'          if (iand(rec, FK_E2_DIR_PAD - 1_c_int32_t) /= 0_c_int32_t) return\n' \
@@ -238,10 +247,15 @@ case_M126() {
   subst src/fs/fk_vfs.f90 \
     $'    if (vfs_is_dir(parent) == 0_c_int32_t) return\n    filling = .true.' \
     $'    filling = .true.'
-  # BOTH SUITES. The answer is identical with this guard removed -- fk_ext2.f90
-  # refuses the same thing one layer down -- so only the FILL COUNTER can see
-  # it, and both suites assert on that counter.
   run_case M126-a-file-is-asked-for-its-directory-entries
+  # AND AGAIN FOR THE OTHER SUITE, WITH THE DEFECT RE-APPLIED.  run_case
+  # restores the tree before it returns, so a second call in the same case
+  # function runs against a CLEAN tree -- it tests the baseline and reports the
+  # pass as an escape.  Measured: the first draft of this table reported
+  # M126-vfs and M127 as escapes for exactly that reason, and both were fine.
+  subst src/fs/fk_vfs.f90 \
+    $'    if (vfs_is_dir(parent) == 0_c_int32_t) return\n    filling = .true.' \
+    $'    filling = .true.'
   run_case M126-vfs-a-file-is-asked-for-its-directory-entries build/run-vfs
 }
 
@@ -251,7 +265,11 @@ case_M127() {
   subst src/fs/fk_vfs.f90 \
     $'    if (c > FK_VFS_NONE) then\n       if (dentry_ok(c)) d = c\n    end if' \
     $'    d = c'
-  run_case M127-the-fillers-errno-is-returned-as-a-dentry
+  # THE VFS SUITE, NOT THE ext2 ONE.  src/fs/fk_ext2.f90's filler never returns
+  # a negative, so against build/run-ext2 this mutation changes nothing and
+  # escaped.  tests/fs/test_vfs.c's stub is the one that reports -ENOENT, a
+  # handle past the pool, and a handle to an unallocated slot.
+  run_case M127-the-fillers-errno-is-returned-as-a-dentry build/run-vfs
 }
 
 # The starting LBA is a BLOCK number scaled by the sectors in a block. Handing
