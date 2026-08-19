@@ -56,6 +56,13 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 SENTINEL="tools/qmp-sentinel.py"
+# roadmap 5.2. Eight key EVENTS, not two keystrokes: shift-a proves the
+# modifier byte is read, and holding 'a' down while 'b' arrives proves the
+# previous report is subtracted. A trailing "+" is a press and "-" a release.
+KBD_KEYS="${FK_KBD_KEYS:-shift+,a+,a-,shift-,a+,b+,b-,a-}"
+KBD_CHARS="${FK_KBD_CHARS:-Aab}"
+KBD_REPORT="${FK_KBD_REPORT:-0x40000}"
+KBD_TIMEOUT="${FK_KBD_TIMEOUT:-30}"
 ISO="${FK_ISO:-build/boot/fortran-kernel.iso}"
 KERNEL="${FK_KERNEL:-build/boot/kernel.elf}"
 BOOT_WAIT="${FK_BOOT_WAIT:-3}"
@@ -239,6 +246,23 @@ Fortran Kernel: the xHCI is RUNNING, USBSTS 0x
 Fortran Kernel: xHCI NO-OP trb/event/code/ptr 0x
 Fortran Kernel: the xHCI executed a command and reported it complete (roadmap 5.1).
 Fortran Kernel: the xHCI\'s MSI-X interrupt ARRIVED, count 0x'
+FK_KBD_PASS_LINES=$'Fortran Kernel: USB looking for a HID keyboard (roadmap 5.2).
+Fortran Kernel: USB port/portsc/speed 0x
+Fortran Kernel: USB device/input ctx/report buffer 0x
+Fortran Kernel: USB slot/address/state 0x
+Fortran Kernel: USB mps0/config/interface 0x
+Fortran Kernel: USB EP1 addr/maxpkt/interval 0x
+Fortran Kernel: the USB keyboard is addressed, configured and polling (roadmap 5.2).'
+FK_KBD_FAIL_LINES=$'Fortran Kernel: the PMM refused a contiguous run for the keyboard.
+Fortran Kernel: the USB keyboard bring-up FAILED, status 0x'
+# On the i440FX board there is no ECAM window, so no xHCI, so xhci_start never
+# runs and neither does the keyboard it calls.  The 5.2 lines are therefore
+# REJECT lines there, not missing PASS lines -- their absence is the assertion.
+if [[ "${FK_MACHINE:-q35}" == pc ]]; then
+  FK_KBD_FAIL_LINES="$FK_KBD_PASS_LINES"$'\n'"$FK_KBD_FAIL_LINES"
+  FK_KBD_PASS_LINES=''
+fi
+
 FK_PCIE_FAIL_LINES=$'Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map.
 Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
 Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route.
@@ -353,7 +377,8 @@ $FK_LAPIC_PASS_LINES
 $FK_ACPI_PASS_LINES
 $FK_IRQ_PASS_LINES
 $FK_IOA_PASS_LINES
-$FK_PCIE_PASS_LINES}"
+$FK_PCIE_PASS_LINES
+$FK_KBD_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
 $FK_VMM_FAIL_LINES
@@ -366,7 +391,8 @@ $FK_LAPIC_FAIL_LINES
 $FK_ACPI_FAIL_LINES
 $FK_IRQ_FAIL_LINES
 $FK_IOA_FAIL_LINES
-$FK_PCIE_FAIL_LINES}"
+$FK_PCIE_FAIL_LINES
+$FK_KBD_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a
@@ -444,6 +470,9 @@ CHECK_DMA="${FK_CHECK_DMA:-1}"
 CHECK_XHCI="${FK_CHECK_XHCI:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_XHCI=0
 [[ "$CHECK_XHCI" != 0 ]] && say "xhci check : the command and event rings, read where the controller wrote them"
+CHECK_KBD="${FK_CHECK_KBD:-1}"
+[[ "$MACHINE" == pc ]] && CHECK_KBD=0
+[[ "$CHECK_KBD" != 0 ]] && say "kbd check  : key presses injected over QMP, decoded and rendered by the guest"
 CHECK_PCI="${FK_CHECK_PCI:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_PCI=0
 [[ "$CHECK_PCI" != 0 ]] && say "pci check  : the guest's own enumeration against QEMU's info pci, as sets"
@@ -653,6 +682,12 @@ assertion_summary() {
       else                           say "  xHCI controller  : FAIL  see the ring dumps above"
       fi
     fi
+    if [[ "$CHECK_KBD" != 0 ]]; then
+      if   (( KBD_OK == 1 )); then  say "  USB keyboard     : PASS  keys were pressed, decoded and rendered"
+      elif (( KBD_RAN == 0 )); then say "  USB keyboard     : FAIL  the guest died before it could be asked"
+      else                          say "  USB keyboard     : FAIL  see the HID assertions above"
+      fi
+    fi
     if [[ "$CHECK_DMA" != 0 ]]; then
       if   (( DMA_OK == 1 )); then  say "  DMA run          : PASS  every frame carried its tag at the physical base"
       elif (( DMA_RAN == 0 )); then say "  DMA run          : FAIL  the guest died before it could be asked"
@@ -694,7 +729,12 @@ QEMU_ARGS=(
 # because it reads 'info pci' off the live monitor and diffs it against the
 # guest's list as sets, so both sides grow together. What is hardcoded to five
 # is qmp-sentinel's own --selftest fixture, which moves with this.
-[[ "$MACHINE" == pc ]] || QEMU_ARGS+=( -device qemu-xhci )
+# roadmap 5.2 adds the keyboard to the controller 5.1 added. It is a USB
+# device on the existing xHCI and NOT a new PCI function, so 4.2's info-pci set
+# comparison needs no change for it -- checked before it was added, by booting
+# the 5.1 tree with the device attached and watching every assertion hold.
+[[ "$MACHINE" == pc ]] || QEMU_ARGS+=( -device qemu-xhci,id=xhci \
+                                       -device usb-kbd,bus=xhci.0,id=kbd )
 [[ "$MODE" == gate ]] && QEMU_ARGS+=( -cdrom "$ISO" )
 
 # FK_FIRMWARE=uefi boots the SAME ISO through OVMF instead of SeaBIOS (roadmap
@@ -860,6 +900,21 @@ if [[ "$CHECK_XHCI" != 0 && "$MODE" == gate ]]; then
   fi
 fi
 
+KBD_RAN=0; KBD_OK=0
+if [[ "$CHECK_KBD" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    KBD_RAN=1
+    rule
+    say "--- the USB keyboard: keys injected from outside, decoded inside ---"
+    if python3 "$SENTINEL" usbkbd --qmp "$SOCK" --elf "$KERNEL" \
+               --timeout "$KBD_TIMEOUT" --keys "$KBD_KEYS" --chars "$KBD_CHARS" \
+               --report "$KBD_REPORT"
+    then
+      KBD_OK=1
+    fi
+  fi
+fi
+
 DMA_RAN=0; DMA_OK=0
 if [[ "$CHECK_DMA" != 0 && "$MODE" == gate ]]; then
   if qemu_alive; then
@@ -975,13 +1030,15 @@ DMA_BAD=0
 if [[ "$CHECK_DMA" != 0 && "$MODE" == gate ]] && (( DMA_OK == 0 )); then DMA_BAD=1; fi
 XHCI_BAD=0
 if [[ "$CHECK_XHCI" != 0 && "$MODE" == gate ]] && (( XHCI_OK == 0 )); then XHCI_BAD=1; fi
+KBD_BAD=0
+if [[ "$CHECK_KBD" != 0 && "$MODE" == gate ]] && (( KBD_OK == 0 )); then KBD_BAD=1; fi
 PCI_BAD=0
 if [[ "$CHECK_PCI" != 0 && "$MODE" == gate ]] && (( PCI_OK == 0 )); then PCI_BAD=1; fi
 
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
    && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )) \
    && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )) && (( DMA_BAD == 0 )) \
-   && (( PCI_BAD == 0 )) && (( XHCI_BAD == 0 )); then
+   && (( PCI_BAD == 0 )) && (( XHCI_BAD == 0 )) && (( KBD_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule

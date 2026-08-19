@@ -36,7 +36,7 @@ written without it, and 3.3 is where it gets used.
 
 | # | milestone | why now | really blocked on |
 |---|---|---|---|
-| 5.2 | the USB HID keyboard | 5.1 leaves a running controller, a command ring that wraps, an event ring and a working MSI-X route | slots and device contexts, an address-device command, a transfer ring and a port reset -- none of which 5.1 built |
+| 5.3 | the NVMe controller | 4.2 finds it (`pcie_find_nvme`), 3.x gives it contiguous memory, and 5.2 has now walked the whole PCIe-to-device path once on the xHCI | submission and completion queues, and an admin queue before either |
 | 1.1 | the string half of the core library | unchanged and still owed | nothing; 6.1 and 6.4 cannot start without it |
 
 **WHAT 5.1 NEEDED BEFORE IT COULD TOUCH THE CONTROLLER, AND IT IS PAID.** 4.2
@@ -2043,9 +2043,37 @@ Writing complex Fortran state machines to talk to modern Minisforum silicon.
         reports zero scratchpad buffers, so the array is never allocated on
         the machine the gate runs, and that is stated rather than hidden.
 
-   * [ ] 5.2 USB HID Keyboard Driver
+   * [x] 5.2 USB HID Keyboard Driver
 
         Validation: Physical keystrokes on a USB keyboard generate APIC interrupts, which Fortran translates to ASCII characters on the screen.
+
+        DONE, and the validation line is satisfied on every clause. Keys are
+        pressed from OUTSIDE the guest over QMP, arrive as MSI-X messages, and
+        the characters come out of guest memory:
+
+            USB port/portsc/speed 0x0005/0x00000E03/0x03
+            USB slot/address/state 0x0001/0x01/0x03
+            USB mps0/config/interface 0x0040/0x01/0x00
+            USB EP1 addr/maxpkt/interval 0x81/0x0008/0x07
+
+        MEASURED BEFORE IT WAS BUILT, and both measurements changed the design:
+        usb-kbd on qemu-xhci lands on PORT 5 -- the USB3 ports are presented
+        first -- and it enumerates at HIGH speed, so EP0's max packet is 64.
+        A hardcoded port 1 finds nothing.
+
+        WHAT IS NOT DONE. One device, one endpoint, one slot, and no hub: the
+        route string is zero because nothing is behind a hub, and a second
+        device would need a second slot the code does not allocate. Full and
+        low speed are REFUSED rather than guessed at -- their bInterval is a
+        frame count where high and super speed carry an exponent. There is no
+        key repeat, no LED report and no SET_IDLE.
+
+        AND THE BUG IT FOUND IN 5.1, which had nothing to do with the keyboard:
+        the NO-OP poll took the FIRST event off the ring rather than the one
+        naming its own TRB. With a device attached the controller also posts
+        Port Status Change events, so that loop read a PSC event as a failed
+        command -- intermittently, which is the worst way to find out. Before
+        this milestone there was no device and nothing else to arrive.
 
    * [ ] 5.3 NVMe Storage Controller
 

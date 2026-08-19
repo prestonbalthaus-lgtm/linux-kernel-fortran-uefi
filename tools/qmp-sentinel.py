@@ -192,6 +192,15 @@ XHCI_SYMBOL = "fk_xhci_state"
 XHCI_WORDS = 19
 MSI_SYMBOL = "fk_msi_count"
 XHCI_MAGIC = 0x584843490501
+KBD_SYMBOL = "fk_usbkbd_state"
+KBD_WORDS = 24
+KBD_MAGIC = 0x55534B420502
+SLOT_STATE_ADDRESSED = 2
+SLOT_STATE_CONFIGURED = 3
+# usb-kbd on qemu-xhci enumerates at high speed -- measured off `info usb`,
+# 480 Mb/s -- so PORTSC speed id 3 and a 64-byte EP0. Super speed is allowed
+# because the code allows it; full and low speed are refused by the kernel.
+KBD_SPEEDS = {3: 64, 4: 512, 5: 512}
 TRB_TYPE_CMD_NOOP = 23
 TRB_TYPE_COMPLETION = 33
 COMP_SUCCESS = 1
@@ -1448,9 +1457,23 @@ def check_xhci_rings(words, cmd_blob, evt_blob, regs, msi):
         out.append(((crcr & ~0x3F) == cmd_phys,
                     f"CRCR holds the kernel's command ring (QEMU reads it "
                     f"back; real hardware returns 0)"))
-        out.append(((erdp & ~0xF) == evt_phys + 16,
-                    f"ERDP 0x{erdp:X} advanced one TRB past the segment base, "
-                    "so the event was consumed"))
+        # WEAKENED AT ROADMAP 5.2, and the reason is written down rather than
+        # quietly absorbed. Until 5.2 exactly one event was ever posted, so
+        # "ERDP is one TRB past the base" was an exact equality. Enumeration
+        # consumes a dozen and a keystroke consumes one more, so the exact
+        # index is a moving target and comparing it against a separately-read
+        # guest word is a race, not an assertion. What survives is what cannot
+        # move: the pointer is inside its own segment, on a TRB boundary, and
+        # STRICTLY PAST the base -- which is still what refuses a kernel that
+        # never advances it, because that one leaves ERDP exactly at the base.
+        # No alignment assertion goes with this: ERDP's low four bits are DESI
+        # and EHB rather than address, so the masked pointer is 16-byte aligned
+        # by construction and a check on it could never refuse anything.
+        seg_end = evt_phys + 256 * 16
+        out.append((evt_phys < (erdp & ~0xF) < seg_end,
+                    f"ERDP 0x{erdp:X} is inside the event ring segment "
+                    f"[0x{evt_phys:X}, 0x{seg_end:X}) and past its base, so "
+                    "events were consumed"))
         # A NO-OP touches no slot, so the controller runs it correctly with
         # DCBAAP still zero -- which is exactly how a kernel that never wrote
         # it passed this gate until mutation M59 was run. Device contexts are
@@ -1463,6 +1486,122 @@ def check_xhci_rings(words, cmd_blob, evt_blob, regs, msi):
                 f"fk_msi_count is {msi}: the controller's MSI-X message "
                 "reached the handler"))
     return out
+
+
+def check_usbkbd(words, xwords, dcbaa_blob, dctx_blob, stride, want_chars,
+                 want_report):
+    """Roadmap 5.2, and the two witnesses are on opposite sides of the bus.
+
+    What the kernel published is in `words`. What the CONTROLLER wrote is in
+    `dcbaa_blob` and `dctx_blob`, read by pmemsave at their physical bases with
+    no page table in the path -- and the slot state and device address in there
+    are fields the controller owns, so no kernel can put them there by writing
+    its own input context.
+    """
+    out = []
+    out.append((words[0] == KBD_MAGIC,
+                f"fk_usbkbd_state magic is 0x{words[0]:012X} "
+                f"(want 0x{KBD_MAGIC:012X}: the bring-up ran)"))
+    if words[0] != KBD_MAGIC:
+        return out
+
+    st = words[23]
+    out.append((st == 0, f"the keyboard bring-up returned {st}"))
+
+    port, portsc, speed = words[1], words[2], words[3]
+    out.append((port >= 1, f"a device was found on root hub port {port}"))
+    out.append((bool(portsc & 1),
+                f"PORTSC 0x{portsc:08X}: the port still reports a connection"))
+    # THE ASSERTION THE RESET EXISTS FOR. A USB2 port comes up Connected and
+    # NOT Enabled; only a port reset moves it to Enabled, and PED is the
+    # controller's answer rather than anything the kernel can write.
+    out.append((bool(portsc & 2),
+                "and PED is set, which only a port reset produces"))
+    out.append((not (portsc & 0x00FE0000),
+                f"with every change bit acknowledged (0x{portsc & 0x00FE0000:X})"))
+    out.append((speed in KBD_SPEEDS,
+                f"the port reports speed id {speed}"))
+
+    slot = words[4]
+    out.append((slot >= 1, f"the controller assigned slot {slot}"))
+    out.append((words[12] != 0,
+                f"and device address {words[12]}, which the CONTROLLER wrote "
+                "into the device context"))
+    out.append((words[11] == SLOT_STATE_ADDRESSED,
+                f"slot state after Address Device is {words[11]} (Addressed)"))
+    out.append((words[13] == SLOT_STATE_CONFIGURED,
+                f"and {words[13]} (Configured) after Configure Endpoint"))
+
+    if speed in KBD_SPEEDS:
+        out.append((words[14] == KBD_SPEEDS[speed],
+                    f"bMaxPacketSize0 is {words[14]}, what speed id {speed} "
+                    "requires"))
+
+    ep_addr = words[16]
+    out.append((bool(ep_addr & 0x80),
+                f"EP1's bEndpointAddress is 0x{ep_addr:02X}, an IN endpoint"))
+    out.append(((ep_addr & 0x0F) == 1,
+                "and it is endpoint 1, so its DCI is 3 and not 1"))
+    ep_mps, ep_ival = words[17] >> 32, words[17] & 0xFFFFFFFF
+    out.append((ep_mps == 8,
+                f"its wMaxPacketSize is {ep_mps}: a boot-protocol report"))
+    out.append((ep_ival >= 1, f"and its bInterval is {ep_ival}"))
+
+    # DCBAA[slot], read out of DRAM at the array's own physical base.
+    if dcbaa_blob and slot >= 1 and (slot + 1) * 8 <= len(dcbaa_blob):
+        entry = struct.unpack_from("<Q", dcbaa_blob, slot * 8)[0]
+        out.append(((entry & ~0x3F) == words[5],
+                    f"DCBAA[{slot}] holds 0x{entry & ~0x3F:X}, the device "
+                    f"context the kernel allocated at 0x{words[5]:X}"))
+
+    # The device context itself, in DRAM. Slot context dword 3 is the
+    # controller's: it carries the state and the address it assigned.
+    if dctx_blob and len(dctx_blob) >= stride:
+        dw3 = struct.unpack_from("<I", dctx_blob, 12)[0]
+        out.append(((dw3 >> 27) == SLOT_STATE_CONFIGURED,
+                    f"the device context in DRAM says slot state "
+                    f"{dw3 >> 27} (Configured), written by the controller"))
+        out.append(((dw3 & 0xFF) == words[12],
+                    f"and device address {dw3 & 0xFF}, the same one the guest "
+                    "read back"))
+
+    # THE KEYSTROKES. Two, deliberately: a handler that never clears the
+    # interrupter's IP bit delivers exactly one and then goes silent forever,
+    # and one keystroke is indistinguishable from a working keyboard.
+    # NOT "so IMAN.IP is being cleared". Mutation M71 removed the IP clear and
+    # this count did not move: QEMU's xHCI does not gate further messages on
+    # it, so repeated delivery is evidence of repeated delivery and nothing
+    # more. The IP clear is required by xHCI 1.2 5.5.2.1 and is kept on the
+    # specification's authority, not this gate's -- see
+    # HARNESS-VALIDATION-PHASE5.md.
+    out.append((words[18] >= 2,
+                f"{words[18]} transfer events arrived on EP1: the endpoint "
+                "keeps delivering, not just once"))
+    out.append((words[20] >= len(want_chars),
+                f"{words[20]} character(s) were rendered to the console"))
+    got = words[21] & ((1 << (8 * len(want_chars))) - 1)
+    want = 0
+    for c in want_chars:
+        want = (want << 8) | ord(c)
+    out.append((got == want,
+                f"the decoded characters are {_chars(got, len(want_chars))} "
+                f"(want {_chars(want, len(want_chars))}) -- injected with "
+                "sendkey, decoded by the guest from the wire"))
+    # THE EIGHT BYTES OFF THE WIRE, not the character they decoded to. The
+    # injection ends with 'b' released while 'a' is STILL HELD, so the last
+    # report carrying a key is {a} with no modifier -- which is also the proof
+    # that a held key really does reappear in a later report, since 'a' was
+    # pressed two reports earlier.
+    out.append((words[19] == want_report,
+                f"the last boot report with a key in it is "
+                f"0x{words[19]:016X} (want 0x{want_report:016X}: modifier "
+                f"0x{want_report & 0xFF:02X}, usage "
+                f"0x{(want_report >> 16) & 0xFF:02X})"))
+    return out
+
+
+def _chars(packed, n):
+    return "".join(chr((packed >> (8 * i)) & 0xFF) for i in range(n - 1, -1, -1))
 
 
 def do_xhci(sock_path, elf, timeout, quiet):
@@ -1509,6 +1648,96 @@ def do_xhci(sock_path, elf, timeout, quiet):
     results = check_xhci_rings(words, cmd_blob, evt_blob, regs, msi)
     if not report_hwstate(results, quiet):
         print(f"        {XHCI_SYMBOL} at 0x{state_paddr:X}")
+        return 1
+    return 0
+
+
+# EVERY KEY IS AN EXPLICIT DOWN AND UP, and sendkey is not used at all.
+# sendkey presses and releases a whole combination on its own timing, so which
+# reports the guest's poll actually samples is a race -- observed, more than
+# once: shift-a decoding as 'a' because the modifier had already been released
+# by the time the report was sampled. Separate events with a gap between them
+# make the sequence of reports a fact rather than a hope, and they are the only
+# way to HOLD one key while another arrives, which is what the rollover
+# subtraction needs to be exercised at all.
+DEFAULT_KEYS = (("shift", True), ("a", True), ("a", False), ("shift", False),
+                ("a", True), ("b", True), ("b", False), ("a", False))
+
+
+def do_usbkbd(sock_path, elf, timeout, quiet, keys=DEFAULT_KEYS,
+              chars="Aab", report=0x0000000000040000):
+    """Wait for the guest to arm EP1, inject keys, and assert what it did.
+
+    THE WAIT IS NOT POLITENESS. Injecting before the endpoint is armed sends
+    the keystroke into a controller with no transfer TRB to put it in, and the
+    test would fail on a correct kernel -- a flaky gate, which is worse than no
+    gate. fk_usbkbd_state[22] is the guest saying it is ready.
+    """
+    _v, kbd_paddr = symbol_phys_addr(elf, KBD_SYMBOL)
+    _v, xhci_paddr = symbol_phys_addr(elf, XHCI_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-kbd.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    dcbaa_blob = dctx_blob = b""
+    stride = 32
+    try:
+        client.handshake()
+
+        def state():
+            client.pmemsave(kbd_paddr, KBD_WORDS * 8, tmp.name)
+            return list(struct.unpack(f"<{KBD_WORDS}Q",
+                                      open(tmp.name, "rb").read()))
+
+        words = state()
+        deadline = time.monotonic() + timeout
+        while words[22] != 1 and time.monotonic() < deadline:
+            time.sleep(0.2)
+            words = state()
+        if words[22] != 1:
+            print("  \033[31mFAIL\033[0m  the guest never armed EP1 "
+                  f"(fk_usbkbd_state[22] = {words[22]}, status {words[23]})")
+            return 1
+
+        # 'a' is still held when 'b' arrives, which is what makes the
+        # report's six usage slots behave as the SET they are: a driver that
+        # does not subtract the previous report renders the held key again on
+        # every one. Measured -- with press-and-release only, mutating the
+        # subtraction away left the gate green.
+        for code, down in keys:
+            client.execute("input-send-event", {"events": [
+                {"type": "key", "data": {"down": down,
+                                         "key": {"type": "qcode",
+                                                 "data": code}}}]})
+            time.sleep(0.3)
+
+        deadline = time.monotonic() + timeout
+        words = state()
+        while words[20] < len(chars) and time.monotonic() < deadline:
+            time.sleep(0.2)
+            words = state()
+
+        client.pmemsave(xhci_paddr, XHCI_WORDS * 8, tmp.name)
+        xwords = list(struct.unpack(f"<{XHCI_WORDS}Q",
+                                    open(tmp.name, "rb").read()))
+        if xwords[1]:
+            cap = xp_words(client, xwords[1] + 0x10, 1)
+            if cap:
+                stride = 32 << ((cap[0] >> 2) & 1)
+        if xwords[2]:
+            client.pmemsave(xwords[2], 4096, tmp.name)
+            dcbaa_blob = open(tmp.name, "rb").read()
+        if words[5]:
+            client.pmemsave(words[5], stride, tmp.name)
+            dctx_blob = open(tmp.name, "rb").read()
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+    results = check_usbkbd(words, xwords, dcbaa_blob, dctx_blob, stride, chars,
+                           report)
+    if not report_hwstate(results, quiet):
+        print(f"        {KBD_SYMBOL} at 0x{kbd_paddr:X}")
         return 1
     return 0
 
@@ -2482,6 +2711,11 @@ def do_selftest():
     expect_rings(False, "an ERDP that never advanced is rejected -- the event "
                         "was posted and never consumed",
                  rg=regs(erdp=RING_EVT))
+    expect_rings(False, "an ERDP past the end of its own segment is rejected",
+                 rg=regs(erdp=RING_EVT + 256 * 16))
+    expect_rings(True, "an ERDP deep inside the segment is accepted -- "
+                       "enumeration consumes many events, not one",
+                 rg=regs(erdp=RING_EVT + 13 * 16))
     # THE ONE M59 FOUND. A NO-OP touches no slot, so every assertion above
     # passes with DCBAAP still zero.
     expect_rings(False, "a DCBAAP the kernel never wrote is rejected",
@@ -2555,6 +2789,15 @@ def main(argv=None):
     t.add_argument("--min-delta", type=int, default=2)
     t.add_argument("--quiet", action="store_true")
 
+    k = sub.add_parser("usbkbd", help="inject keys and assert the HID path")
+    k.add_argument("--qmp", required=True)
+    k.add_argument("--elf", required=True)
+    k.add_argument("--timeout", type=float, default=30.0)
+    k.add_argument("--quiet", action="store_true")
+    k.add_argument("--keys", default="shift+,a+,a-,shift-,a+,b+,b-,a-")
+    k.add_argument("--chars", default="Aab")
+    k.add_argument("--report", default="0x40000")
+
     m = sub.add_parser("dma", help="assert the DMA run at its physical base")
     m.add_argument("--qmp", required=True)
     m.add_argument("--elf", required=True)
@@ -2605,6 +2848,12 @@ def main(argv=None):
             return do_dma(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "xhci":
             return do_xhci(args.qmp, args.elf, args.timeout, args.quiet)
+        if args.cmd == "usbkbd":
+            return do_usbkbd(args.qmp, args.elf, args.timeout, args.quiet,
+                             keys=tuple((k[:-1], k[-1] == "+")
+                                        for k in args.keys.split(",")),
+                             chars=args.chars,
+                             report=int(args.report, 0))
         if args.cmd == "ticks":
             return do_ticks(args.qmp, args.elf, args.timeout, args.quiet,
                             interval=args.interval, min_delta=args.min_delta)

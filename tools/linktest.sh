@@ -118,6 +118,20 @@ for f in $(find "$SRCDIR" -name "fk_*.f90" | sort); do
   # it would fail on the legitimate cross-module references.
   ent=$(nm --defined-only -g "$obj" | awk '$2=="T"{print $3; exit}')
   if [ -z "$ent" ]; then
+    # A module of nothing but PARAMETERs compiles to an object with no symbols
+    # of any kind: every constant is folded at the use site, so there is no
+    # text to enter at and nothing for a link to resolve.  Demanding an entry
+    # point from one is the gate asking for something that cannot exist.
+    #
+    # THE EXEMPTION IS NARROW ON PURPOSE and both halves are load bearing: no
+    # defined symbols AND no undefined ones.  An object with undefined symbols
+    # and no text is not a constants module, it is a module whose code went
+    # missing, and that still has to fail.  tools/gate-selftest.sh runs both
+    # cases.
+    if [ -z "$(nm --defined-only "$obj")" ] && [ -z "$undef" ]; then
+      echo "  OK    $n  (kernel flags, constants only: no text, no symbols, nothing to link)"
+      continue
+    fi
     echo "  FAIL  $n: no global text symbol to link against"; fail=1; continue
   fi
   others=$(for o in $objs; do [ "$o" = "$obj" ] || printf '%s ' "$o"; done)

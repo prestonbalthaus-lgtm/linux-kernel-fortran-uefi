@@ -1,4 +1,4 @@
-# Does the xHCI's test actually catch bugs?
+# Does the USB stack's test actually catch bugs?
 
 Roadmap 5.1 brought a USB host controller out of reset, gave it a command ring
 and an event ring, ran it, executed a NO-OP, and took the first interrupt in this
@@ -146,6 +146,108 @@ can be said is what the code does — the four writes go through `fk_writel`, an
 opaque call the compiler cannot reorder against, so the *source* order is the
 *emitted* order. Anyone reordering those four lines to save a register should be
 required to say why against this paragraph.
+
+## Roadmap 5.2: the keyboard
+
+
+5.1's device was the controller itself. 5.2's is a keyboard on the other end of
+it, and that changes what the harness has to do: for the first time the gate
+must **cause** something from outside the guest and see the guest react.
+
+### The channels 5.2 adds
+
+| Channel | Sees | Cannot see |
+|---|---|---|
+| `build/run-usb_hid`, 4348 checks | the usage-to-ASCII decode, against Linux's `usb_kbd_keycode` for two relations and a reference model for the rest | anything about USB |
+| QMP `input-send-event` | nothing — it is the *cause*, not a channel | — |
+| `fk_usbkbd_state` by `pmemsave` | what the kernel decided | whether the controller agreed |
+| the **device context** in DRAM, at its physical base | the slot state and device address the CONTROLLER wrote | anything the kernel wrote |
+| `DCBAA[slot]` in DRAM | that the array the controller reads points at that context | — |
+
+**The device context is the load-bearing one.** Slot Context dword 3 carries the
+slot state and the USB address, and both are the controller's to write — a
+kernel that filled in its own input context and never issued Address Device
+cannot put `Addressed` there, and one that never issued Configure Endpoint
+cannot put `Configured` there. Everything else in that structure is the
+kernel's own writing read back.
+
+### Causing a keystroke, and why `sendkey` was abandoned
+
+The first version used HMP `sendkey`, which presses and releases a whole
+combination on QEMU's own timing. That is a **race**: which reports the guest's
+8ms poll actually samples is not determined, and `shift-a` was observed
+decoding as `a` because the modifier had already been released by the time a
+report was sampled. Three consecutive gate runs disagreed with each other.
+
+Every key is now an explicit down and up through `input-send-event`, with a gap
+between them, so the sequence of reports is a fact rather than a hope. It also
+buys the one thing `sendkey` cannot do at all: **hold a key**.
+
+    shift down, a down, a up, shift up      ->  A
+    a down, b down, b up, a up              ->  a b
+
+That second line is the whole reason it matters. A boot report's six usage slots
+are a **set**, not a queue: a key held down reappears in every report until it
+is released, so a driver that does not subtract the previous report renders it
+again on each one. With press-and-release only, no two consecutive reports ever
+share a usage — and mutation M74 removing the subtraction left the gate green.
+Measured, then fixed, then measured again.
+
+### Mutations
+
+| # | Injected defect | Detected? | How it surfaced |
+|---|---|---|---|
+| M65 | the port is never reset | **yes** | `PED is set, which only a port reset produces` fails, and a change bit is left unacknowledged (`0x20000`) |
+| M66 | PORTSC written read-modify-write | **NO — escaped** | QEMU-specific; see below |
+| M67 | `DCBAA[slot]` never written | **yes** | Address Device fails outright; the bring-up never reaches its own next line |
+| M68 | Context Entries left at 1 with EP1 added | **NO — escaped** | QEMU-specific; see below |
+| M69 | Add flag A3 not set on Configure Endpoint | **yes** | the endpoint is never configured and no report ever arrives |
+| M70 | doorbell rung at DCI 1 instead of 3 | **NO — escaped** | QEMU-specific; see below |
+| M71 | IMAN.IP never cleared in the handler | **NO — escaped** | QEMU-specific, and it cost an assertion; see below |
+| M72 | `SET_PROTOCOL` removed | **NO — escaped** | predicted in the plan; see below |
+| M73 | the modifier byte ignored | **yes** | `the decoded characters are aab (want Aab)` |
+| M74 | the previous report not subtracted | **yes**, after the injection was strengthened | `aba` instead of `Aab` |
+| M75 | the handler drains before it owns the ring | **yes** | `the xHCI never completed the NO-OP` — 5.1's completion, eaten |
+
+Eleven cases, six refused. **M75 is not hypothetical**: it is the bug the first
+version of this milestone actually shipped, and the gate reported it as 5.1
+regressing, with the completion event visibly correct in DRAM.
+
+### The five escapes, and the one that cost an assertion
+
+M66, M68, M70, M71 and M72 all escape for the same reason, and it is a
+different reason from Phase 4's: **QEMU's device model is more permissive than
+the specification.** These are not guards against malformed input; they are
+requirements a real controller enforces and this one does not.
+
+- **M66** — PORTSC is written read-modify-write. PED is write-1-to-**disable**,
+  so the second write (the one acknowledging the reset) hands back a 1 in PED
+  on a port that is now enabled. On this model the port stays enabled anyway.
+- **M68** — Context Entries left at 1 while EP1 IN is added at DCI 3. The
+  specification has the controller answer that with a parameter error; here
+  Configure Endpoint returns SUCCESS and the endpoint works.
+- **M70** — the doorbell for EP1 is rung at DCI 1. The endpoint still runs.
+- **M71** — the interrupter's IP bit is never cleared.
+
+**M71 is the one worth dwelling on, because it falsified an assertion rather
+than merely escaping.** Two keystrokes are injected precisely because a handler
+that leaves IP set should deliver exactly one message and then go silent, and
+the gate's assertion said so in as many words: *"more than one, so IMAN.IP is
+being cleared and messages keep coming."* The mutation removed the IP clear and
+the count did not move. So the causal claim was **wrong on this machine**, and
+an assertion that states a reason the evidence does not support is worse than
+one that states less. It now says what it can support — the endpoint keeps
+delivering — and the IP clear is kept on xHCI 1.2 5.5.2.1's authority rather
+than this gate's.
+
+The two-key injection is kept anyway. It is right for the specification, it
+costs nothing, and the failure mode it guards against is the one M33 has
+already caught this project out with once.
+
+**M72 was predicted before it was run.** The plan said `SET_PROTOCOL` might not
+be refutable because QEMU's keyboard may report the same eight bytes in both
+protocols, and that if so it would be labelled QEMU-specific rather than
+counted as coverage. It was not refutable. It is labelled.
 
 ## What is NOT claimed
 
