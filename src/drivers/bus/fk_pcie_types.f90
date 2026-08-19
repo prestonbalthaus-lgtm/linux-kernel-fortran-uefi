@@ -170,7 +170,11 @@ module fk_pcie_types_m
   end type fk_pci_msix_cap_t   ! 0x0c
 
   ! pci_regs.h:345-352.  Lives in device memory mapped by a BAR, not in
-  ! configuration space: dword accesses, and the overlay must be VOLATILE.
+  ! configuration space.  DOCUMENTARY ONLY -- nothing overlays this type on the
+  ! table.  A device register reached through a Fortran pointer is what 3.3
+  ! found gfortran narrowing, VOLATILE or not, so every entry access goes
+  ! through fk_readl/fk_writel at FK_PCI_MSIX_E_* offsets and tools/mmiocheck.sh
+  ! refuses the alternative.
   type, bind(c) :: fk_pci_msix_entry_t
     integer(c_int32_t) :: msg_addr_lo
     integer(c_int32_t) :: msg_addr_hi

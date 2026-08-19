@@ -1393,7 +1393,13 @@ def check_xhci_rings(words, cmd_blob, evt_blob, regs, msi):
     # THE COMMAND RING, in DRAM. The kernel says it enqueued a NO-OP; this is
     # the TRB a bus master would fetch.
     if cmd_blob:
-        parm, status, control = trb_at(cmd_blob, trb_phys - cmd_phys)
+        off = trb_phys - cmd_phys
+        if not 0 <= off <= len(cmd_blob) - 16:
+            out.append((False,
+                        f"the TRB the kernel published, 0x{trb_phys:X}, is "
+                        f"not inside its own command ring at 0x{cmd_phys:X}"))
+            return out
+        parm, status, control = trb_at(cmd_blob, off)
         out.append((((control >> 10) & 0x3F) == TRB_TYPE_CMD_NOOP,
                     f"the TRB at 0x{trb_phys:X} is a NO-OP command "
                     f"(type {(control >> 10) & 0x3F})"))
@@ -1428,7 +1434,7 @@ def check_xhci_rings(words, cmd_blob, evt_blob, regs, msi):
                 "and the guest's own reading of that event agrees"))
 
     if regs:
-        usbsts, usbcmd, crcr, erdp, iman = regs
+        usbsts, usbcmd, crcr, erdp, iman, dcbaap = regs
         out.append((not (usbsts & 1),
                     f"USBSTS 0x{usbsts:08X}: the controller is NOT halted"))
         out.append((not (usbsts & (1 << 12)),
@@ -1445,6 +1451,13 @@ def check_xhci_rings(words, cmd_blob, evt_blob, regs, msi):
         out.append(((erdp & ~0xF) == evt_phys + 16,
                     f"ERDP 0x{erdp:X} advanced one TRB past the segment base, "
                     "so the event was consumed"))
+        # A NO-OP touches no slot, so the controller runs it correctly with
+        # DCBAAP still zero -- which is exactly how a kernel that never wrote
+        # it passed this gate until mutation M59 was run. Device contexts are
+        # the first thing that needs the array to be real.
+        out.append(((dcbaap & ~0x3F) == words[2],
+                    f"DCBAAP 0x{dcbaap:X} holds the kernel's device-context "
+                    f"base array at 0x{words[2]:X}"))
 
     out.append((msi >= 1,
                 f"fk_msi_count is {msi}: the controller's MSI-X message "
@@ -1485,9 +1498,11 @@ def do_xhci(sock_path, elf, timeout, quiet):
                 c = xp_words(client, op + 0x18, 2)
                 d = xp_words(client, rt + 0x38, 2)
                 i = xp_words(client, rt + 0x20, 1)
-                if r and c and d and i:
+                b = xp_words(client, op + 0x30, 2)
+                if r and c and d and i and b:
                     regs = (r[1], r[0],
-                            c[0] | (c[1] << 32), d[0] | (d[1] << 32), i[0])
+                            c[0] | (c[1] << 32), d[0] | (d[1] << 32), i[0],
+                            b[0] | (b[1] << 32))
     finally:
         client.close()
         os.unlink(tmp.name)
@@ -2336,6 +2351,146 @@ def do_selftest():
                Q35_PCI,
                "a guest that reports a route the device does not hold is "
                "rejected", dev(e2=0x31))
+
+    # roadmap 5.1's ring checker, which had NO self-test until the phase-4/5
+    # mutation sweep went looking for one. check_pci was covered; this was not,
+    # so every green "xHCI controller : PASS" rested on an assertion nothing
+    # had ever watched refuse.
+    print("--- the rings, as the CONTROLLER left them in DRAM ---")
+
+    RING_CMD, RING_EVT, RING_ERST = 0x348000, 0x349000, 0x34A000
+    RING_DCBAA, RING_TRB = 0x347000, 0x348000
+
+    def trb(parm=0, status=0, control=0):
+        return struct.pack("<QII", parm, status, control)
+
+    def rings_cmd(noop_ctrl=(TRB_TYPE_CMD_NOOP << 10) | 1, noop_parm=0,
+                  noop_status=0, link_ctrl=(6 << 10) | 2 | 1,
+                  link_parm=RING_CMD):
+        b = bytearray(4096)
+        b[0:16] = trb(noop_parm, noop_status, noop_ctrl)
+        b[255 * 16:256 * 16] = trb(link_parm, 0, link_ctrl)
+        return bytes(b)
+
+    def rings_evt(ctrl=(TRB_TYPE_COMPLETION << 10) | 1, comp=COMP_SUCCESS,
+                  parm=RING_TRB):
+        b = bytearray(4096)
+        b[0:16] = trb(parm, comp << 24, ctrl)
+        return bytes(b)
+
+    def rings_words(**kw):
+        w = [0] * XHCI_WORDS
+        w[0] = XHCI_MAGIC
+        w[1] = 0xFEBF0000
+        w[2] = RING_DCBAA
+        w[3], w[4], w[5] = RING_CMD, RING_EVT, RING_ERST
+        w[6] = RING_TRB
+        w[7] = (TRB_TYPE_COMPLETION << 32) | COMP_SUCCESS
+        w[8] = RING_TRB
+        w[15] = 0
+        w[16], w[17] = 0, 0
+        w[18] = 1                      # halted, CNR clear
+        for k, v in kw.items():
+            w[int(k[1:])] = v
+        return w
+
+    # usbsts, usbcmd, crcr, erdp, iman, dcbaap
+    REGS_OK = (0x00000008, 0x00000005, RING_CMD, RING_EVT + 16, 0x00000002,
+               RING_DCBAA)
+
+    def regs(**kw):
+        names = ["usbsts", "usbcmd", "crcr", "erdp", "iman", "dcbaap"]
+        r = list(REGS_OK)
+        for k, v in kw.items():
+            r[names.index(k)] = v
+        return tuple(r)
+
+    def expect_rings(ok_wanted, what, words=None, cmd=None, evt=None,
+                     rg=None, msi=1):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_xhci_rings(
+            rings_words() if words is None else words,
+            rings_cmd() if cmd is None else cmd,
+            rings_evt() if evt is None else evt,
+            REGS_OK if rg is None else rg, msi))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} "
+                  f"(wanted {ok_wanted}, got {got})")
+            fail_n += 1
+
+    expect_rings(True, "a complete, correct bring-up is accepted")
+    expect_rings(False, "a state block with no magic is rejected",
+                 words=rings_words(w0=0))
+    expect_rings(False, "a non-zero bring-up status is rejected",
+                 words=rings_words(w15=0xFFFFFFFFFFFFFFF9))
+    # THE RESET, and the three readings that are firmware's unless it ran.
+    expect_rings(False, "a CRCR that still holds firmware's pointer straight "
+                        "after the reset is rejected",
+                 words=rings_words(w16=0x7FFDFC01))
+    expect_rings(False, "a DCBAAP that still holds firmware's is rejected",
+                 words=rings_words(w17=0x7FFDFD80))
+    expect_rings(False, "a controller that was not halted at that moment is "
+                        "rejected", words=rings_words(w18=0))
+    expect_rings(False, "one whose CNR was still set is rejected",
+                 words=rings_words(w18=1 | (1 << 11)))
+    expect_rings(False, "a ring that is not 64-byte aligned is rejected",
+                 words=rings_words(w3=RING_CMD + 8, w6=RING_TRB + 8))
+    expect_rings(False, "a published TRB outside its own ring is rejected "
+                        "rather than crashing the gate",
+                 words=rings_words(w6=RING_CMD - 0x1000))
+    # THE COMMAND RING, in DRAM.
+    expect_rings(False, "a command TRB that is not a NO-OP is rejected",
+                 cmd=rings_cmd(noop_ctrl=(1 << 10) | 1))
+    expect_rings(False, "a NO-OP whose cycle bit is clear is rejected -- the "
+                        "controller never owned it",
+                 cmd=rings_cmd(noop_ctrl=TRB_TYPE_CMD_NOOP << 10))
+    expect_rings(False, "a NO-OP with a non-zero parameter is rejected",
+                 cmd=rings_cmd(noop_parm=1))
+    expect_rings(False, "a ring whose last TRB is not a LINK is rejected",
+                 cmd=rings_cmd(link_ctrl=(1 << 10) | 1))
+    expect_rings(False, "a LINK without Toggle Cycle is rejected -- the ring "
+                        "goes silent after exactly one lap",
+                 cmd=rings_cmd(link_ctrl=(6 << 10) | 1))
+    expect_rings(False, "a LINK pointing somewhere other than the ring base "
+                        "is rejected", cmd=rings_cmd(link_parm=RING_EVT))
+    # THE EVENT RING, which the CONTROLLER wrote.
+    expect_rings(False, "an event that is not a Command Completion is "
+                        "rejected", evt=rings_evt(ctrl=(32 << 10) | 1))
+    expect_rings(False, "an event with cycle 0 is rejected -- that is a "
+                        "zeroed segment, not a posted event",
+                 evt=rings_evt(ctrl=TRB_TYPE_COMPLETION << 10))
+    expect_rings(False, "a completion code other than SUCCESS is rejected",
+                 evt=rings_evt(comp=5))
+    expect_rings(False, "an event naming a TRB the kernel did not enqueue is "
+                        "rejected", evt=rings_evt(parm=RING_CMD + 0x40))
+    # THE DEVICE MODEL'S OWN REGISTERS.
+    expect_rings(False, "a halted controller is rejected",
+                 rg=regs(usbsts=0x00000009))
+    expect_rings(False, "one reporting a host controller error is rejected",
+                 rg=regs(usbsts=0x00001008))
+    expect_rings(False, "one with R/S clear is rejected",
+                 rg=regs(usbcmd=0x00000004))
+    expect_rings(False, "one with USBCMD.INTE clear is rejected",
+                 rg=regs(usbcmd=0x00000001))
+    expect_rings(False, "one whose interrupter is not enabled is rejected",
+                 rg=regs(iman=0x00000001))
+    expect_rings(False, "a CRCR holding something other than the kernel's "
+                        "command ring is rejected", rg=regs(crcr=RING_EVT))
+    expect_rings(False, "an ERDP that never advanced is rejected -- the event "
+                        "was posted and never consumed",
+                 rg=regs(erdp=RING_EVT))
+    # THE ONE M59 FOUND. A NO-OP touches no slot, so every assertion above
+    # passes with DCBAAP still zero.
+    expect_rings(False, "a DCBAAP the kernel never wrote is rejected",
+                 rg=regs(dcbaap=0))
+    expect_rings(False, "a DCBAAP pointing somewhere other than the device "
+                        "context base array is rejected",
+                 rg=regs(dcbaap=RING_EVT))
+    expect_rings(False, "a controller that completed its command and sent no "
+                        "message is rejected", msi=0)
 
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0

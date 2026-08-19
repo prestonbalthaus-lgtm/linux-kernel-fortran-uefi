@@ -56,9 +56,10 @@ module fk_tss_m
 
   ! 8 KiB.  boot/boot.S zeroes [__bss_start, __bss_end) before it calls
   ! kernel_main, so an uninitialised array here costs nothing in the image and
-  ! arrives zeroed.  There is no guard page below it -- that needs the VMM at
-  ! roadmap 3.5, and until then a runaway panic handler walks into whatever
-  ! .bss put underneath.
+  ! arrives zeroed.  There is still no guard page below EITHER of these: the one
+  ! 3.5 landed is `__boot_stack_guard`, reserved for the boot stack alone, so a
+  ! runaway panic handler on IST1 or IST2 walks into whatever .bss put
+  ! underneath.  No open roadmap box owns that.
   integer(c_int32_t), parameter :: FK_DF_STACK_QWORDS  = 1024_c_int32_t
   integer(c_int32_t), parameter :: FK_NMI_STACK_QWORDS = 1024_c_int32_t
 

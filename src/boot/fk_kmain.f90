@@ -2684,8 +2684,12 @@ contains
     call serial_print_string(FK_PMM_SLASH)
     call serial_print_hex(madt_ioapic_addr(0_c_int32_t), 16_c_int32_t)
     call serial_print_string(FK_PMM_SLASH)
+    ! EIGHT DIGITS, not four.  A GSI base read from the wrong offset picks up
+    ! the IOAPIC's own address, 0xFEC00000, whose low sixteen bits are zero --
+    ! so at four digits a wrong answer printed exactly like the right one and
+    ! mutation M44 walked through the gate.
     call serial_print_hex(int(madt_ioapic_gsi_base(0_c_int32_t), c_int64_t), &
-                          4_c_int32_t)
+                          8_c_int32_t)
     call serial_print_string(FK_NL)
 
     call serial_print_string(FK_MADT_ISO)
@@ -3070,9 +3074,9 @@ contains
     ! on a machine that is being interrupted rather than a quiet one.
     ! NOT PREEMPTION-SAFE, and it runs before the scheduler for that reason.
     ! Nothing in fk_heap_m takes a lock, so kmalloc from an interrupt handler
-    ! or from two threads at once will corrupt the block list.  Roadmap 4.1's
-    ! problem; today the rule is that only this thread allocates, and it stops
-    ! allocating before sched_start.
+    ! or from two threads at once will corrupt the block list.  No open roadmap
+    ! box owns that; today the rule is that only this thread allocates, and it
+    ! stops allocating before sched_start.
     heap_next = FK_VMM_HEAP
     status = heap_bringup()
 
