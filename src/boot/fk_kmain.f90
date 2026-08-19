@@ -513,17 +513,19 @@ module fk_kmain_m
   ! and a transfer that crossed a page would need a PRP list.  A run that
   ! already carries five such buffers is where the sixth goes.
   !
-  ! The second is measured and is NOT a root cause.  6.2 first asked the PMM
-  ! for its own page, and that call was seen to return 0 -- refusal -- ONCE in
-  ! nine boots, with the PMM's published totals byte-identical to the passing
-  ! runs (0x5FFF7D total, 0x5FFD36 free) and the NVMe run at the same 0x35F000.
-  ! pmm_alloc_contiguous(1) is covered by tests/mm/test_pmm.c:561 and passes
-  ! there, and frame 0 is reserved by pmm_init precisely so that 0 cannot be a
-  ! successful address (fk_pmm.f90:640-641), so neither of the two obvious
-  ! explanations fits.  IT IS NOT EXPLAINED.  Folding the buffer into a run
-  ! that is allocated once, in one place, whose failure nvme_bringup already
-  ! reports, removes 6.2's dependence on that call; it does not remove the
-  ! question, which is recorded rather than closed.
+  ! The second is that one allocation is easier to reason about than two: this
+  ! run is allocated in one place and nvme_bringup already reports its failure,
+  ! so 6.2 has no allocation path of its own to get wrong.
+  !
+  ! AND A CORRECTION, because the first version of this comment recorded an
+  ! open question about the PMM that does not exist.  6.2 originally took its
+  ! own page and the bring-up was seen to fail about one boot in ten; that was
+  ! diagnosed here as pmm_alloc_contiguous refusing, and it was not.  The
+  ! status was -1, which this routine used for "no buffer" AND which is
+  ! fk_ext2.f90's FK_EXT2_E_IO -- the real failure was roadmap 5.3's completion
+  ! spin expiring on a contended host, one layer down, wearing this routine's
+  ! number.  pmm_alloc_contiguous never refused anything.  The status ranges
+  ! are disjoint now (see FK_E2B_* below) and 5.3's budget is 100x what it was.
   integer(c_int64_t), parameter :: FK_NVME_PAGES = 7_c_int64_t
 
   ! See nvme_bringup's completion wait for why this is not 2,000,000.

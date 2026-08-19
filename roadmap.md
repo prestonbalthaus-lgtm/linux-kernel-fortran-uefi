@@ -2223,9 +2223,69 @@ Preparing the kernel to host external C applications.
         arrives as a HANG, which is `docs/HARNESS-VALIDATION.md`'s oldest recorded lesson
         -- written in Phase 1 and unheeded until a mutation table needed it.
 
-   * [ ] 6.2 Basic File System Driver (e.g., ext2 or FAT32)
+   * [x] 6.2 Basic File System Driver (e.g., ext2 or FAT32)
 
         Validation: Kernel can read the directory structure of the NVMe drive and locate a specific file.
+
+        DONE 2026-08-19. `src/fs/fk_ext2.f90` and `fk_ext2_types.f90` parse the format,
+        `fk_blkdev.f90` is one buffer and one block at a time, and `fk_blkdev_nvme.f90` puts
+        5.3's controller under it. 6.1 promised `vfs_lookup` would be the one seam and that a
+        MISS would one day mean "read the directory off the disk"; that is now what it means,
+        and nothing above it changed shape to allow it. Off the running machine:
+
+            Fortran Kernel: ext2 bsize/isize/blocks/inodes 0x00000400/0x00000100/0x00000400/0x00000080
+            Fortran Kernel: /bin/init ino/size/LBA 0x0000000D/0x0000001C/0x00000066
+            Fortran Kernel: ext2 blocks read/dentries filled 0x0000000F/0x00000006
+
+        Inode 13, 28 bytes, LBA 102 -- and `debugfs` says inode 13, 28 bytes, block 51, which
+        at a 1 KiB block is LBA 102.
+
+        ext2 RATHER THAN FAT32, and the deciding reason is the seam. `vfs_lookup` compares
+        (LENGTH, BYTES) -- `dcache.h`'s `dentry_cmp` -- and FAT stores short names uppercased
+        and matches them case-INSENSITIVELY, so a FAT driver must either fold case INSIDE
+        that comparison, changing what the seam means for everyone, or reassemble long names
+        to recover a byte-exact one. ext2 names are byte-exact on disk. Three lesser reasons:
+        FAT32 is not legally FAT32 below 65525 clusters, which would take the gate's 1 MiB
+        fixture past 33 MiB; ext2's root is inode 2, a CONSTANT (`ext2.h:162`), where FAT32's
+        is a chain to be walked; and the constants oracle was already in the tree.
+
+        ONE DISK CARRIES BOTH MILESTONES. ext2 reserves its first 1024 bytes for a boot block
+        and puts its superblock at byte 1024 (`super.c:933-937`), so 5.3's prologue, boot
+        signature and sector-1 marker all live in space the filesystem does not use and every
+        assertion 5.3 makes still holds byte for byte.
+
+        THE ORACLE IS e2fsprogs, WHICH IS THE POINT. `tools/gen-ext2-oracle.sh` builds the
+        fixture with `mke2fs` and reads the expected answers back with `debugfs`;
+        `qmp-sentinel.py` gained an INDEPENDENT ext2 walker in Python. Three readers of the
+        same bytes must agree -- 4.1's standard -- so a parser and a formatter written by one
+        hand cannot agree on a shared misconception. The LAYOUT has its own oracle again: the
+        four on-disk structs are CUT VERBATIM out of `fs/ext2/ext2.h`, which cannot simply be
+        included because it pulls in `linux/fs.h` and `linux/mm.h`.
+
+        THE FIVE REFUSALS ARE `dir.c:118-131`'s, in its order, and the first is why the walk
+        terminates: `rec_len` 0 is an offset that never advances, so a driver without it does
+        not answer wrongly, it HANGS.
+
+        TWELVE DIRECT BLOCKS AND NO INDIRECTION, named here as a debt rather than discovered
+        later: 12 KiB covers every directory the gate builds and will not cover a BusyBox.
+        6.4 writes the singly-indirect block, and a file this driver cannot reach is REFUSED
+        with -EFBIG rather than silently truncated.
+
+        TWO DEFECTS FOUND IN OTHER BOXES. ROADMAP 5.3's COMPLETION WAIT WAS TOO SHORT and is
+        fixed here because this is what found it: its 2,000,000-iteration spin expired in 3
+        of 31 boots, only ever on a host running back-to-back VMs, and surfaced as
+        FK_NVME_E_CMD -- the controller blamed for a completion that had not arrived. An
+        empty spin measures HOST CPU time, not device time. 0 of 14 at 200,000,000. And a
+        DIAGNOSTIC THAT NAMED THE WRONG MECHANISM cost an hour: `ext2_bringup` reported its
+        own steps as -1..-4, which collides with `fk_ext2.f90`'s -1..-14, so an unreadable
+        superblock and a missing buffer said the same thing and the allocator was
+        investigated for a fault it did not have.
+
+        187 host checks (the VFS's own 157 -> 171) and 24 new sentinel self-test assertions.
+        `docs/HARNESS-VALIDATION-PHASE6.md` carries the mutation table: 21 cases, 20 refused,
+        one documented escape. The table earned its keep on its FIRST run -- 14 caught and 6
+        through, of which four were one mistake, an assertion too coarse to tell two
+        mechanisms apart, and two were bugs in the runner.
 
    * [ ] 6.3 Syscall ABI Trap
 

@@ -1960,6 +1960,13 @@ def check_nvme(words, irq_count, sector, host_sector, regs, ext2_reads=0):
     # would go red on a kernel that is working perfectly.  Every completion is
     # still accounted for, which is a STRONGER claim than the old one: it also
     # catches a block layer that completed reads nobody asked for.
+    # AT LEAST ITS OWN ONE.  The sum below would balance just as well with 5.3
+    # publishing nothing and 6.2 doing all the work, and that is a state this
+    # tool should not accept from the accounting alone -- 5.3's read is the
+    # milestone this check exists for.
+    out.append((words[15] >= 1,
+                f"5.3's own read completed in interrupt context "
+                f"({words[15]} completion(s) published)"))
     out.append((words[15] + ext2_reads == irq_count,
                 f"the guest published {words[15]} completion(s) at 5.3 and "
                 f"6.2's block layer has read {ext2_reads} block(s) since, "
@@ -3374,6 +3381,132 @@ def do_selftest():
     expect_vfs(False, "a trailing slash that answered -ENOENT rather than "
                       "-ENOTDIR is rejected",
                words=vf_words(w10=(1 << 64) - 2))
+
+    # ---- roadmap 6.2 ------------------------------------------------------
+    # THE IMAGE IS A PARAMETER OF THE CHECK, so the fixture supplies a stand-in
+    # walker and can make the two sides disagree.  Against the real guest one
+    # side is the Fortran on a live controller and the other is Ext2Image over
+    # the same file.
+    class FakeImg:
+        block_size = 1024
+        inode_size = 256
+        blocks_count = 1024
+        inodes_count = 128
+        inode_table = 5
+
+        def __init__(self, **kw):
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+        def resolve(self, path):
+            if path != "/bin/init":
+                return None
+            return {"ino": 13, "mode": 0o100644, "size": 28,
+                    "links": 1, "blocks": [51] + [0] * 11}
+
+    def e2_words(**kw):
+        w = [0] * EXT2_WORDS
+        w[0] = EXT2_MAGIC
+        w[1] = 2
+        w[2], w[3] = 1024, 256
+        w[4], w[5], w[6] = 1024, 128, 5
+        w[7], w[8], w[9] = 6, 13, 28
+        w[10] = 0o100644
+        w[11] = 102
+        w[12], w[13] = 15, 6
+        w[14] = (1 << 64) - 20
+        w[15] = 0
+        for k, v in kw.items():
+            w[int(k[1:])] = v
+        return w
+
+    def expect_ext2(ok_wanted, what, words=None, img=None):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_ext2(
+            e2_words() if words is None else words,
+            FakeImg() if img is None else img))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} "
+                  f"(wanted {ok_wanted}, got {got})")
+            fail_n += 1
+
+    expect_ext2(True, "a complete, correct ext2 bring-up is accepted")
+    expect_ext2(False, "a state block with no magic is rejected",
+                words=e2_words(w0=0))
+    expect_ext2(False, "a non-zero bring-up status is rejected",
+                words=e2_words(w15=(1 << 64) - 9))
+    expect_ext2(False, "no superblock is rejected", words=e2_words(w1=0))
+    expect_ext2(False, "a block size that is not the image's is rejected",
+                words=e2_words(w2=4096))
+    # THE FIXTURE IS NOT 128-BYTE INODES ON PURPOSE.  A driver that hardcoded
+    # EXT2_GOOD_OLD_INODE_SIZE would read every inode after the first at the
+    # wrong offset, and only a filesystem whose inodes are not 128 can tell.
+    expect_ext2(False, "an inode size of 128 against a 256-byte image is "
+                       "rejected", words=e2_words(w3=128))
+    expect_ext2(False, "an image that IS 128-byte inodes is rejected as a "
+                       "fixture -- it could not catch a hardcoded driver",
+                img=FakeImg(inode_size=128), words=e2_words(w3=128))
+    expect_ext2(False, "a block count that is not the image's is rejected",
+                words=e2_words(w4=2048))
+    expect_ext2(False, "an inode count that is not the image's is rejected",
+                words=e2_words(w5=256))
+    expect_ext2(False, "an inode table block that is not the image's is "
+                       "rejected", words=e2_words(w6=51))
+    expect_ext2(False, "no dentry for /bin/init is rejected",
+                words=e2_words(w7=0))
+    expect_ext2(False, "an inode number the host walker disagrees with is "
+                       "rejected", words=e2_words(w8=12))
+    expect_ext2(False, "a size the host walker disagrees with is rejected",
+                words=e2_words(w9=1024))
+    expect_ext2(False, "a directory where a regular file belongs is rejected",
+                words=e2_words(w10=0o40755))
+    expect_ext2(False, "the right type with the wrong permission bits is "
+                       "rejected", words=e2_words(w10=0o100755))
+    # THE LBA IS THE BLOCK NUMBER SCALED, and handing back the block number is
+    # off by a factor of two at a 1 KiB block -- the wrong half of the disk.
+    expect_ext2(False, "a starting LBA that is the block number is rejected",
+                words=e2_words(w11=51))
+    expect_ext2(False, "a zero starting LBA is rejected", words=e2_words(w11=0))
+    # THE CLAIM THE MILESTONE IS ABOUT.  A tree built in memory answers with
+    # the same dentry handle; only the counters say it came off the drive.
+    expect_ext2(False, "zero blocks read is rejected -- the handle proves "
+                       "nothing on its own", words=e2_words(w12=0))
+    expect_ext2(False, "one block read is rejected -- two components missed",
+                words=e2_words(w12=1))
+    expect_ext2(False, "zero fills is rejected", words=e2_words(w13=0))
+    expect_ext2(False, "a trailing slash that RESOLVED is rejected",
+                words=e2_words(w14=6))
+    expect_ext2(False, "a trailing slash that answered -ENOENT rather than "
+                       "-ENOTDIR is rejected", words=e2_words(w14=(1 << 64) - 2))
+
+    # THE NVMe ACCOUNTING ACROSS THE TWO MILESTONES, which is the line 6.2
+    # changed in check_nvme and which the existing fixtures cannot reach: they
+    # all pass ext2_reads=0, the degenerate case.
+    def expect_acct(ok_wanted, what, published, reads, live):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_nvme(
+            nv_words(w15=published), live, NV_READ, NV_SECTOR,
+            (0x00460001, 0x00000001), ext2_reads=reads))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} "
+                  f"(wanted {ok_wanted}, got {got})")
+            fail_n += 1
+
+    expect_acct(True, "5.3's one completion plus 6.2's fifteen accounts for "
+                      "sixteen", 1, 15, 16)
+    expect_acct(True, "and with no filesystem mounted it is the old equality",
+                1, 0, 1)
+    expect_acct(False, "a completion nobody asked for is rejected",
+                1, 15, 17)
+    expect_acct(False, "a block read that produced no completion is rejected",
+                1, 15, 15)
+    expect_acct(False, "5.3 publishing zero is rejected", 0, 15, 15)
 
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
