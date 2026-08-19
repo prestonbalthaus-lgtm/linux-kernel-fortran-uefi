@@ -283,6 +283,16 @@ if [[ "${FK_MACHINE:-q35}" == pc ]]; then
   FK_NVME_PASS_LINES=''
 fi
 
+# Roadmap 6.1.  These run on EVERY machine, unlike 4.2's and 5.x's: the VFS
+# touches no bus and no device, so there is no board on which it does not come
+# up.  That is the point of a scaffold and it is asserted rather than assumed.
+FK_VFS_PASS_LINES=$'Fortran Kernel: mounting the VFS root (roadmap 6.1).
+Fortran Kernel: VFS sb/root/bin/init 0x
+Fortran Kernel: /bin/init ino/size/mode 0x
+Fortran Kernel: VFS dentries/inodes in use 0x
+Fortran Kernel: the VFS resolved /bin/init and refused /bin/init/ (roadmap 6.1).'
+FK_VFS_FAIL_LINES=$'Fortran Kernel: the VFS bring-up FAILED, status 0x'
+
 FK_PCIE_FAIL_LINES=$'Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map.
 Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
 Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route.
@@ -399,7 +409,8 @@ $FK_IRQ_PASS_LINES
 $FK_IOA_PASS_LINES
 $FK_PCIE_PASS_LINES
 $FK_KBD_PASS_LINES
-$FK_NVME_PASS_LINES}"
+$FK_NVME_PASS_LINES
+$FK_VFS_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
 $FK_VMM_FAIL_LINES
@@ -414,7 +425,8 @@ $FK_IRQ_FAIL_LINES
 $FK_IOA_FAIL_LINES
 $FK_PCIE_FAIL_LINES
 $FK_KBD_FAIL_LINES
-$FK_NVME_FAIL_LINES}"
+$FK_NVME_FAIL_LINES
+$FK_VFS_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a
@@ -492,6 +504,8 @@ CHECK_DMA="${FK_CHECK_DMA:-1}"
 CHECK_XHCI="${FK_CHECK_XHCI:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_XHCI=0
 [[ "$CHECK_XHCI" != 0 ]] && say "xhci check : the command and event rings, read where the controller wrote them"
+CHECK_VFS="${FK_CHECK_VFS:-1}"
+[[ "$CHECK_VFS" != 0 ]] && say "vfs check  : the dentry tree and the path walk, read out of guest memory"
 CHECK_NVME="${FK_CHECK_NVME:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_NVME=0
 [[ "$CHECK_NVME" != 0 ]] && say "nvme check : sector 0, read at its physical base and diffed against the image"
@@ -705,6 +719,12 @@ assertion_summary() {
       if   (( XHCI_OK == 1 )); then  say "  xHCI controller  : PASS  it executed a command and the interrupt arrived"
       elif (( XHCI_RAN == 0 )); then say "  xHCI controller  : FAIL  the guest died before it could be asked"
       else                           say "  xHCI controller  : FAIL  see the ring dumps above"
+      fi
+    fi
+    if [[ "$CHECK_VFS" != 0 ]]; then
+      if   (( VFS_OK == 1 )); then  say "  VFS path walk    : PASS  /bin/init resolved and /bin/init/ was refused"
+      elif (( VFS_RAN == 0 )); then say "  VFS path walk    : FAIL  the guest died before it could be asked"
+      else                          say "  VFS path walk    : FAIL  see the VFS assertions above"
       fi
     fi
     if [[ "$CHECK_NVME" != 0 ]]; then
@@ -953,6 +973,18 @@ if [[ "$CHECK_XHCI" != 0 && "$MODE" == gate ]]; then
   fi
 fi
 
+VFS_RAN=0; VFS_OK=0
+if [[ "$CHECK_VFS" != 0 && "$MODE" == gate ]]; then
+  if qemu_alive; then
+    VFS_RAN=1
+    rule
+    say "--- the VFS tree and the path walk, out of guest memory ---"
+    if python3 "$SENTINEL" vfs --qmp "$SOCK" --elf "$KERNEL" --timeout 15; then
+      VFS_OK=1
+    fi
+  fi
+fi
+
 NVME_RAN=0; NVME_OK=0
 if [[ "$CHECK_NVME" != 0 && "$MODE" == gate ]]; then
   if qemu_alive; then
@@ -1100,13 +1132,16 @@ KBD_BAD=0
 if [[ "$CHECK_KBD" != 0 && "$MODE" == gate ]] && (( KBD_OK == 0 )); then KBD_BAD=1; fi
 NVME_BAD=0
 if [[ "$CHECK_NVME" != 0 && "$MODE" == gate ]] && (( NVME_OK == 0 )); then NVME_BAD=1; fi
+VFS_BAD=0
+if [[ "$CHECK_VFS" != 0 && "$MODE" == gate ]] && (( VFS_OK == 0 )); then VFS_BAD=1; fi
 PCI_BAD=0
 if [[ "$CHECK_PCI" != 0 && "$MODE" == gate ]] && (( PCI_OK == 0 )); then PCI_BAD=1; fi
 
 if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
    && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )) \
    && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )) && (( DMA_BAD == 0 )) \
-   && (( PCI_BAD == 0 )) && (( XHCI_BAD == 0 )) && (( KBD_BAD == 0 )) && (( NVME_BAD == 0 )); then
+   && (( PCI_BAD == 0 )) && (( XHCI_BAD == 0 )) && (( KBD_BAD == 0 )) \
+   && (( NVME_BAD == 0 )) && (( VFS_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule

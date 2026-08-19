@@ -36,12 +36,21 @@ same hybrid ISO comes up on both firmwares — SeaBIOS, and OVMF since roadmap
 - An xHCI controller brought up from reset: command and event rings in
   physically contiguous memory, a NO-OP command executed, and its MSI-X
   interrupt delivered
-- `memset` / `memcpy` / `memmove` / `memcmp` and 7 integer-math routines,
-  all translated from Linux and byte-compared against it
+- A USB HID keyboard: port reset, slot, device context, four control transfers,
+  an interrupt IN endpoint, and keys pressed from outside the VM decoded to
+  ASCII on the framebuffer console
+- An NVMe controller: reset, admin and I/O queues, Identify, and sector 0 read
+  by DMA and diffed against the disk image on the host
+- A virtual filesystem — superblock, inode, dentry and file as `bind(c)`
+  structs, a dentry tree in fixed pools, and a path walk that resolves
+  `/bin/init` and refuses `/bin/init/`. No filesystem driver behind it yet
+- `memset` / `memcpy` / `memmove` / `memcmp`, `strlen` / `strcpy` / `strcmp` /
+  `strncmp`, and 7 integer-math routines, all translated from Linux and
+  byte-compared against it
 
 ## Not done yet
 
-A USB keyboard driver, NVMe, a VFS, syscalls, an ELF loader, and ring 3.
+A filesystem driver behind the VFS, syscalls, an ELF loader, and ring 3.
 See `roadmap.md` for the full plan.
 
 ## Building
@@ -72,7 +81,13 @@ FK_MACHINE=pc tools/qemu-boot-test.sh      # the board with no ECAM window
 It boots the ISO headless and asserts guest state over QMP: the framebuffer's
 pixels against the kernel's own font table, the PCIe bus against QEMU's `info
 pci`, the DMA run at its physical base, the xHCI's rings where the controller
-wrote them, and the timer still ticking between two reads.
+wrote them, keystrokes injected from outside and decoded inside, sector 0 in the
+DMA landing zone against the disk image the gate generated, the VFS tree and the
+path walk, and the timer still ticking between two reads.
+
+Nothing in that list is a line the kernel printed about itself. Where the kernel
+does print, `roadmap.md` and `docs/HARNESS-VALIDATION-*.md` say which claims rest
+on that and which do not.
 
 ## Testing
 
@@ -89,7 +104,7 @@ it was translated from. It needs the Linux 7.1.8 source tree unpacked at
 
 | Path | Contents |
 |---|---|
-| `src/` | Fortran kernel sources — boot, cpu, mm, lib, drivers |
+| `src/` | Fortran kernel sources — boot, cpu, mm, lib, fs, drivers |
 | `boot/` | The assembly that Fortran cannot replace |
 | `tests/` | C test drivers and the headers they shim |
 | `mk/` | Per-module test fragments and the shared kernel flag set |

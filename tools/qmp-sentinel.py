@@ -192,6 +192,15 @@ XHCI_SYMBOL = "fk_xhci_state"
 XHCI_WORDS = 19
 MSI_SYMBOL = "fk_msi_count"
 XHCI_MAGIC = 0x584843490501
+VFS_SYMBOL = "fk_vfs_state"
+VFS_WORDS = 12
+VFS_MAGIC = 0x5646530601
+# uapi/linux/stat.h:9-14, and uapi/asm-generic/errno-base.h:24.
+VFS_S_IFMT = 0o170000
+VFS_S_IFDIR = 0o40000
+VFS_S_IFREG = 0o100000
+VFS_ENOTDIR = 20
+
 NVME_SYMBOL = "fk_nvme_state"
 NVME_IRQ_SYMBOL = "fk_nvme_irq_completions"
 NVME_WORDS = 21
@@ -1775,6 +1784,79 @@ def _signed(v):
     return v - (1 << 64) if v >= (1 << 63) else v
 
 
+def check_vfs(words):
+    """Roadmap 6.1, and every assertion is about the TREE rather than a device.
+
+    There is nothing outside the guest to diff this against -- the tree is
+    built in memory and 6.2 is the milestone that puts it on a disk -- so what
+    the boot adds over the host suite is narrow and stated as such: the walk
+    ran under KFLAGS, against the real fk_strlen, on a machine taking timer
+    interrupts, and it produced the same answers.
+    """
+    out = []
+    out.append((words[0] == VFS_MAGIC,
+                f"fk_vfs_state magic is 0x{words[0]:010X} "
+                f"(want 0x{VFS_MAGIC:010X}: the bring-up ran)"))
+    if words[0] != VFS_MAGIC:
+        return out
+
+    st = words[11]
+    out.append((st == 0, f"the VFS bring-up returned {_signed(st)}"))
+
+    sb, root, binh, init = words[1], words[2], words[3], words[4]
+    out.append((sb > 0, f"the superblock is handle {sb}"))
+    out.append((root > 0, f"the mount made a root, handle {root}"))
+    out.append((binh > 0 and binh != root,
+                f"/bin is handle {binh}, and it is not the root"))
+    out.append((init > 0 and init not in (root, binh),
+                f"/bin/init is handle {init}, distinct from both"))
+
+    ino, size, mode = words[5], words[6], words[7]
+    out.append((ino > 0, f"its inode number is {ino}"))
+    out.append((size == 4096,
+                f"its size came back {size} (want 4096)"))
+    out.append((mode & VFS_S_IFMT == VFS_S_IFREG,
+                f"its mode 0o{mode:o} is S_IFREG"))
+    out.append((mode & 0o7777 == 0o755,
+                f"and its permission bits are 0o{mode & 0o7777:o}"))
+
+    # FIVE dentries: the root, bin, etc, init, fstab. Asserting the number
+    # rather than "some" is what catches an add that silently did nothing.
+    out.append((words[8] == 5,
+                f"{words[8]} dentries are in use (want 5: /, bin, etc, "
+                "bin/init, etc/fstab)"))
+    out.append((words[9] == 5, f"and {words[9]} inodes, one each"))
+
+    # THE REFUSAL, and it is the half a path walk is most likely to get wrong.
+    # /bin/init is a regular file, so the trailing slash has to be -ENOTDIR --
+    # not the file, and not -ENOENT.
+    out.append((_signed(words[10]) == -VFS_ENOTDIR,
+                f"resolving /bin/init/ answered {_signed(words[10])} "
+                f"(want -{VFS_ENOTDIR}, ENOTDIR)"))
+    return out
+
+
+def do_vfs(sock_path, elf, timeout, quiet):
+    _v, st_paddr = symbol_phys_addr(elf, VFS_SYMBOL)
+    tmp = tempfile.NamedTemporaryFile(prefix="fk-vfs.", suffix=".bin",
+                                      delete=False)
+    tmp.close()
+    client = QmpClient(sock_path, time.monotonic() + timeout)
+    client.connect()
+    try:
+        client.handshake()
+        client.pmemsave(st_paddr, VFS_WORDS * 8, tmp.name)
+        words = list(struct.unpack(f"<{VFS_WORDS}Q",
+                                   open(tmp.name, "rb").read()))
+    finally:
+        client.close()
+        os.unlink(tmp.name)
+    if not report_hwstate(check_vfs(words), quiet):
+        print(f"        {VFS_SYMBOL} at 0x{st_paddr:X}")
+        return 1
+    return 0
+
+
 def do_nvme(sock_path, elf, timeout, quiet, image=None):
     _v, st_paddr = symbol_phys_addr(elf, NVME_SYMBOL)
     _v, irq_paddr = symbol_phys_addr(elf, NVME_IRQ_SYMBOL)
@@ -3000,6 +3082,66 @@ def do_selftest():
     expect_nvme(False, "a device model that no longer says READY is rejected",
                 regs=(0x00460001, 0x00000000))
 
+    # ---- roadmap 6.1: the VFS ------------------------------------------
+    def vf_words(**kw):
+        w = [0] * VFS_WORDS
+        w[0] = VFS_MAGIC
+        w[1], w[2], w[3], w[4] = 1, 1, 2, 3
+        w[5] = 4
+        w[6] = 4096
+        w[7] = VFS_S_IFREG | 0o755
+        w[8], w[9] = 5, 5
+        w[10] = (1 << 64) - VFS_ENOTDIR
+        w[11] = 0
+        for k, v in kw.items():
+            w[int(k[1:])] = v
+        return w
+
+    def expect_vfs(ok_wanted, what, words=None):
+        nonlocal pass_n, fail_n
+        got = all(ok for ok, _ in check_vfs(words or vf_words()))
+        if got == ok_wanted:
+            print(f"  \033[32mPASS\033[0m  {what}")
+            pass_n += 1
+        else:
+            print(f"  \033[31mFAIL\033[0m  {what} "
+                  f"(wanted {ok_wanted}, got {got})")
+            fail_n += 1
+
+    expect_vfs(True, "a complete, correct VFS bring-up is accepted")
+    expect_vfs(False, "a state block with no magic is rejected",
+               words=vf_words(w0=0))
+    expect_vfs(False, "a non-zero bring-up status is rejected",
+               words=vf_words(w11=(1 << 64) - 3))
+    expect_vfs(False, "no superblock is rejected", words=vf_words(w1=0))
+    expect_vfs(False, "no root is rejected", words=vf_words(w2=0))
+    expect_vfs(False, "a /bin that IS the root is rejected -- a walk that "
+                      "never moved would look like a successful one",
+               words=vf_words(w3=1))
+    expect_vfs(False, "a /bin/init that is the same handle as /bin is "
+                      "rejected", words=vf_words(w4=2))
+    expect_vfs(False, "an inode number of zero is rejected",
+               words=vf_words(w5=0))
+    expect_vfs(False, "a size that is not the one the tree was built with is "
+                      "rejected", words=vf_words(w6=512))
+    expect_vfs(False, "a directory where a regular file belongs is rejected",
+               words=vf_words(w7=VFS_S_IFDIR | 0o755))
+    expect_vfs(False, "the right type with the wrong permission bits is "
+                      "rejected", words=vf_words(w7=VFS_S_IFREG | 0o644))
+    expect_vfs(False, "four dentries instead of five is rejected -- one add "
+                      "that silently did nothing", words=vf_words(w8=4))
+    expect_vfs(False, "five dentries with four inodes is rejected",
+               words=vf_words(w9=4))
+    # THE REFUSAL. All three of these are what a walk that dropped the
+    # trailing slash would report instead.
+    expect_vfs(False, "a trailing slash that RESOLVED is rejected",
+               words=vf_words(w10=3))
+    expect_vfs(False, "a trailing slash that answered zero is rejected",
+               words=vf_words(w10=0))
+    expect_vfs(False, "a trailing slash that answered -ENOENT rather than "
+                      "-ENOTDIR is rejected",
+               words=vf_words(w10=(1 << 64) - 2))
+
     print(f"=== {pass_n} passed, {fail_n} failed ===")
     return 1 if fail_n else 0
 
@@ -3062,6 +3204,12 @@ def main(argv=None):
     t.add_argument("--interval", type=float, default=0.25)
     t.add_argument("--min-delta", type=int, default=2)
     t.add_argument("--quiet", action="store_true")
+
+    vf = sub.add_parser("vfs", help="assert the VFS tree and the path walk")
+    vf.add_argument("--qmp", required=True)
+    vf.add_argument("--elf", required=True)
+    vf.add_argument("--timeout", type=float, default=15.0)
+    vf.add_argument("--quiet", action="store_true")
 
     nv = sub.add_parser("nvme", help="assert the NVMe read against the disk")
     nv.add_argument("--qmp", required=True)
@@ -3129,6 +3277,8 @@ def main(argv=None):
             return do_dma(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "xhci":
             return do_xhci(args.qmp, args.elf, args.timeout, args.quiet)
+        if args.cmd == "vfs":
+            return do_vfs(args.qmp, args.elf, args.timeout, args.quiet)
         if args.cmd == "nvme":
             return do_nvme(args.qmp, args.elf, args.timeout, args.quiet,
                            image=args.image)
