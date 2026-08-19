@@ -3070,9 +3070,9 @@ contains
     ! on a machine that is being interrupted rather than a quiet one.
     ! NOT PREEMPTION-SAFE, and it runs before the scheduler for that reason.
     ! Nothing in fk_heap_m takes a lock, so kmalloc from an interrupt handler
-    ! or from two threads at once will corrupt the block list.  Roadmap 4.1's
-    ! problem; today the rule is that only this thread allocates, and it stops
-    ! allocating before sched_start.
+    ! or from two threads at once will corrupt the block list.  No open roadmap
+    ! box owns that; today the rule is that only this thread allocates, and it
+    ! stops allocating before sched_start.
     heap_next = FK_VMM_HEAP
     status = heap_bringup()
 
