@@ -22,6 +22,18 @@ FFLAGS := -O2 -fwrapv -fno-underscoring -Wall -J$(BUILD)
 TESTS :=
 include $(sort $(wildcard mk/*.mk))
 
+# EVERY OBJECT DEPENDS ON THE FRAGMENTS, and this is a bug fix rather than
+# belt-and-braces. build/oracle-<name>.o depended on its C source alone, so
+# changing which functions CFLAGS_<name> selects out of that source did not
+# rebuild it. Roadmap 1.1 removed four __HAVE_ARCH_* guards to bring
+# strlen/strcpy/strcmp/strncmp into the oracle; the stale object did not have
+# them, the link fell through to GLIBC, and the harness spent a run diffing the
+# Fortran against the C library instead of against the kernel. It went red --
+# glibc's strcmp returns the byte difference and lib/string.c returns the sign
+# -- but a translation that happened to agree with glibc would have gone GREEN
+# against the wrong oracle. MAKEFILE_LIST is this file plus every fragment.
+MKDEPS := $(MAKEFILE_LIST)
+
 # Stated explicitly: mk/*.mk is a wildcard, and a fragment that ever defines a
 # rule would otherwise silently steal the default goal from `test`.
 .DEFAULT_GOAL := test
@@ -73,7 +85,7 @@ audit: selftest test kflags-test symcheck
 fobj = $(foreach s,$(FSRC_$(1)),$(BUILD)/fk_$(1)__$(basename $(notdir $(s))).o)
 
 define FSRC_template
-$(BUILD)/fk_$(1)__$(basename $(notdir $(2))).o: $(2) | $(BUILD)
+$(BUILD)/fk_$(1)__$(basename $(notdir $(2))).o: $(2) $(MKDEPS) | $(BUILD)
 	gfortran $$(FFLAGS) -c -o $$@ $$<
 endef
 
@@ -106,10 +118,10 @@ endef
 # silent if it does not.
 define TEST_template
 $(if $(ORACLE_$(1)),
-$(BUILD)/oracle-$(1).o: $(KDIR)/$(ORACLE_$(1)) | $(BUILD)
+$(BUILD)/oracle-$(1).o: $(KDIR)/$(ORACLE_$(1)) $(MKDEPS) | $(BUILD)
 	gcc $(CFLAGS) $(CFLAGS_$(1)) -c -o $$@ $$<
 )
-$(BUILD)/drv-$(1).o: $(DRV_$(1)) | $(BUILD)
+$(BUILD)/drv-$(1).o: $(DRV_$(1)) $(MKDEPS) | $(BUILD)
 	gcc $(CFLAGS) $(CFLAGS_$(1)) -c -o $$@ $$<
 $(BUILD)/run-$(1): $(if $(ORACLE_$(1)),$(BUILD)/oracle-$(1).o) $(call fobj,$(1)) $(BUILD)/drv-$(1).o
 	gcc -o $$@ $$^
