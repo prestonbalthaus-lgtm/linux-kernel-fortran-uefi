@@ -249,9 +249,27 @@ the guest read back out of the register. The guest never sees that number.
 | S123 | a successful write is not counted | yes | the byte total |
 | S124 | a refused write still moves the byte total | yes | the byte total |
 | S125 | exit does not record its code | yes | the exit rows |
+| S134 | a `sysretq` in the image | yes | `the image contains SYSRET, but STAR[63:48] is zero`, naming the instruction |
 | S131 | **boot:** FMASK without IF | yes | **the sentinel's own flag list only** |
 | S132 | **boot:** a data descriptor for CS | yes | a fault inside a fault -- it arrives as a hang |
 | S133 | **boot:** the tail does not skip int_no/err_code | yes | IRETQ reads -1 as the return RIP |
+
+### S134 refused a build-system error before it refused a SYSRET
+
+The gate asserts a NEGATIVE -- that the image contains no SYSRET -- and a check
+of that shape passes trivially when it is broken, which is why it needed a case
+at all. The first attempt reported a catch that was not the gate's:
+`sysretcheck-boot` was reachable only through `Makefile.boot`, so
+`./tools/run.sh` answered `No rule to make target` and the non-zero exit was
+counted as a refusal. **A build-system error read as a passing gate is the same
+false green the gate itself exists to prevent, arriving one layer out.** The
+target is forwarded from the top-level `Makefile` now, and the refusal names
+the instruction: `ffffffff8010133f: 48 0f 07 sysretq`.
+
+Its second assertion, `grep -q iretq boot/interrupts.S`, is NOT covered and
+cannot usefully be: `irq_common` has carried an IRETQ since roadmap 3.2b, so
+that grep succeeds whatever the syscall stub's tail becomes. It is decoration.
+The objdump half is the gate, and S133 is what covers the tail.
 
 ### S131 is the one that justifies spelling the flags out twice
 
