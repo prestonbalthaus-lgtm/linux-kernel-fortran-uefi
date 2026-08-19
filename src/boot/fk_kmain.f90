@@ -112,6 +112,14 @@ module fk_kmain_m
                       vfs_dentry_inode, vfs_inode_ino, vfs_inode_size, &
                       vfs_inode_mode, vfs_dentries_used, vfs_inodes_used
   use fk_vfs_types_m, only: FK_S_IFDIR, FK_S_IFREG, FK_E_NOTDIR
+  use fk_syscall_m, only: syscall_init, syscall_star, syscall_lstar, &
+                          syscall_fmask, syscall_efer, syscall_count, &
+                          syscall_last_nr, syscall_last_ret, &
+                          syscall_entry_rflags, syscall_masked_flags, &
+                          syscall_written, syscall_exit_called, &
+                          syscall_exit_code, syscall_stack_top, &
+                          FK_SYS_OK, FK_SYS_NR_WRITE, FK_SYS_NR_EXIT, &
+                          FK_E_NOSYS, FK_SYSCALL_FMASK, FK_EFER_SCE_BIT
   use fk_console_m, only: FK_CON_OK, console_init, console_write, &
                          console_print_hex, console_cols, console_rows, &
                          console_ready, fk_console_scrolls
@@ -544,6 +552,44 @@ module fk_kmain_m
        int(z'5646530601', c_int64_t)
   integer(c_int64_t), volatile, save, bind(c, name="fk_vfs_state") :: &
        fk_vfs_state(0:11)
+
+  ! roadmap 6.3
+  character(kind=c_char, len=*), parameter :: FK_SYS_START = &
+       "Fortran Kernel: arming SYSCALL/SYSRET (roadmap 6.3)." // FK_CRLF // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SYS_MSRS = &
+       "Fortran Kernel: SYSCALL star/lstar/fmask 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SYS_EFER = &
+       "Fortran Kernel: EFER/SCE and the stack top 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SYS_TRAP = &
+       "Fortran Kernel: syscall calls/nr/ret 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SYS_FLAGS = &
+       "Fortran Kernel: RFLAGS on entry/masked survivors 0x" // c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SYS_DONE = &
+       "Fortran Kernel: a SYSCALL instruction reached a Fortran handler and returned (roadmap 6.3)." // &
+       c_null_char
+  character(kind=c_char, len=*), parameter :: FK_SYS_BAD = &
+       "Fortran Kernel: the syscall bring-up FAILED, status 0x" // c_null_char
+
+  ! This routine's own steps, in a range src/cpu/fk_syscall.f90's -1..-7 cannot
+  ! produce.  Roadmap 6.2 paid for that lesson: overlapping ranges made an I/O
+  ! failure and a missing buffer report the same number, and an hour went into
+  ! the wrong module.
+  integer(c_int32_t), parameter :: FK_SYSB_NORET = -100_c_int32_t
+  integer(c_int32_t), parameter :: FK_SYSB_NOCALL = -101_c_int32_t
+  integer(c_int32_t), parameter :: FK_SYSB_BADNR = -102_c_int32_t
+  integer(c_int32_t), parameter :: FK_SYSB_FLAGS = -103_c_int32_t
+  integer(c_int32_t), parameter :: FK_SYSB_NOSYS = -104_c_int32_t
+  integer(c_int32_t), parameter :: FK_SYSB_EXIT = -105_c_int32_t
+
+  ! [0] magic [1] syscall_init's status [2] STAR [3] LSTAR [4] FMASK
+  ! [5] EFER [6] calls taken [7] the last number [8] the last return
+  ! [9] RFLAGS as the handler was entered [10] which masked flags SURVIVED,
+  ! which must be zero [11] sequence status
+  integer(c_int64_t), parameter :: FK_SYSS_MAGIC = &
+       int(z'535943410603', c_int64_t)
+  integer(c_int64_t), volatile, save, bind(c, name="fk_syscall_state") :: &
+       fk_syscall_state(0:11)
 
   ! roadmap 5.2
   character(kind=c_char, len=*), parameter :: FK_KBD_START = &
@@ -1076,6 +1122,21 @@ module fk_kmain_m
   integer(c_int32_t), volatile :: fk_dividend = 1_c_int32_t
   integer(c_int32_t), volatile :: fk_divisor  = 0_c_int32_t
   integer(c_int32_t), volatile :: fk_quotient = 0_c_int32_t
+
+  interface
+    ! roadmap 6.3.  Fortran has no spelling for SYSCALL, and fk_syscall1 is the
+    ! shuffle between the SysV C ABI and the Linux syscall ABI: the number goes
+    ! to RAX and the third argument to RDX, because the syscall ABI's fourth
+    ! argument is R10 rather than RCX -- SYSCALL destroys RCX with the return
+    ! address.  boot/interrupts.S owns both.
+    function fk_syscall1(nr, a1, a2, a3) result(ret) &
+         bind(c, name="fk_syscall1")
+      import :: c_int64_t
+      implicit none
+      integer(c_int64_t), intent(in), value :: nr, a1, a2, a3
+      integer(c_int64_t)                    :: ret
+    end function fk_syscall1
+  end interface
 
   interface
     ! Parks this CPU permanently (CLI; HLT) and never returns.  In boot/boot.S,
@@ -3177,6 +3238,165 @@ contains
     fk_vfs_state(11) = int(st, c_int64_t)
   end subroutine vfs_failed
 
+  ! roadmap 6.3.  Arms SYSCALL/SYSRET and then EXECUTES ONE, which is the only
+  ! evidence that the four registers describe a path a CPU will actually take.
+  !
+  ! THE CALLER IS RING 0, and that is what makes the tail of the stub IRETQ
+  ! rather than SYSRETQ: SYSRET forces CPL 3 and cannot return kernel code to
+  ! kernel code.  Roadmap 7.1 is the box that drops to Ring 3 and it is the box
+  ! that changes the two selectors in the frame; nothing else here moves.
+  subroutine syscall_bringup()
+    implicit none
+    integer(c_int32_t) :: st
+    integer(c_int64_t) :: ret, flags_in
+    character(kind=c_char), target :: sbuf(8)
+
+    fk_syscall_state = 0_c_int64_t
+    fk_syscall_state(0) = FK_SYSS_MAGIC
+    call serial_print_string(FK_SYS_START)
+
+    st = syscall_init()
+    fk_syscall_state(1) = int(st, c_int64_t)
+    if (st /= FK_SYS_OK) then
+       call syscall_failed(st)
+       return
+    end if
+
+    fk_syscall_state(2) = syscall_star()
+    fk_syscall_state(3) = syscall_lstar()
+    fk_syscall_state(4) = syscall_fmask()
+    fk_syscall_state(5) = syscall_efer()
+
+    call serial_print_string(FK_SYS_MSRS)
+    call serial_print_hex(syscall_star(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(syscall_lstar(), 16_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(syscall_fmask(), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_SYS_EFER)
+    call serial_print_hex(syscall_efer(), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(syscall_stack_top(), 16_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! THE FLAGS ARE SET ON PURPOSE BEFORE THE INSTRUCTION, because FMASK can
+    ! only be shown to have cleared a bit that was set.  IF is already on -- the
+    ! timer is running -- and the arithmetic flags are set by the comparison
+    ! the runtime does anyway; what matters is that whatever IS set here must
+    ! not survive into the handler.  DF, TF, IOPL, NT and RF are deliberately
+    ! NOT set: TF would single-step the instruction before this one, RF cannot
+    ! be set by POPFQ at all, and a kernel that ran with DF set even briefly
+    ! would break every string operation between here and the syscall.  Those
+    ! five are covered by the value check on FMASK itself and are named in
+    ! docs/HARNESS-VALIDATION-PHASE6.md as what this assertion does not reach.
+    flags_in = fk_read_rflags()
+    fk_syscall_state(9) = flags_in
+
+    sbuf = c_null_char
+    ret = fk_syscall1(FK_SYS_NR_WRITE, 1_c_int64_t, &
+                      transfer(c_loc(sbuf(1)), 0_c_int64_t), 5_c_int64_t)
+
+    fk_syscall_state(6) = syscall_count()
+    fk_syscall_state(7) = syscall_last_nr()
+    fk_syscall_state(8) = syscall_last_ret()
+    fk_syscall_state(9) = syscall_entry_rflags()
+    fk_syscall_state(10) = syscall_masked_flags()
+
+    ! THE INSTRUCTION RETURNED AT ALL, which is the first thing a wrong IRETQ
+    ! frame would take away -- and it would take it away by faulting rather
+    ! than by answering wrongly, so reaching this line is itself the assertion.
+    if (syscall_count() < 1_c_int64_t) then
+       call syscall_failed(FK_SYSB_NOCALL)
+       return
+    end if
+    if (syscall_last_nr() /= FK_SYS_NR_WRITE) then
+       call syscall_failed(FK_SYSB_BADNR)
+       return
+    end if
+    ! sys_write returns its count, and the value has to come back through
+    ! POP_GPRS into RAX -- a handler that wrote its answer anywhere else
+    ! delivers nothing to the caller.
+    if (ret /= 5_c_int64_t) then
+       call syscall_failed(FK_SYSB_NORET)
+       return
+    end if
+
+    ! EVERY FLAG FMASK NAMES MUST BE CLEAR, and IF is the one that was
+    ! provably set beforehand.  A survivor means the CPU did not clear it,
+    ! which means it was not in the value that was written.
+    if (syscall_masked_flags() /= 0_c_int64_t) then
+       call syscall_failed(FK_SYSB_FLAGS)
+       return
+    end if
+    if (iand(flags_in, FK_SYSCALL_FMASK) == 0_c_int64_t) then
+       ! Nothing maskable was set on the way in, so the row above proved
+       ! nothing.  Refused rather than reported green.
+       call syscall_failed(FK_SYSB_FLAGS)
+       return
+    end if
+
+    call serial_print_string(FK_SYS_TRAP)
+    call serial_print_hex(syscall_count(), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(syscall_last_nr(), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(ret, 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    call serial_print_string(FK_SYS_FLAGS)
+    call serial_print_hex(syscall_entry_rflags(), 8_c_int32_t)
+    call serial_print_string(FK_PMM_SLASH)
+    call serial_print_hex(syscall_masked_flags(), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+
+    ! AN UNKNOWN NUMBER IS -ENOSYS AND NOT A HALT, and the second call also
+    ! shows the path is REUSABLE -- a stub that corrupted its own stack or left
+    ! fk_syscall_rsp0 wrong would survive one call and not two.
+    ret = fk_syscall1(9999_c_int64_t, 0_c_int64_t, 0_c_int64_t, 0_c_int64_t)
+    if (ret /= FK_E_NOSYS) then
+       call syscall_failed(FK_SYSB_NOSYS)
+       return
+    end if
+    if (syscall_count() < 2_c_int64_t) then
+       call syscall_failed(FK_SYSB_NOCALL)
+       return
+    end if
+
+    ! sys_exit RETURNS at 6.3: the caller is the kernel's own boot thread and
+    ! there is no task to destroy.  Roadmap 7.1 is where it stops returning,
+    ! and this line is what will have to change when it does.
+    ret = fk_syscall1(FK_SYS_NR_EXIT, 7_c_int64_t, 0_c_int64_t, 0_c_int64_t)
+    if (syscall_exit_called() /= 1_c_int32_t .or. &
+        syscall_exit_code() /= 7_c_int64_t) then
+       call syscall_failed(FK_SYSB_EXIT)
+       return
+    end if
+
+    ! RE-SNAPSHOT AFTER THE LAST CALL, not only after the first.  Words 6-8
+    ! were taken straight after the write and then left, so the published
+    ! "last number" said 1 while three calls had been made -- the state block
+    ! described a moment rather than the end of the sequence.
+    fk_syscall_state(6) = syscall_count()
+    fk_syscall_state(7) = syscall_last_nr()
+    fk_syscall_state(8) = syscall_last_ret()
+    fk_syscall_state(11) = 0_c_int64_t
+    call serial_print_string(FK_SYS_DONE)
+    call serial_print_string(FK_NL)
+  end subroutine syscall_bringup
+
+  subroutine syscall_failed(st)
+    implicit none
+    integer(c_int32_t), intent(in) :: st
+
+    call serial_print_string(FK_SYS_BAD)
+    call serial_print_hex(int(st, c_int64_t), 8_c_int32_t)
+    call serial_print_string(FK_NL)
+    fk_syscall_state(0) = FK_SYSS_MAGIC
+    fk_syscall_state(11) = int(st, c_int64_t)
+  end subroutine syscall_failed
+
   ! A parameter string copied into storage whose address can be taken.  c_loc
   ! needs a TARGET and a named constant is not one; a character SCALAR with a
   ! length parameter is not interoperable either, so the copy lands in an array
@@ -3663,6 +3883,12 @@ contains
     call dma_bringup()
 
     call vfs_bringup()
+
+    ! roadmap 6.3, and it is independent of everything above it: SYSCALL needs
+    ! a GDT and an entry point, both of which have existed since Phase 3.  It
+    ! runs BEFORE the scheduler because the stub keeps one kernel stack in one
+    ! global, and a second thread taking a syscall would share it.
+    call syscall_bringup()
 
     ! roadmap 4.0's second half.  Last, because from here on this routine is
     ! one of three threads rather than the only one, and everything above

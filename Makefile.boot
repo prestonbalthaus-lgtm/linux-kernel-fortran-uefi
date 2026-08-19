@@ -120,6 +120,7 @@ FSRC_KERNEL := src/drivers/serial/fk_serial.f90 \
                src/drivers/usb/fk_usb_kbd.f90 \
                src/drivers/storage/fk_nvme_types.f90 \
                src/drivers/storage/fk_nvme.f90 \
+               src/cpu/fk_syscall.f90 \
                src/cpu/fk_sched.f90 \
                src/boot/fk_kmain.f90
 
@@ -385,8 +386,29 @@ isocheck-boot: $(ISO)
 	  || { echo "  FAIL  the ISO carries no x86_64-efi video driver"; exit 1; }
 	@echo "  OK    the ISO loads a video driver and carries one for UEFI"
 
+# roadmap 6.3.  AN ASSERTION ABOUT WHAT IS NOT THERE, and it is worth a gate
+# because the alternative is a comment nobody can check.  src/cpu/fk_syscall.f90
+# programs STAR[63:48] as ZERO, on the grounds that SYSRET derives its CS from
+# STAR[63:48]+16 and its SS from +8 at RPL 3, and this GDT has no Ring 3
+# descriptors for those to name.  That reasoning is only sound while nothing in
+# the image executes SYSRET: one that did would load a CS from a null selector
+# and take a #GP with no useful state left.  The entry stub returns with IRETQ
+# instead, and this is what keeps that true.
+#
+# Roadmap 7.1 adds the three descriptors, fills in STAR[63:48], and DELETES
+# this check -- which is the right time for it to go, and not before.
+sysretcheck-boot: $(KERNEL)
+	@if objdump -d $(KERNEL) | grep -qwE 'sysret|sysretq|sysretl'; then \
+	   echo "  FAIL  the image contains SYSRET, but STAR[63:48] is zero"; \
+	   objdump -d $(KERNEL) | grep -wE 'sysret|sysretq|sysretl' | sed 's/^/        /'; \
+	   exit 1; \
+	 fi
+	@grep -q 'iretq' boot/interrupts.S \
+	  || { echo "  FAIL  the syscall stub has no IRETQ tail"; exit 1; }
+	@echo "  OK    no SYSRET in the image, so a zero STAR[63:48] names nothing"
+
 bootgate: $(KERNEL) mbcheck symcheck-boot undefcheck-boot selftest-boot \
-          mmiocheck-boot isocheck-boot
+          mmiocheck-boot isocheck-boot sysretcheck-boot
 	@echo "=== boot path gates clean: header valid, image enterable, no runtime ==="
 
 # --- ISO ---------------------------------------------------------------------

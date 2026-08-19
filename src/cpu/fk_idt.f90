@@ -24,10 +24,16 @@ module fk_idt_m
   public :: idt_init, idt_reload, isr_handler, irq_handler, fk_irq_spurious, &
             idt_set_panic_colors, idt_set_eoi_lapic, fk_lapic_spurious, &
             FK_VECTOR_SPURIOUS, FK_VECTOR_MSI, FK_MSI_LINE, fk_msi_count
+  ! PUBLISHED AT ROADMAP 6.3, and it is the type and not a copy of it.  The
+  ! syscall stub in boot/interrupts.S builds the identical 22-quadword frame
+  ! isr_common and irq_common build, so src/cpu/fk_syscall.f90 reads it through
+  ! this declaration rather than through a second one that could drift.
 
   ! What boot/interrupts.S leaves on the stack, lowest address first.  Every
   ! field is a quadword, so the type needs no padding and the assembly needs no
   ! knowledge of Fortran.
+  public :: fk_regs_t
+
   type, bind(c) :: fk_regs_t
     integer(c_int64_t) :: r15, r14, r13, r12, r11, r10, r9, r8
     integer(c_int64_t) :: rdi, rsi, rbp, rbx, rdx, rcx, rax
