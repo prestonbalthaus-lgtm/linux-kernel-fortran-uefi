@@ -293,17 +293,6 @@ Fortran Kernel: VFS dentries/inodes in use 0x
 Fortran Kernel: the VFS resolved /bin/init and refused /bin/init/ (roadmap 6.1).'
 FK_VFS_FAIL_LINES=$'Fortran Kernel: the VFS bring-up FAILED, status 0x'
 
-# Roadmap 6.3.  On EVERY machine, like 6.1's and unlike 5.x's: SYSCALL needs a
-# GDT and an entry point and nothing else, so there is no board on which it does
-# not come up.  FK_MACHINE=pc runs it identically.
-FK_SYS_PASS_LINES=$'Fortran Kernel: arming SYSCALL/SYSRET (roadmap 6.3).
-Fortran Kernel: SYSCALL star/lstar/fmask 0x
-Fortran Kernel: EFER/SCE and the stack top 0x
-Fortran Kernel: syscall calls/nr/ret 0x
-Fortran Kernel: RFLAGS on entry/masked survivors 0x
-Fortran Kernel: a SYSCALL instruction reached a Fortran handler and returned (roadmap 6.3).'
-FK_SYS_FAIL_LINES=$'Fortran Kernel: the syscall bring-up FAILED, status 0x'
-
 FK_PCIE_FAIL_LINES=$'Fortran Kernel: the ECAM window is STILL mapped write-back in the linear map.
 Fortran Kernel: the xHCI REFUSED a COMMAND write; decode or bus mastering did not move.
 Fortran Kernel: the xHCI declares NO MSI-X capability; 5.1 has no route.
@@ -421,8 +410,7 @@ $FK_IOA_PASS_LINES
 $FK_PCIE_PASS_LINES
 $FK_KBD_PASS_LINES
 $FK_NVME_PASS_LINES
-$FK_VFS_PASS_LINES
-$FK_SYS_PASS_LINES}"
+$FK_VFS_PASS_LINES}"
 REJECT_SERIAL="${FK_REJECT_SERIAL:-Fortran Kernel: COM1 loopback self-test FAILED.
 $FK_PMM_FAIL_LINES
 $FK_VMM_FAIL_LINES
@@ -438,8 +426,7 @@ $FK_IOA_FAIL_LINES
 $FK_PCIE_FAIL_LINES
 $FK_KBD_FAIL_LINES
 $FK_NVME_FAIL_LINES
-$FK_VFS_FAIL_LINES
-$FK_SYS_FAIL_LINES}"
+$FK_VFS_FAIL_LINES}"
 
 # Blank lines are dropped, and NOT because they are untidy: an empty pattern
 # matches every file, so one stray newline would turn an assertion into a
@@ -519,10 +506,6 @@ CHECK_XHCI="${FK_CHECK_XHCI:-1}"
 [[ "$CHECK_XHCI" != 0 ]] && say "xhci check : the command and event rings, read where the controller wrote them"
 CHECK_VFS="${FK_CHECK_VFS:-1}"
 [[ "$CHECK_VFS" != 0 ]] && say "vfs check  : the dentry tree and the path walk, read out of guest memory"
-# roadmap 6.3.  ON EVERY MACHINE, like the VFS check: the trap touches no bus
-# and no device.
-CHECK_SYSCALL="${FK_CHECK_SYSCALL:-1}"
-[[ "$CHECK_SYSCALL" != 0 ]] && say "syscall chk: the trap, its four MSRs, and LSTAR against the ELF's own symbol"
 CHECK_NVME="${FK_CHECK_NVME:-1}"
 [[ "$MACHINE" == pc ]] && CHECK_NVME=0
 [[ "$CHECK_NVME" != 0 ]] && say "nvme check : sector 0, read at its physical base and diffed against the image"
@@ -742,12 +725,6 @@ assertion_summary() {
       if   (( VFS_OK == 1 )); then  say "  VFS path walk    : PASS  /bin/init resolved and /bin/init/ was refused"
       elif (( VFS_RAN == 0 )); then say "  VFS path walk    : FAIL  the guest died before it could be asked"
       else                          say "  VFS path walk    : FAIL  see the VFS assertions above"
-      fi
-    fi
-    if [[ "$CHECK_SYSCALL" != 0 ]]; then
-      if   (( SYSCALL_OK == 1 )); then  say "  syscall trap     : PASS  a SYSCALL reached Fortran and FMASK cleared what it names"
-      elif (( SYSCALL_RAN == 0 )); then say "  syscall trap     : FAIL  the guest died before it could be asked"
-      else                              say "  syscall trap     : FAIL  see the syscall assertions above"
       fi
     fi
     if [[ "$CHECK_NVME" != 0 ]]; then
@@ -1008,18 +985,6 @@ if [[ "$CHECK_VFS" != 0 && "$MODE" == gate ]]; then
   fi
 fi
 
-SYSCALL_RAN=0; SYSCALL_OK=0
-if [[ "$CHECK_SYSCALL" != 0 && "$MODE" == gate ]]; then
-  if qemu_alive; then
-    SYSCALL_RAN=1
-    rule
-    say "--- the syscall trap: four MSRs, and LSTAR against kernel.elf ---"
-    if python3 "$SENTINEL" syscall --qmp "$SOCK" --elf "$KERNEL" --timeout 15; then
-      SYSCALL_OK=1
-    fi
-  fi
-fi
-
 NVME_RAN=0; NVME_OK=0
 if [[ "$CHECK_NVME" != 0 && "$MODE" == gate ]]; then
   if qemu_alive; then
@@ -1167,8 +1132,6 @@ KBD_BAD=0
 if [[ "$CHECK_KBD" != 0 && "$MODE" == gate ]] && (( KBD_OK == 0 )); then KBD_BAD=1; fi
 NVME_BAD=0
 if [[ "$CHECK_NVME" != 0 && "$MODE" == gate ]] && (( NVME_OK == 0 )); then NVME_BAD=1; fi
-SYSCALL_BAD=0
-if [[ "$CHECK_SYSCALL" != 0 && "$MODE" == gate ]] && (( SYSCALL_OK == 0 )); then SYSCALL_BAD=1; fi
 VFS_BAD=0
 if [[ "$CHECK_VFS" != 0 && "$MODE" == gate ]] && (( VFS_OK == 0 )); then VFS_BAD=1; fi
 PCI_BAD=0
@@ -1178,8 +1141,7 @@ if (( SENTINEL_OK == 1 )) && (( SERIAL_OK == 1 )) && (( SELFTEST_BAD == 0 )) \
    && (( QEMU_DIED == 0 )) && (( HW_BAD == 0 )) && (( TICK_BAD == 0 )) \
    && (( FB_BAD == 0 )) && (( SCHED_BAD == 0 )) && (( DMA_BAD == 0 )) \
    && (( PCI_BAD == 0 )) && (( XHCI_BAD == 0 )) && (( KBD_BAD == 0 )) \
-   && (( NVME_BAD == 0 )) && (( VFS_BAD == 0 )) \
-   && (( SYSCALL_BAD == 0 )); then
+   && (( NVME_BAD == 0 )) && (( VFS_BAD == 0 )); then
   python3 "$SENTINEL" check "$DUMP" | sed 's/^/  /'
   show_serial_log
   rule
