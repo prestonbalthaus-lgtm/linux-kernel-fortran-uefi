@@ -39,8 +39,7 @@ MKDEPS := $(MAKEFILE_LIST)
 .DEFAULT_GOAL := test
 
 .PHONY: test symcheck clean list kflags-test selftest audit linkscript \
-        kernel iso mbcheck symcheck-boot undefcheck-boot clean-boot bootgate \
-        sysretcheck-boot
+        kernel iso mbcheck symcheck-boot undefcheck-boot clean-boot bootgate
 test: $(addprefix $(BUILD)/run-,$(TESTS))
 	@echo "=== all $(words $(TESTS)) translation(s) matched the C oracle ==="
 
@@ -66,8 +65,7 @@ selftest:
 # Roadmap 1.2/0.2: the bootable kernel image. Delegated to Makefile.boot so
 # that the Phase 1 differential harness above cannot be disturbed by boot work
 # -- different flags, different objects, different output directory.
-kernel iso mbcheck symcheck-boot undefcheck-boot clean-boot bootgate \
-sysretcheck-boot:
+kernel iso mbcheck symcheck-boot undefcheck-boot clean-boot bootgate:
 	@$(MAKE) --no-print-directory -f Makefile.boot $@
 
 # Everything a translation must survive before it is considered done.
